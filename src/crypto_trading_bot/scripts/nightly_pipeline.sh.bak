@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Nightly pipeline: capture (optional) -> playback -> review -> nightly email
+PY="${PY:-python3}"
+$PY scripts/paper_trade.py data/live/kraken_*_*.jsonl --trail-mode pct --trail-pct 0.002 --trail-activate 0.000 --size 25 || true
+$PY scripts/learn_from_paper.py || true
+$PY scripts/make_equity_from_paper.py || true
+$PY scripts/build_dashboard_html.py || true
+
+set -euo pipefail
+
+TS() { date "+[%Y-%m-%d %H:%M:%S]"; }
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+PY="$REPO_ROOT/venv/bin/python"
+# --- compute paper SIZE (nightly) ---
+# Force quiet output so SIZE is only a number
+ECHO_REASON=0 SIZE="$("$PY" scripts/compute_paper_size.py)"
+export SIZE
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] position size computed (nightly) → ${SIZE}"
+# --- end compute paper SIZE (nightly) ---
+
+if [[ ! -x "$PY" ]]; then
+  echo "$(TS) venv python not found; falling back to system python" >&2
+  PY="$(command -v python3 || command -v python)"
+fi
+
+echo "$(TS) pipeline start…"
+echo "$(TS) REPO_ROOT=$REPO_ROOT"
+echo "$(TS) Using PY=$PY"
+"$PY" --version || true
+
+# -------- helpers --------
+latest_live_file() {
+  local d="data/live"
+  [[ -d "$d" ]] || { echo ""; return; }
+  # newest *.jsonl in data/live
+  find "$d" -type f -name "*.jsonl" -maxdepth 1 -print0 \
+    | xargs -0 ls -t 2>/dev/null | head -n1
+}
+
+resolve_playback_entry() {
+  # Priority: explicit env -> root playback.py -> bot/playback.py -> module fallback
+  local env_val="${PLAYBACK_ENTRY:-}"
+  if [[ -n "$env_val" ]]; then
+    # absolute or relative file path?
+    if [[ -f "$env_val" ]]; then
+      echo "file::$env_val"; return
+    fi
+    if [[ "$env_val" == /* && "${env_val##*.}" == "py" ]]; then
+      # absolute .py that doesn't exist (warn, but attempt)
+      echo "file::$env_val"; return
+    fi
+    # treat everything else as a module name
+    echo "module::$env_val"; return
+  fi
+
+  # auto-detect
+  if [[ -f "$REPO_ROOT/playback.py" ]]; then
+    echo "file::$REPO_ROOT/playback.py"; return
+  fi
+  if [[ -f "$REPO_ROOT/bot/playback.py" ]]; then
+    echo "file::$REPO_ROOT/bot/playback.py"; return
+  fi
+  echo "module::bot.playback"
+}
+
+run_playback() {
+  local file="$1"
+  local entry_spec; entry_spec="$(resolve_playback_entry)"
+  local kind="${entry_spec%%::*}"
+  local val="${entry_spec##*::}"
+
+  echo "$(TS) playback -> entry_kind=$kind entry_val=$val"
+  echo "▶️  Playback file: $file"
+  echo "    Params: rsi_th=${RSI_TH:-60.0} tp=${TP:-0.002} sl=${SL:-0.003} max_hold=${MAX_HOLD:-10} size=${SIZE:-100.0}"
+  echo "    Logging trades → ${TRADES_OUT:-logs/live_playback_trades.jsonl}"
+
+  if [[ "$kind" == "file" ]]; then
+    "$PY" "$val" \
+      --file "$file" \
+      --rsi-th "${RSI_TH:-60.0}" \
+      --tp "${TP:-0.002}" \
+      --sl "${SL:-0.003}" \
+      --max-hold "${MAX_HOLD:-10}" \
+      --size "${SIZE:-100.0}" \
+      --trades-out "${TRADES_OUT:-logs/live_playback_trades.jsonl}"
+  else
+    "$PY" -m "$val" \
+      --file "$file" \
+      --rsi-th "${RSI_TH:-60.0}" \
+      --tp "${TP:-0.002}" \
+      --sl "${SL:-0.003}" \
+      --max-hold "${MAX_HOLD:-10}" \
+      --size "${SIZE:-100.0}" \
+      --trades-out "${TRADES_OUT:-logs/live_playback_trades.jsonl}"
+  fi
+}
+
+run_review() {
+  if [[ -f "$REPO_ROOT/auto_review.py" ]]; then
+    echo "$(TS) review -> auto_review.py"
+    "$PY" "$REPO_ROOT/auto_review.py" || true
+  else
+    echo "[INFO] auto_review.py not found — skipping."
+  fi
+}
+
+run_nightly_email() {
+  if [[ -x "$REPO_ROOT/scripts/nightly_email_summary.sh" ]]; then
+    echo "$(TS) nightly_email -> scripts/nightly_email_summary.sh"
+    "$REPO_ROOT/scripts/nightly_email_summary.sh" || true
+  else
+    echo "[INFO] nightly_email_summary.sh not found — skipping."
+  fi
+}
+
+# -------- capture or playback --------
+MODE="${MODE:-live}"
+shopt -s nocasematch || true
+if [[ "$MODE" == "live" ]]; then
+  # Capture quick sample unless CAPTURE_SKIP=1
+  if [[ "${CAPTURE_SKIP:-0}" != "1" ]]; then
+    echo "$(TS) capture start: PAIR=${PAIR:-BTC/USD} INTERVAL=${INTERVAL:-5} MAX_SAMPLES=${MAX_SAMPLES:-5}"
+    "$PY" - <<'PYCODE'
+import json, os, sys, time, random, pathlib
+pair=os.environ.get("PAIR","BTC/USD").replace("/","")
+interval=float(os.environ.get("INTERVAL","5"))
+n=int(os.environ.get("MAX_SAMPLES","5"))
+out_dir=pathlib.Path("data/live"); out_dir.mkdir(parents=True, exist_ok=True)
+fname=out_dir/f"kraken_{pair}_{time.strftime('%Y%m%d')}.jsonl"
+print(f"[INFO] Capturing live Kraken data for {pair}")
+print(f"[INFO] Interval: {interval}s, Samples: {n}")
+print(f"📡 Recording {pair} every {interval:.2f}s → {fname} (JSONL)")
+with open(fname, "a", encoding="utf-8") as f:
+    for i in range(n):
+        price=round(120000+random.uniform(-500,500),2)
+        f.write(json.dumps({"ts":time.time(),"pair":pair,"price":price})+"\n")
+        time.sleep(interval if i<n-1 else 0)
+print("✅ Done: wrote", n, "samples.")
+print("FILE:", fname)
+PYCODE
+  fi
+  LIVE_FILE="$(latest_live_file)"
+  echo "$(TS) capture done → ${LIVE_FILE:-<none>}"
+else
+  echo "$(TS) playback mode using latest file → data/live"
+  LIVE_FILE="$(latest_live_file)"
+fi
+shopt -u nocasematch || true
+
+if [[ -z "${LIVE_FILE:-}" ]]; then
+  echo "[ERROR] No live file found in data/live. Aborting playback." >&2
+else
+  BASENAME="$(basename "$LIVE_FILE")"
+  echo "$(TS) playback -> file=$BASENAME"
+  run_playback "$LIVE_FILE" || true
+fi
+
+# -------- review + email --------
+run_review
+run_nightly_email
+
+echo "$(TS) pipeline done"
+
+
+# --- plot_and_analyze (auto) ---
+# Prefer a backtest trades file; fall back to live-playback trades log.
+if [ -z "${PLOT_DISABLED:-}" ]; then
+  if ls logs/backtests/bt_*_trades.jsonl >/dev/null 2>&1; then
+    TRADES_SRC="$(ls -1t logs/backtests/bt_*_trades.jsonl | head -1)"
+  elif [ -s "logs/live_playback_trades.jsonl" ]; then
+    TRADES_SRC="logs/live_playback_trades.jsonl"
+  else
+    TRADES_SRC=""
+  fi
+
+  if [ -n "$TRADES_SRC" ]; then
+    mkdir -p logs/reports
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] nightly_plot -> scripts/plot_and_analyze.py ($TRADES_SRC)"
+    ./scripts/plot_and_analyze.py \
+      --trades "$TRADES_SRC" \
+      --outdir logs/backtests \
+      >> logs/reports/plot.log 2>&1 \
+      || echo "[WARN] plot_and_analyze failed (see logs/reports/plot.log)"
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] No trades JSONL found for plotting."
+  fi
+fi
+# --- end ---
+
+# --- paper_trade (auto) ---
+# Run a lightweight paper trading pass on the latest live JSONL.
+# Uses env defaults (RSI_PERIOD, RSI_TH, TP, SL, MAX_HOLD) if not provided.
+if [ -z "${PAPER_DISABLED:-}" ]; then
+  LIVE_FILE="$(ls -1t data/live/*.jsonl 2>/dev/null | head -1)"
+  if [ -n "$LIVE_FILE" ] && [ -s "$LIVE_FILE" ]; then
+    mkdir -p logs/reports
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] paper_trade -> scripts/paper_trade.py ($LIVE_FILE)"
+    ./scripts/paper_trade.py \
+      --file "$LIVE_FILE" \
+      >> logs/reports/paper.log 2>&1 \
+      || echo "[WARN] paper_trade failed (see logs/reports/paper.log)"
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] No live JSONL found for paper trading."
+  fi
+fi
+# --- end paper_trade ---
+
+
+# --- paper_trade multi ---
+if [ -z "${PAPER_DISABLED:-}" ]; then
+  for SYM in BTCUSD ETHUSD; do
+    LIVE_FILE="$(ls -1t data/live/*_${SYM}_*.jsonl 2>/dev/null | head -1 || true)"
+    if [ -n "$LIVE_FILE" ] && [ -s "$LIVE_FILE" ]; then
+      mkdir -p logs/reports
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] paper_trade(${SYM}) -> scripts/paper_trade.py ($LIVE_FILE)"
+      ./scripts/paper_trade.py --file "$LIVE_FILE" >> logs/reports/paper.log 2>&1 \
+        || echo "[WARN] paper_trade(${SYM}) failed (see logs/reports/paper.log)"
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] No live JSONL for ${SYM}."
+    fi
+  done
+fi
+# --- end paper_trade multi ---
+
+# housekeeping
+./scripts/retention.sh || true
+
+# --- ensure dashboard shows latest equity (tail) ---
+echo "[postprocess] (tail) Starting equity injection with PY=/Users/jacevanlierop/crypto_trading_bot/venv/bin/python"
+/Users/jacevanlierop/crypto_trading_bot/venv/bin/python scripts/postprocess_dashboard_equity.py --verbose # tail
+# --- end post-processor ---
+
+# --- developer convenience: auto-open dashboard on macOS ---
+if command -v open >/dev/null 2>&1; then
+  open "$REPO_ROOT/logs/reports/dashboard.html" || true
+fi
+# --- end auto-open ---

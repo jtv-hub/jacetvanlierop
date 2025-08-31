@@ -1,0 +1,2 @@
+[console_scripts]
+nightly_pipeline = crypto_trading_bot.scripts.nightly_pipeline:run_pipeline

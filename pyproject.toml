@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto_trading_bot"
+version = "0.1.0"
+description = "A modular crypto trading bot with learning capabilities"
+authors = [{ name = "Jace Vanlierop", email = "jace@example.com" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+nightly_pipeline = "crypto_trading_bot.scripts.nightly_pipeline:run_pipeline"

@@ -1,0 +1,1 @@
+{"shadow_test_id": "f92de707-e695-45da-b5f7-1a0a45be2fff", "timestamp": "2025-08-27T21:51:08.100365+00:00", "strategy_name": "unknown", "param_change": {}, "rationale": "", "confidence": 0.0, "avg_roi": -0.01, "win_rate": 0.0, "sharpe": -11047.24, "threshold": 0.5, "status": "rejected", "reason": "Confidence 0.00 below threshold 0.50"}

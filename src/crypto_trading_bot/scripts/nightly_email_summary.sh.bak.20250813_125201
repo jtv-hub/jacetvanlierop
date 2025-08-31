@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+# === Config ===
+SUMMARY_SUBJECT="Crypto Bot Nightly Summary"
+SUMMARY_FILE="$(mktemp)"
+
+# === Gather metrics ===
+echo "📊 Crypto Bot Nightly Summary" > "$SUMMARY_FILE"
+echo "Date: $(date)" >> "$SUMMARY_FILE"
+echo >> "$SUMMARY_FILE"
+
+# Latest metrics snapshot
+if [ -f logs/snapshots/metrics_snapshots.csv ]; then
+    echo "📈 Latest Metrics:" >> "$SUMMARY_FILE"
+    tail -n 5 logs/snapshots/metrics_snapshots.csv >> "$SUMMARY_FILE"
+    echo >> "$SUMMARY_FILE"
+else
+    echo "⚠️ No metrics snapshots found." >> "$SUMMARY_FILE"
+    echo >> "$SUMMARY_FILE"
+fi
+
+# Latest health check
+if [ -f logs/reports/health.log ]; then
+    echo "🩺 Latest Health Checks:" >> "$SUMMARY_FILE"
+    tail -n 5 logs/reports/health.log >> "$SUMMARY_FILE"
+    echo >> "$SUMMARY_FILE"
+else
+    echo "⚠️ No health logs found." >> "$SUMMARY_FILE"
+    echo >> "$SUMMARY_FILE"
+fi
+
+# === Send the summary via notify.sh ===
+./scripts/notify.sh INFO "$SUMMARY_SUBJECT" "$(cat "$SUMMARY_FILE")"
+
+# Clean up
+rm -f "$SUMMARY_FILE"

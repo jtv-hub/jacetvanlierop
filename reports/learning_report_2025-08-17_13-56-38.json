@@ -1,0 +1,12 @@
+{
+    "win_rate": 0.0,
+    "roi_percent": 1166.67,
+    "avg_trade_return": 0.02,
+    "trade_count": 2,
+    "sharpe_ratio": 0.302,
+    "sortino_ratio": 0.0,
+    "max_drawdown": 250.0,
+    "avg_trade_duration": 0.0,
+    "avg_vol_entry": 1200.0,
+    "avg_vol_exit": 1600.0
+}

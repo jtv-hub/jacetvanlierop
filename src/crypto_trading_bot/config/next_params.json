@@ -1,0 +1,78 @@
+{
+  "BTCUSD": {
+    "observations": {
+      "trades": 471,
+      "win_rate": 0.471,
+      "avg_pnl": -0.00026,
+      "avg_win": 0.00321,
+      "avg_loss": -0.00335
+    },
+    "suggested": {
+      "rsi_th": 60,
+      "tp": 0.002,
+      "sl": 0.003,
+      "trail": {
+        "mode": "pct",
+        "pct": 0.002,
+        "activate": 0.0
+      }
+    }
+  },
+  "ETHUSD": {
+    "observations": {
+      "trades": 1613,
+      "win_rate": 0.483,
+      "avg_pnl": -0.00067,
+      "avg_win": 0.00319,
+      "avg_loss": -0.00428
+    },
+    "suggested": {
+      "rsi_th": 60,
+      "tp": 0.002,
+      "sl": 0.0021,
+      "trail": {
+        "mode": "pct",
+        "pct": 0.002,
+        "activate": 0.0
+      }
+    }
+  },
+  "SOLUSD": {
+    "observations": {
+      "trades": 1936,
+      "win_rate": 0.608,
+      "avg_pnl": 0.00032,
+      "avg_win": 0.00319,
+      "avg_loss": -0.00413
+    },
+    "suggested": {
+      "rsi_th": 55,
+      "tp": 0.002,
+      "sl": 0.003,
+      "trail": {
+        "mode": "pct",
+        "pct": 0.002,
+        "activate": 0.0
+      }
+    }
+  },
+  "UNKNOWN": {
+    "observations": {
+      "trades": 82,
+      "win_rate": 0.451,
+      "avg_pnl": 58.45885,
+      "avg_win": 129.80118,
+      "avg_loss": -0.20039
+    },
+    "suggested": {
+      "rsi_th": 60,
+      "tp": 0.002,
+      "sl": 0.003,
+      "trail": {
+        "mode": "pct",
+        "pct": 0.002,
+        "activate": 0.0
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[
+  {
+    "category": "parameter_tuning",
+    "suggestion": "Use params {} for SimpleRSIStrategy (score: -954.369)",
+    "confidence": -954.369,
+    "reason": "Backtest shows ROI=-0.01, Win Rate=0.00, Sharpe=-9543.65"
+  }
+]

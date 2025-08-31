@@ -1,0 +1,1 @@
+{"trade_id": "ecc49416-21d4-4a37-9fa4-e3b69147e900", "pair": "BTC/USD", "size": 0.001, "entry_price": 18183.4653, "timestamp": "2025-08-31T18:30:44.352929+00:00", "strategy": "SimpleRSIStrategy", "confidence": 0.5, "high_water_mark": 18183.4653}

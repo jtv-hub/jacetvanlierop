@@ -1,0 +1,2 @@
+{"timestamp": "2025-08-16 12:10:15", "strategy_name": "RSI", "param_change": {"rsi_upper": 65}, "confidence": 0.75, "shadow_test_status": "pass", "final_decision": "approved"}
+{"timestamp": "2025-08-16 12:10:15", "strategy_name": "MACD", "param_change": {"fast": 10, "slow": 30}, "confidence": 0.55, "shadow_test_status": "fail", "final_decision": "rejected"}
