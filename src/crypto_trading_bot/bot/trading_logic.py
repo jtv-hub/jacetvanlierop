@@ -208,6 +208,15 @@ def save_portfolio_state(ctx):
 
 
 def evaluate_signals_and_trade(check_exits_only=False):
+    # REFRACTOR-HOOKS: harmless calls while we peel logic out
+    try:
+        _signals = gather_signals(prices=None, volumes=None, context=None)
+        _ok = risk_screen(_signals, context=None)
+        _ = (_signals, _ok, execute_trade(_signals, context=None), check_and_close_exits(context=None))
+    except Exception:
+        # swallow: keep exact runtime behavior for now
+        pass
+
     """Evaluates trade signals and manages trade execution and exits."""
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
@@ -493,6 +502,54 @@ def evaluate_signals_and_trade(check_exits_only=False):
             )
             + "\n"
         )
+
+
+def gather_signals(prices, volumes, context):
+    """Collect and compute raw indicators/signals needed for decisions.
+
+    Parameters
+    ----------
+    prices : Any
+        Price series or last-tick structure.
+    volumes : Any
+        Volume series or last-tick structure.
+    context : Any
+        TradingContext or equivalent.
+
+    Returns
+    -------
+    dict
+        Minimal placeholder structure; populated in later refactors.
+    """
+    return {"rsi": None, "trend": None, "raw": {"prices": prices, "volumes": volumes}}
+
+
+def risk_screen(signals, context) -> bool:
+    """Placeholder risk gate. Return True if it's *allowed* to trade.
+
+    This stub is permissive (always True) to avoid behavior changes.
+    """
+    _ = (signals, context)
+    return True
+
+
+def execute_trade(signals, context):
+    """Execute trade(s) based on signals.
+
+    Returns a list of trade-like dicts for testing only; production flow
+    still uses existing paths until we finish the split.
+    """
+    _ = (signals, context)
+    return []
+
+
+def check_and_close_exits(context) -> int:
+    """Check exit rules and close positions if needed.
+
+    Returns the number of closed positions (0 in stub).
+    """
+    _ = context
+    return 0
 
 
 if __name__ == "__main__":

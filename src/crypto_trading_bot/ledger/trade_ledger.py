@@ -43,6 +43,25 @@ def _slippage_rate_for_pair(pair: str) -> float:
     return (lo + hi) / 2.0
 
 
+def _apply_exit_slippage(pair: str, exit_price: float) -> float:
+    """Stub slippage helper (no-op) to preserve existing behavior.
+
+    Parameters
+    ----------
+    pair : str
+        Trading pair, e.g., "BTC/USD".
+    exit_price : float
+        Raw exit price.
+
+    Returns
+    -------
+    float
+        Unmodified price (refactor hook point).
+    """
+    _ = pair
+    return float(exit_price)
+
+
 class TradeLedger:
     """
     A class to manage trade lifecycle logging, updating, and validation.
