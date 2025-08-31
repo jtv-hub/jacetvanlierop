@@ -7,13 +7,12 @@ Intended to be scheduled (daily/weekly).
 """
 
 import logging
+
 from crypto_trading_bot.learning.learning_machine import LearningMachine
 from crypto_trading_bot.scripts.export_learning_report import export_learning_report
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def run_daily_learning_cycle():

@@ -8,14 +8,10 @@ trading strategies in the crypto trading bot framework.
 import random
 
 
-def _wobble_series(
-    start: float, steps: int, step_min: float, step_max: float
-) -> list[float]:
+def _wobble_series(start: float, steps: int, step_min: float, step_max: float) -> list[float]:
     vals = [start]
     for _ in range(1, steps):
-        vals.append(
-            vals[-1] + random.choice([-1, 1]) * random.uniform(step_min, step_max)
-        )
+        vals.append(vals[-1] + random.choice([-1, 1]) * random.uniform(step_min, step_max))
     return vals
 
 

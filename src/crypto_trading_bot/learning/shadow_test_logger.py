@@ -5,8 +5,8 @@ Logs the results of shadow tests for rejected learning suggestions, allowing
 comparison between user-accepted strategies and machine-suggested alternatives.
 """
 
-import os
 import json
+import os
 from datetime import datetime
 
 SHADOW_TEST_LOG_PATH = "logs/shadow_test_results.log"

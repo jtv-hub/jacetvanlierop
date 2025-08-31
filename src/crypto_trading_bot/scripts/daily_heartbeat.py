@@ -8,6 +8,7 @@ and other periodic health checks or cleanup routines.
 
 import sys
 import traceback
+
 from crypto_trading_bot.bot.state.portfolio_state import (
     get_reinvestment_rate,
 )

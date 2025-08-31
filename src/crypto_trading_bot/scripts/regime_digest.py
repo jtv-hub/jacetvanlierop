@@ -11,11 +11,11 @@ Output files are named like:
 
 from __future__ import annotations
 
+import json
+import logging
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-import json
-import logging
 from typing import Dict, Iterable, List, Tuple
 
 LOGS_DIR = Path("logs")
@@ -60,9 +60,7 @@ def _group_by_regime(entries: Iterable[dict]) -> Dict[str, List[dict]]:
 
 def _avg_conf(entries: Iterable[dict]) -> float:
     """Average of 'confidence' for the given entries, 0.0 if none."""
-    vals = [
-        float(e.get("confidence")) for e in entries if e.get("confidence") is not None
-    ]
+    vals = [float(e.get("confidence")) for e in entries if e.get("confidence") is not None]
     if not vals:
         return 0.0
     return sum(vals) / len(vals)

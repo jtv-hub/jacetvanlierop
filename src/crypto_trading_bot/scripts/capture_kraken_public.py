@@ -14,6 +14,7 @@ This uses only Kraken's *public* REST endpoint. No API keys required.
 from __future__ import annotations
 
 import json
+import ssl
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,8 +22,6 @@ from pathlib import Path
 from typing import Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
-
-import ssl
 
 # Prefer certifi if available to avoid SSL issues, otherwise fall back.
 try:

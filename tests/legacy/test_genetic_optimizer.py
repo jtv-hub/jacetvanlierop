@@ -1,9 +1,11 @@
 import unittest
 
+from crypto_trading_bot.bot.strategies.dual_threshold_strategies import (
+    DualThresholdStrategy,
+)
+from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
 from crypto_trading_bot.bot.utils.historical_data_loader import load_dummy_price_data
 from crypto_trading_bot.optimizer.genetic_optimizer import evaluate_fitness
-from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
-from crypto_trading_bot.bot.strategies.dual_threshold_strategies import DualThresholdStrategy
 
 
 class TestGeneticOptimizer(unittest.TestCase):

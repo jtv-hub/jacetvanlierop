@@ -16,11 +16,10 @@ import argparse
 import datetime as dt
 import json
 import time
-from pathlib import Path
-from typing import Optional
-
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Optional
 
 API = "https://api.kraken.com/0/public/Ticker?pair={pair}"
 
@@ -71,8 +70,7 @@ def fetch_price(pair_for_user: str, *, verbose: bool = False) -> Optional[float]
                 if r.status != 200:
                     dbg(
                         verbose,
-                        f"[capture] HTTP {r.status} for {query_pair} "
-                        f"(attempt {i}/{attempts})",
+                        f"[capture] HTTP {r.status} for {query_pair} " f"(attempt {i}/{attempts})",
                     )
                     time.sleep(0.6)
                     continue
@@ -83,8 +81,7 @@ def fetch_price(pair_for_user: str, *, verbose: bool = False) -> Optional[float]
             if data.get("error"):
                 dbg(
                     verbose,
-                    f"[capture] Kraken error {data['error']} for {query_pair} "
-                    f"(attempt {i}/{attempts})",
+                    f"[capture] Kraken error {data['error']} for {query_pair} " f"(attempt {i}/{attempts})",
                 )
                 time.sleep(0.6)
                 continue
@@ -93,8 +90,7 @@ def fetch_price(pair_for_user: str, *, verbose: bool = False) -> Optional[float]
             if not result:
                 dbg(
                     verbose,
-                    f"[capture] Empty result for {query_pair} "
-                    f"(attempt {i}/{attempts})",
+                    f"[capture] Empty result for {query_pair} " f"(attempt {i}/{attempts})",
                 )
                 time.sleep(0.6)
                 continue
@@ -105,8 +101,7 @@ def fetch_price(pair_for_user: str, *, verbose: bool = False) -> Optional[float]
             if not last_trade or not last_trade[0]:
                 dbg(
                     verbose,
-                    f"[capture] Missing 'c' field for {query_pair} "
-                    f"(attempt {i}/{attempts})",
+                    f"[capture] Missing 'c' field for {query_pair} " f"(attempt {i}/{attempts})",
                 )
                 time.sleep(0.6)
                 continue
@@ -138,9 +133,7 @@ def fetch_price(pair_for_user: str, *, verbose: bool = False) -> Optional[float]
 def main() -> None:
     """CLI entrypoint."""
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--pair", required=True, help="Kraken pair like BTCUSD, ETHUSD, SOLUSD"
-    )
+    ap.add_argument("--pair", required=True, help="Kraken pair like BTCUSD, ETHUSD, SOLUSD")
     ap.add_argument("--seconds", type=int, default=60, help="How long to capture")
     ap.add_argument("--interval", type=int, default=5, help="Seconds between polls")
     ap.add_argument("--verbose", action="store_true", help="Print diagnostics")
@@ -159,9 +152,7 @@ def main() -> None:
             px = fetch_price(args.pair, verbose=args.verbose)
             if px is not None:
                 obj = {
-                    "ts": dt.datetime.now(dt.timezone.utc).isoformat(
-                        timespec="seconds"
-                    ),
+                    "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
                     "pair": args.pair.upper(),
                     "price": px,
                     "source": "kraken",
@@ -170,9 +161,7 @@ def main() -> None:
                 fh.flush()
                 wrote += 1
             else:
-                dbg(
-                    args.verbose, f"[capture] {args.pair.upper()} poll returned no data"
-                )
+                dbg(args.verbose, f"[capture] {args.pair.upper()} poll returned no data")
             time.sleep(max(1, args.interval))
 
     print(f"[capture] {args.pair.upper()} wrote {wrote} rows -> {out_path}")

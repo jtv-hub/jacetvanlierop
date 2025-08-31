@@ -151,10 +151,7 @@ def append_csv(
     by_strat: Dict[str, Dict[str, float]],
 ) -> None:
     """Append a metrics row to the CSV (creating it with a header if absent)."""
-    header = (
-        "timestamp,count,wins,win_rate,avg_win,avg_loss,expectancy,"
-        "by_strategy_json\n"
-    )
+    header = "timestamp,count,wins,win_rate,avg_win,avg_loss,expectancy," "by_strategy_json\n"
     row = (
         f"{ts:%Y-%m-%d %H:%M:%S},"
         f"{int(overall['count'])},"
@@ -193,9 +190,7 @@ def main() -> int:
     print("By strategy:")
     for strat, met in by_strat.items():
         # split into two short prints to avoid long line
-        left = (
-            f"  - {strat}: n={int(met['count'])}, " f"win%={met['win_rate']*100:.1f}%"
-        )
+        left = f"  - {strat}: n={int(met['count'])}, " f"win%={met['win_rate']*100:.1f}%"
         right = f"    exp/trade={met['expectancy']:.2f}"
         print(left)
         print(right)

@@ -3,8 +3,8 @@ One-off script to insert dummy trades into logs/trades.log
 for testing the learning machine and scheduler.
 """
 
-import os
 import json
+import os
 
 # Ensure logs directory exists
 os.makedirs("logs", exist_ok=True)

@@ -51,9 +51,7 @@ def inspect_sync():
             t_price = trade_map[tid].get("entry_price")
             p_price = position_map[tid].get("entry_price")
             if round(float(t_price), 4) != round(float(p_price), 4):
-                print(
-                    f"⚠️ Price mismatch for {tid}: trades.log={t_price}, positions.jsonl={p_price}"
-                )
+                print(f"⚠️ Price mismatch for {tid}: trades.log={t_price}, positions.jsonl={p_price}")
                 errors += 1
 
     if errors == 0:

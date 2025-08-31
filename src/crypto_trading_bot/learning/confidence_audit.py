@@ -4,11 +4,12 @@ confidence_audit.py
 Audits the trade log to identify malformed or out-of-range confidence values.
 """
 
+import fcntl
 import json
+import logging
 import os
 from datetime import datetime, timezone
-import logging
-import fcntl
+
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
 
@@ -209,11 +210,7 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
         positions = validator.load_json_lines(positions_file, "positions.jsonl")
         pos_ids = {p.get("trade_id") for p in positions if p.get("trade_id")}
         for i, t in enumerate(trades_list):
-            if (
-                t.get("status") == "closed"
-                and t.get("exit_price") is not None
-                and t.get("trade_id") in pos_ids
-            ):
+            if t.get("status") == "closed" and t.get("exit_price") is not None and t.get("trade_id") in pos_ids:
                 anomaly = {
                     "index": i,
                     "type": "closed_trade_still_in_positions",
@@ -245,9 +242,7 @@ def print_audit_report(results):
         )
 
 
-def cleanup_closed_positions(
-    trades_file="logs/trades.log", positions_file="logs/positions.jsonl"
-) -> int:
+def cleanup_closed_positions(trades_file="logs/trades.log", positions_file="logs/positions.jsonl") -> int:
     """Remove any positions whose matching trade is closed from positions.jsonl.
 
     Returns the number of positions removed.
@@ -256,17 +251,16 @@ def cleanup_closed_positions(
         validator = SyncValidator()
         trades = validator.load_json_lines(trades_file, "trades.log")
         closed_ids = {
-            t.get("trade_id")
-            for t in trades
-            if t.get("status") == "closed" and t.get("exit_price") is not None
+            t.get("trade_id") for t in trades if t.get("status") == "closed" and t.get("exit_price") is not None
         }
         if not os.path.exists(positions_file) or not closed_ids:
             return 0
         removed = 0
         tmp_path = positions_file + ".tmp"
-        with open(positions_file, "r", encoding="utf-8") as src, open(
-            tmp_path, "w", encoding="utf-8"
-        ) as dst:
+        with (
+            open(positions_file, "r", encoding="utf-8") as src,
+            open(tmp_path, "w", encoding="utf-8") as dst,
+        ):
             fcntl.flock(dst, fcntl.LOCK_EX)
             try:
                 for line in src:
@@ -285,23 +279,17 @@ def cleanup_closed_positions(
         os.replace(tmp_path, positions_file)
         return removed
     except (OSError, IOError, ValueError, TypeError, json.JSONDecodeError) as e:
-        log_anomaly(
-            {"type": "positions_cleanup_error", "error": str(e)}, source="audit"
-        )
+        log_anomaly({"type": "positions_cleanup_error", "error": str(e)}, source="audit")
         return 0
 
 
-def run_and_cleanup(
-    trade_log_path="logs/trades.log", positions_file="logs/positions.jsonl"
-) -> dict:
+def run_and_cleanup(trade_log_path="logs/trades.log", positions_file="logs/positions.jsonl") -> dict:
     """Run audit, perform cleanup of closed positions, rerun audit, and return summary.
 
     Returns a dict: {"initial_errors": int, "removed": int, "final_errors": int, "errors": [..]}
     """
     report1 = audit_trades(trade_log_path, positions_file=positions_file)
-    removed = cleanup_closed_positions(
-        trades_file=trade_log_path, positions_file=positions_file
-    )
+    removed = cleanup_closed_positions(trades_file=trade_log_path, positions_file=positions_file)
     report2 = audit_trades(trade_log_path, positions_file=positions_file)
     return {
         "initial_errors": len(report1),

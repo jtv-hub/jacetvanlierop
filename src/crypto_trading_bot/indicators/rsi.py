@@ -4,9 +4,10 @@ rsi.py
 Implements the Relative Strength Index (RSI) calculation for trading strategies.
 """
 
-import os
 import json
+import os
 from datetime import datetime, timezone
+
 import numpy as np
 
 

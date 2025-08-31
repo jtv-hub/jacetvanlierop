@@ -3,10 +3,10 @@ Learning Pipeline Controller
 Coordinates the review-learning-shadow process into a single run.
 """
 
+import importlib
+import json
 import logging
 import os
-import json
-import importlib
 from logging.handlers import RotatingFileHandler
 
 # === Dynamic imports (fixes IDE & runtime issues) ===
@@ -79,9 +79,7 @@ def run_learning_pipeline():
 
         passed = [r for r in results if r.get("status") == "pass"]
         failed = [r for r in results if r.get("status") == "fail"]
-        logger.info(
-            "Shadow tests complete: %d passed, %d failed", len(passed), len(failed)
-        )
+        logger.info("Shadow tests complete: %d passed, %d failed", len(passed), len(failed))
 
         # === Step 3: Update learning machine ===
         logger.info("Step 3: Updating learning machine with results...")

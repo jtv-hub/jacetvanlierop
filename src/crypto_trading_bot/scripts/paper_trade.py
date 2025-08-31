@@ -151,9 +151,7 @@ def _symbol_from_filename(p: Path) -> str:
     return "UNKNOWN"
 
 
-def _paper_trades_from_ticks(
-    symbol: str, ticks: List[Tick], params: TradeParams, file_source: Path
-) -> Iterator[dict]:
+def _paper_trades_from_ticks(symbol: str, ticks: List[Tick], params: TradeParams, file_source: Path) -> Iterator[dict]:
     """Simulate paper trades from price ticks using given trade parameters."""
     if len(ticks) < 2:
         return
@@ -207,12 +205,8 @@ def _paper_trades_from_ticks(
             yield emit_exit(i, "stop_loss")
             continue
 
-        if params.trail.mode == "pct" and params.trail.armed(
-            up_pct
-        ):  # pylint: disable=no-member
-            trail_stop = trail_high * (
-                1.0 - params.trail.pct
-            )  # pylint: disable=no-member
+        if params.trail.mode == "pct" and params.trail.armed(up_pct):  # pylint: disable=no-member
+            trail_stop = trail_high * (1.0 - params.trail.pct)  # pylint: disable=no-member
             if px <= trail_stop:
                 yield emit_exit(i, "trailing_stop")
                 continue
@@ -282,18 +276,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ]
             ):
                 trail = Trail(
-                    mode=(
-                        args.trail_mode if args.trail_mode else params.trail.mode
-                    ),  # pylint: disable=no-member
+                    mode=(args.trail_mode if args.trail_mode else params.trail.mode),  # pylint: disable=no-member
                     pct=(
-                        args.trail_pct
-                        if args.trail_pct is not None
-                        else params.trail.pct
+                        args.trail_pct if args.trail_pct is not None else params.trail.pct
                     ),  # pylint: disable=no-member
                     activate=(
-                        args.trail_activate
-                        if args.trail_activate is not None
-                        else params.trail.activate
+                        args.trail_activate if args.trail_activate is not None else params.trail.activate
                     ),  # pylint: disable=no-member
                 )
                 params = TradeParams(tp=params.tp, sl=params.sl, trail=trail)

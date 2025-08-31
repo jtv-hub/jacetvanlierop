@@ -24,9 +24,7 @@ PROPOSALS_LOG = Path("logs/learning_proposals.jsonl")
 REPORTS_DIR = Path("logs/reports")
 
 # Logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -112,9 +110,7 @@ def build_digest_text() -> str:
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
     lines.append(f"Trades logged (all time): {trades_count}")
-    lines.append(
-        f"Learning entries today: {today_count} | Avg confidence: {today_avg:.4f}"
-    )
+    lines.append(f"Learning entries today: {today_count} | Avg confidence: {today_avg:.4f}")
     lines.append("")
 
     if conf:
@@ -138,9 +134,7 @@ def build_digest_text() -> str:
         dconf = metrics.get("delta_conf")
         orig = metrics.get("original_trades")
         shdw = metrics.get("shadow_trades")
-        lines.append(
-            "  - Metrics: " f"orig={orig}, shadow={shdw}, coverage={cov}, Δconf={dconf}"
-        )
+        lines.append("  - Metrics: " f"orig={orig}, shadow={shdw}, coverage={cov}, Δconf={dconf}")
         reason = decision.get("reason")
         if reason:
             lines.append(f"  - Reason: {reason}")

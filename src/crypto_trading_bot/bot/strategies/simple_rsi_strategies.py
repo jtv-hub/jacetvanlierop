@@ -5,6 +5,7 @@ Implements the SimpleRSIStrategy class using RSI thresholds.
 """
 
 from typing import List
+
 from crypto_trading_bot.indicators.rsi import calculate_rsi
 
 
@@ -47,14 +48,8 @@ class SimpleRSIStrategy:
             dict: A dictionary containing the signal type and confidence level.
         """
         # Filter 1: Price validity and sufficiency
-        if (
-            not prices
-            or len(prices) < max(self.period + 1, 5)
-            or any(p is None or p <= 0 for p in prices)
-        ):
-            print(
-                f"[DEBUG] SimpleRSIStrategy invalid prices: len={len(prices) if prices else 0}"
-            )
+        if not prices or len(prices) < max(self.period + 1, 5) or any(p is None or p <= 0 for p in prices):
+            print(f"[DEBUG] SimpleRSIStrategy invalid prices: len={len(prices) if prices else 0}")
             return {"signal": None, "confidence": 0.0}
 
         # Filter 2: Volume check

@@ -3,7 +3,7 @@ Signal Filter Utility
 Prevents duplicate trades on the same asset in a single evaluation cycle.
 """
 
-from typing import List, Dict
+from typing import Dict, List
 
 
 def filter_duplicate_signals(trade_signals: List[Dict]) -> List[Dict]:

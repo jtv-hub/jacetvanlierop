@@ -114,9 +114,7 @@ def _ensure_csv_header(csv_path: Path) -> None:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                ["timestamp", "total_realized", "total_open_pnl", "by_strategy_json"]
-            )
+            writer.writerow(["timestamp", "total_realized", "total_open_pnl", "by_strategy_json"])
 
 
 def write_snapshot() -> None:

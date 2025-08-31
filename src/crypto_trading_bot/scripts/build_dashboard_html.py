@@ -28,9 +28,7 @@ def _iso_to_dt(s: str) -> datetime:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         # Fallback: parse basic form (YYYY-mm-ddTHH:MM:SS) and assume UTC.
-        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(
-            tzinfo=timezone.utc
-        )
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
 
 
 def _age_secs(p: Path) -> int:

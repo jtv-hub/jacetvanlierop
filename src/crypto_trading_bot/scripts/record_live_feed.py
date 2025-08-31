@@ -34,7 +34,6 @@ from data.adapters.kraken_public import (
     KrakenPublicAdapter,
 )  # pylint: disable=wrong-import-position
 
-
 # ------------------------------- Utilities --------------------------------- #
 
 
@@ -188,10 +187,7 @@ def run_collector(cfg: CollectorConfig) -> None:
     if not adapter.ping():
         print("⚠️  Kraken public API did not respond to ping(). Proceeding anyway…")
 
-    print(
-        f"📡 Recording {cfg.pair} every {cfg.interval:.2f}s "
-        f"→ {out_path} ({cfg.fmt.upper()})"
-    )
+    print(f"📡 Recording {cfg.pair} every {cfg.interval:.2f}s " f"→ {out_path} ({cfg.fmt.upper()})")
 
     backoff = 1.0
     written = 0
@@ -209,10 +205,7 @@ def run_collector(cfg: CollectorConfig) -> None:
                     elapsed = time.time() - started
                     rate = written / max(elapsed, 1e-6)
                     last = data.get("last")
-                    print(
-                        f"[{utc_now_str()}] samples={written} "
-                        f"rate={rate:.2f}/s last={last}"
-                    )
+                    print(f"[{utc_now_str()}] samples={written} " f"rate={rate:.2f}/s last={last}")
 
                 if cfg.max_samples is not None and written >= cfg.max_samples:
                     print(f"✅ Done: wrote {written} samples.")

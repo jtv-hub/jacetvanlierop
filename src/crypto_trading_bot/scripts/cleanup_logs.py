@@ -96,9 +96,7 @@ def delete_paths(paths: Iterable[Path], dry_run: bool) -> None:
                     pass
 
 
-def prune_by_age(
-    folder: Path, patterns: Iterable[str], days: int, dry_run: bool
-) -> Tuple[int, int]:
+def prune_by_age(folder: Path, patterns: Iterable[str], days: int, dry_run: bool) -> Tuple[int, int]:
     """Remove files in `folder` older than `days`. Return (kept, removed)."""
     if not folder.exists():
         return 0, 0
@@ -107,9 +105,7 @@ def prune_by_age(
     remove = [p for p in candidates if older_than(p, cutoff) and p not in PROTECTED]
     kept = len(candidates) - len(remove)
     if remove:
-        logging.info(
-            "Pruning by age in %s (>%d days): %d files", folder, days, len(remove)
-        )
+        logging.info("Pruning by age in %s (>%d days): %d files", folder, days, len(remove))
         delete_paths(remove, dry_run)
     return kept, len(remove)
 
@@ -243,12 +239,8 @@ def main() -> int:
     logging.info("🧹 Starting cleanup (dry_run=%s)", args.dry_run)
 
     # 1) Age-based pruning
-    kept_r, removed_r = prune_by_age(
-        REPORTS_DIR, ["*.txt"], args.reports_days, args.dry_run
-    )
-    kept_s, removed_s = prune_by_age(
-        SNAPSHOTS_DIR, ["*.csv"], args.snapshots_days, args.dry_run
-    )
+    kept_r, removed_r = prune_by_age(REPORTS_DIR, ["*.txt"], args.reports_days, args.dry_run)
+    kept_s, removed_s = prune_by_age(SNAPSHOTS_DIR, ["*.csv"], args.snapshots_days, args.dry_run)
     logging.info(
         "Reports: kept=%d, removed=%d | Snapshots: kept=%d, removed=%d",
         kept_r,

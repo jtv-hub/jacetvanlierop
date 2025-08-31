@@ -6,8 +6,10 @@ for trading strategies using historical price data and a fitness function.
 """
 
 from __future__ import annotations
+
 import random
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
+
 from crypto_trading_bot.bot.utils.alert import send_alert
 
 
@@ -71,9 +73,7 @@ def evaluate_fitness(
     return results
 
 
-def select_top_n(
-    results: List[Tuple[Dict, float]], n: int = 5
-) -> List[Tuple[Dict, float]]:
+def select_top_n(results: List[Tuple[Dict, float]], n: int = 5) -> List[Tuple[Dict, float]]:
     """Select top N performing parameter sets."""
     return sorted(results, key=lambda x: x[1], reverse=True)[:n]
 

@@ -5,6 +5,7 @@ This makes them valid Python packages for absolute imports.
 
 import os
 
+
 def ensure_init_files(root_folder: str):
     """Walk through the project and ensure every folder has an __init__.py"""
     for dirpath, _, _ in os.walk(root_folder):
@@ -19,6 +20,7 @@ def ensure_init_files(root_folder: str):
             print(f"[added] {init_file}")
         else:
             print(f"[exists] {init_file}")
+
 
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.abspath(__file__))

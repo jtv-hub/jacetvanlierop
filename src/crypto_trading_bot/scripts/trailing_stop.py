@@ -23,7 +23,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-
 Side = Literal["long", "short"]
 Mode = Literal["pct", "atr"]
 
@@ -60,9 +59,7 @@ class TrailingStop:
     For shorts: symmetric.
     """
 
-    def __init__(
-        self, side: Side, entry: float, cfg: TrailConfig, atr: float | None = None
-    ):
+    def __init__(self, side: Side, entry: float, cfg: TrailConfig, atr: float | None = None):
         if side not in ("long", "short"):
             raise ValueError("side must be 'long' or 'short'")
         if cfg.mode == "atr" and (atr is None or atr <= 0):

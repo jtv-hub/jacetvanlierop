@@ -5,12 +5,12 @@ Evaluates signals using predefined strategies, executes mock trades,
 manages open positions, and checks exit conditions.
 """
 
-import random
 import datetime
-import uuid
-import os
 import json
+import os
+import random
 import time
+import uuid
 
 # Optional dependency for correlation checks
 try:
@@ -18,13 +18,13 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
-from crypto_trading_bot.context.trading_context import TradingContext
-from crypto_trading_bot.ledger.trade_ledger import TradeLedger
-from crypto_trading_bot.indicators.rsi import calculate_rsi
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.context.trading_context import TradingContext
+from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
-from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
+from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
 
@@ -37,31 +37,11 @@ ACCOUNT_SIZE = 100000
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
 mock_price_data = {
-    "BTC": [
-        19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)
-    ],  # Random up/down trend
-    "ETH": [
-        2000
-        + sum(random.choice([-1, 1]) * random.uniform(0.5, 3.0) for _ in range(i + 1))
-        for i in range(100)
-    ],
-    "XRP": [
-        0.5
-        + sum(
-            random.choice([-1, 1]) * random.uniform(0.001, 0.01) for _ in range(i + 1)
-        )
-        for i in range(100)
-    ],
-    "LINK": [
-        7
-        + sum(random.choice([-1, 1]) * random.uniform(0.01, 0.1) for _ in range(i + 1))
-        for i in range(100)
-    ],
-    "SOL": [
-        20
-        + sum(random.choice([-1, 1]) * random.uniform(0.05, 0.4) for _ in range(i + 1))
-        for i in range(100)
-    ],
+    "BTC": [19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)],  # Random up/down trend
+    "ETH": [2000 + sum(random.choice([-1, 1]) * random.uniform(0.5, 3.0) for _ in range(i + 1)) for i in range(100)],
+    "XRP": [0.5 + sum(random.choice([-1, 1]) * random.uniform(0.001, 0.01) for _ in range(i + 1)) for i in range(100)],
+    "LINK": [7 + sum(random.choice([-1, 1]) * random.uniform(0.01, 0.1) for _ in range(i + 1)) for i in range(100)],
+    "SOL": [20 + sum(random.choice([-1, 1]) * random.uniform(0.05, 0.4) for _ in range(i + 1)) for i in range(100)],
 }
 
 mock_volume_data = {
@@ -118,17 +98,13 @@ class PositionManager:
         except (OSError, IOError) as e:
             print(f"[PositionManager] Error writing to positions.jsonl: {e}")
 
-    def check_exits(
-        self, current_prices, tp=0.002, sl=0.0015, trailing_stop=0.01, max_hold_bars=14
-    ):
+    def check_exits(self, current_prices, tp=0.002, sl=0.0015, trailing_stop=0.01, max_hold_bars=14):
         """Checks each open position for exit criteria like SL, TP, or max hold."""
         exits = []
         current_time = datetime.datetime.now(datetime.UTC)
         keys_to_delete = []
         for trade_id, pos in self.positions.items():
-            price = current_prices.get(
-                pos["pair"], pos["entry_price"]
-            )  # ledger applies exit slippage
+            price = current_prices.get(pos["pair"], pos["entry_price"])  # ledger applies exit slippage
             if price <= 0:
                 continue
             if "high_water_mark" not in pos:
@@ -146,15 +122,11 @@ class PositionManager:
                 history = mock_price_data.get(asset)
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
                     rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])
-                    exit_upper = CONFIG["rsi"].get(
-                        "exit_upper", CONFIG["rsi"].get("upper", 70)
-                    )
+                    exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
                     if rsi_val is not None and rsi_val >= exit_upper:
                         exit_price = price
                         reason = "RSI_EXIT"
-                        print(
-                            f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} rsi={rsi_val:.2f}"
-                        )
+                        print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} rsi={rsi_val:.2f}")
                         exits.append((trade_id, exit_price, reason))
                         keys_to_delete.append(trade_id)
                         continue
@@ -207,9 +179,7 @@ class PositionManager:
                                     pos["high_water_mark"] = pos["entry_price"]
                                 pos["timestamp"] = pos.get("timestamp")
                                 self.positions[trade_id] = pos
-                                print(
-                                    f"[DEBUG] Loaded position {trade_id} from positions.jsonl"
-                                )
+                                print(f"[DEBUG] Loaded position {trade_id} from positions.jsonl")
                         except json.JSONDecodeError:
                             print("⚠️ Failed to parse position.")
             except (OSError, IOError) as e:
@@ -241,9 +211,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
     """Evaluates trade signals and manages trade execution and exits."""
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
-    current_prices = {
-        f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()
-    }
+    current_prices = {f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()}
 
     # Refresh current market regime and capital buffer before signal evaluation
     context.update_context()
@@ -274,9 +242,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                         f.write(
                             json.dumps(
                                 {
-                                    "timestamp": datetime.datetime.now(
-                                        datetime.UTC
-                                    ).isoformat(),
+                                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                                     "type": "Signal Error",
                                     "error": str(e),
                                     "strategy": strategy.__class__.__name__,
@@ -335,10 +301,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 proposed_trades.append(trade_data)
                 total_risk = calculate_total_risk(proposed_trades)
                 if total_risk > MAX_PORTFOLIO_RISK:
-                    print(
-                        f"⚠️ Skipping trade for {asset} — Portfolio risk "
-                        f"({total_risk:.2%}) exceeds cap"
-                    )
+                    print(f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap")
                     proposed_trades.pop()
                     continue
 
@@ -365,15 +328,11 @@ def evaluate_signals_and_trade(check_exits_only=False):
                                 skip_due_to_corr = True
                                 # Log block event
                                 os.makedirs("logs", exist_ok=True)
-                                with open(
-                                    "logs/portfolio_metrics.log", "a", encoding="utf-8"
-                                ) as f:
+                                with open("logs/portfolio_metrics.log", "a", encoding="utf-8") as f:
                                     f.write(
                                         json.dumps(
                                             {
-                                                "timestamp": datetime.datetime.now(
-                                                    datetime.UTC
-                                                ).isoformat(),
+                                                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                                                 "type": "correlation_block",
                                                 "asset": asset,
                                                 "other": other,
@@ -388,16 +347,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     # Log all evaluated correlations
                     if corr_rows:
                         os.makedirs("logs", exist_ok=True)
-                        with open(
-                            "logs/portfolio_metrics.log", "a", encoding="utf-8"
-                        ) as f:
+                        with open("logs/portfolio_metrics.log", "a", encoding="utf-8") as f:
                             for row in corr_rows:
                                 f.write(
                                     json.dumps(
                                         {
-                                            "timestamp": datetime.datetime.now(
-                                                datetime.UTC
-                                            ).isoformat(),
+                                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                                             "type": "correlation",
                                             **row,
                                         }
@@ -417,10 +372,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 print(trade_data)
 
                 trade_id = str(uuid.uuid4())
-                print(
-                    f"[DEBUG] Using trade_id for both log_trade and "
-                    f"open_position: {trade_id}"
-                )
+                print(f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}")
 
                 entry_raw = prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
@@ -512,9 +464,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
     # Inject mock TAKE_PROFIT prices before exit checks
     for trade_id, pos in position_manager.positions.items():
         if random.random() < 0.3:
-            current_prices[pos["pair"]] = pos["entry_price"] * (
-                1 + random.uniform(0.01, 0.05)
-            )
+            current_prices[pos["pair"]] = pos["entry_price"] * (1 + random.uniform(0.01, 0.05))
 
     exits = position_manager.check_exits(current_prices)
     for trade_id, exit_price, reason in exits:

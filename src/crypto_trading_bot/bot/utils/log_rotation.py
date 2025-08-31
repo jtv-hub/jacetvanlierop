@@ -4,11 +4,11 @@ log_rotation.py
 Provides rotating log handlers and optional compression for the crypto trading bot.
 """
 
-import os
 import gzip
+import logging
+import os
 import shutil
 from logging.handlers import RotatingFileHandler
-import logging
 
 LOG_DIR = "logs"
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB

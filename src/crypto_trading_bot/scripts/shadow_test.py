@@ -6,13 +6,11 @@ original vs proposed performance.
 """
 
 import json
-from pathlib import Path
 import logging
+from pathlib import Path
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 LEDGER_PATH = Path("logs/learning_ledger.jsonl")
 
@@ -47,9 +45,7 @@ def simulate_rsi_threshold(entries, new_threshold: float):
     shadow_confidences = []
 
     for entry in entries:
-        rsi_value = (
-            entry.get("rsi") or entry.get("rsi_score") or 25
-        )  # fallback for mock data
+        rsi_value = entry.get("rsi") or entry.get("rsi_score") or 25  # fallback for mock data
         confidence = entry.get("confidence")
 
         # Original logic: all signals included
@@ -79,9 +75,7 @@ def summarize_results(original, shadow):
 
     # Shadow test approval rule
     if improvement > 0 and len(shadow) >= 0.5 * len(original):
-        print(
-            "\n✅ Shadow test PASSED — this change would be eligible for live deployment."
-        )
+        print("\n✅ Shadow test PASSED — this change would be eligible for live deployment.")
     else:
         print("\n❌ Shadow test FAILED — not enough improvement or too few trades.")
 

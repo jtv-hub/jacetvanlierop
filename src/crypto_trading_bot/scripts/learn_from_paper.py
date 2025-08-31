@@ -11,11 +11,11 @@ The rules are intentionally simple and transparent so we can iterate fast.
 """
 from __future__ import annotations
 
-from pathlib import Path
-from collections import defaultdict
 import glob
 import json
 import statistics as stats
+from collections import defaultdict
+from pathlib import Path
 
 # Where to read / write
 PAPER_GLOB = "logs/paper/paper_trades_*.jsonl"

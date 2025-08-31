@@ -5,16 +5,17 @@ Encapsulates trade lifecycle logging, ROI updates, schema validation,
 and trade syncing using a class-based approach.
 """
 
-import os
-import json
-import time
 import fcntl
-import uuid
-import random
+import json
 import logging
+import os
+import random
+import time
+import uuid
 from datetime import datetime, timezone
-from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
+
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG
 
 logger = logging.getLogger("trade_ledger")
@@ -79,9 +80,7 @@ class TradeLedger:
         trade_id = kwargs.get("trade_id") or str(uuid.uuid4())
         entry_price = kwargs.get("entry_price", 18000 + 250 * (0.5 - random.random()))
         # Apply side-aware slippage per CONFIG and round to 4 decimals
-        side = kwargs.get("side") or (
-            "buy" if strategy_name.lower().find("sell") == -1 else "sell"
-        )
+        side = kwargs.get("side") or ("buy" if strategy_name.lower().find("sell") == -1 else "sell")
         slip_rate = _slippage_rate_for_pair(trading_pair)
         raw_entry = float(entry_price)
         if side == "buy":
@@ -155,21 +154,14 @@ class TradeLedger:
         Retries up to 3 times on failure and safely resyncs positions.jsonl.
         """
         if not isinstance(exit_price, (int, float)) or exit_price <= 0:
-            raise ValueError(
-                f"[Ledger] Invalid exit_price for trade {trade_id}: {exit_price}"
-            )
+            raise ValueError(f"[Ledger] Invalid exit_price for trade {trade_id}: {exit_price}")
 
         if not os.path.exists(TRADES_LOG_PATH):
             print(f"[Ledger] Trade file not found: {TRADES_LOG_PATH}")
             return
 
-        if (
-            not hasattr(self.position_manager, "positions")
-            or self.position_manager.positions is None
-        ):
-            print(
-                f"[Ledger] position_manager.positions unavailable for trade {trade_id}"
-            )
+        if not hasattr(self.position_manager, "positions") or self.position_manager.positions is None:
+            print(f"[Ledger] position_manager.positions unavailable for trade {trade_id}")
             return
 
         max_retries = 3
@@ -188,9 +180,7 @@ class TradeLedger:
                     if pos and pos.get("exit_price") is None:
                         trade = {
                             "trade_id": trade_id,
-                            "timestamp": pos.get(
-                                "timestamp", datetime.now(timezone.utc).isoformat()
-                            ),
+                            "timestamp": pos.get("timestamp", datetime.now(timezone.utc).isoformat()),
                             "pair": pos.get("pair", "BTC/USD"),
                             "size": pos.get("size", 0.001),
                             "strategy": pos.get("strategy", "Unknown"),
@@ -215,26 +205,19 @@ class TradeLedger:
 
                 # If still not found, log a clear error and stop
                 if trade_id not in [t.get("trade_id") for t in trades]:
-                    print(
-                        f"[Ledger] Trade ID {trade_id} not found in memory or "
-                        "trades.log — aborting update"
-                    )
+                    print(f"[Ledger] Trade ID {trade_id} not found in memory or " "trades.log — aborting update")
                     return
 
                 # Apply update
                 for trade in trades:
-                    if (
-                        trade.get("trade_id") == trade_id
-                        and trade.get("exit_price") is None
-                    ):
+                    if trade.get("trade_id") == trade_id and trade.get("exit_price") is None:
                         entry_price = trade["entry_price"]
                         size = trade["size"]
                         try:
                             timestamp = datetime.fromisoformat(trade["timestamp"])
                         except ValueError as e:
                             print(
-                                f"[Ledger] Invalid timestamp for trade {trade_id}:"
-                                f"{trade['timestamp']} - Error: {e}"
+                                f"[Ledger] Invalid timestamp for trade {trade_id}:" f"{trade['timestamp']} - Error: {e}"
                             )
                             continue
 
@@ -248,20 +231,11 @@ class TradeLedger:
                                 "status": "closed",
                                 "reason": reason,
                                 "holding_period_days": round(
-                                    (
-                                        datetime.now(timezone.utc) - timestamp
-                                    ).total_seconds()
-                                    / 86400,
+                                    (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400,
                                     2,
                                 ),
-                                "realized_gain": round(
-                                    (exit_adj - entry_price) * size, 4
-                                ),
-                                "roi": (
-                                    round((exit_adj - entry_price) / entry_price, 6)
-                                    if entry_price
-                                    else 0.0
-                                ),
+                                "realized_gain": round((exit_adj - entry_price) * size, 4),
+                                "roi": (round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0),
                                 # Slippage metadata
                                 "exit_slippage_rate": round(slip_rate, 6),
                                 "exit_slippage_amount": exit_slippage_amount,
@@ -285,9 +259,7 @@ class TradeLedger:
                             fcntl.flock(f, fcntl.LOCK_UN)
                     os.replace(temp_path, TRADES_LOG_PATH)
                     self.trades = trades
-                    print(
-                        f"[DEBUG] Successfully updated trade {trade_id} in trades.log"
-                    )
+                    print(f"[DEBUG] Successfully updated trade {trade_id} in trades.log")
 
                     # Safely resync positions.jsonl by removing the closed position
                     try:
@@ -312,43 +284,23 @@ class TradeLedger:
                                     finally:
                                         fcntl.flock(dst, fcntl.LOCK_UN)
                             os.replace(tmp_pos, POSITIONS_PATH)
-                            print(
-                                (
-                                    "[DEBUG] Synchronized positions.jsonl — removed closed "
-                                    "position "
-                                    f"{trade_id}"
-                                )
-                            )
+                            print(("[DEBUG] Synchronized positions.jsonl — removed closed " "position " f"{trade_id}"))
                     except (OSError, IOError) as e:
-                        print(
-                            f"[Ledger] Warning: failed to sync positions.jsonl for {trade_id}: {e}"
-                        )
+                        print(f"[Ledger] Warning: failed to sync positions.jsonl for {trade_id}: {e}")
                 else:
                     # If trade is already closed, treat this as idempotent
-                    existing = next(
-                        (t for t in trades if t.get("trade_id") == trade_id), None
-                    )
-                    if (
-                        existing
-                        and existing.get("exit_price") is not None
-                        and existing.get("status") == "closed"
-                    ):
-                        print(
-                            f"[Ledger] Idempotent update — trade {trade_id} already closed"
-                        )
+                    existing = next((t for t in trades if t.get("trade_id") == trade_id), None)
+                    if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
+                        print(f"[Ledger] Idempotent update — trade {trade_id} already closed")
                     else:
-                        print(
-                            f"[Ledger] No update applied — trade_id {trade_id} not in open state"
-                        )
+                        print(f"[Ledger] No update applied — trade_id {trade_id} not in open state")
                 return
 
             except (OSError, IOError, json.JSONDecodeError) as e:
                 print(f"[Ledger] Error updating trade (attempt {attempt + 1}): {e}")
                 time.sleep(1)
 
-        print(
-            f"[Ledger] Failed to update trade {trade_id} after {max_retries} attempts"
-        )
+        print(f"[Ledger] Failed to update trade {trade_id} after {max_retries} attempts")
 
     def reload_trades(self):
         """
@@ -366,10 +318,7 @@ class TradeLedger:
                             if trade.get("trade_id"):
                                 self.trades.append(trade)
                         except json.JSONDecodeError as e:
-                            print(
-                                f"[Ledger] Skipping invalid line in trades.log:"
-                                f"{line.strip()} - Error: {e}"
-                            )
+                            print(f"[Ledger] Skipping invalid line in trades.log:" f"{line.strip()} - Error: {e}")
             print(f"[Ledger] Reloaded {len(self.trades)} trades from trades.log")
         else:
             print("[Ledger] No trades.log file found.")
@@ -386,9 +335,7 @@ class TradeLedger:
         if not matching:
             print(f"[Ledger] No entries found for trade_id: {target_trade_id}")
             return False
-        latest = max(
-            matching, key=lambda x: x.get("timestamp", "1970-01-01T00:00:00+00:00")
-        )
+        latest = max(matching, key=lambda x: x.get("timestamp", "1970-01-01T00:00:00+00:00"))
         required_fields = ["status", "exit_price", "reason", "roi"]
         status_ok = latest.get("status") == "closed"
         fields_ok = all(latest.get(f) is not None for f in required_fields)

@@ -4,8 +4,8 @@ Appends optimization suggestions from the learning review step
 into a JSONL file for historical tracking and future evaluation.
 """
 
-import os
 import json
+import os
 from datetime import datetime
 
 # Explicit file path inside learning/
@@ -15,9 +15,7 @@ SUGGESTIONS_FILE = os.path.join("learning", "suggestions.jsonl")
 os.makedirs(os.path.dirname(SUGGESTIONS_FILE), exist_ok=True)
 
 
-def log_suggestion(
-    strategy_name, param_change, rationale, confidence, status="pending"
-):
+def log_suggestion(strategy_name, param_change, rationale, confidence, status="pending"):
     """
     Append a learning suggestion to suggestions.jsonl
     """

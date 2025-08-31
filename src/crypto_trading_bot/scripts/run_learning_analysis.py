@@ -6,16 +6,15 @@ Executes the LearningMachine to analyze past trades,
 then saves the report to JSON and CSV under /reports.
 """
 
-import os
-import json
 import csv
+import json
 import logging
+import os
+
 from crypto_trading_bot.learning.learning_machine import LearningMachine
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 REPORTS_DIR = "reports"
 JSON_PATH = os.path.join(REPORTS_DIR, "learning_report.json")

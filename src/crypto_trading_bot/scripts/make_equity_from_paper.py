@@ -12,10 +12,11 @@ outliers to keep the curve readable.
 
 from __future__ import annotations
 
-import json
 import datetime as dt
+import json
 from pathlib import Path
-from typing import Iterable, List, Dict, Any
+from typing import Any, Dict, Iterable, List
+
 import matplotlib
 import matplotlib.pyplot as plt
 

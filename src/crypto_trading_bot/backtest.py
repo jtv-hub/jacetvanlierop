@@ -76,9 +76,7 @@ def _iter_prices(path: str) -> Iterable[Tuple[str, float]]:
                 continue
 
             # try common time keys; fall back to synthetic, stable order
-            ts = (
-                obj.get("ts") or obj.get("timestamp") or obj.get("time") or obj.get("t")
-            )
+            ts = obj.get("ts") or obj.get("timestamp") or obj.get("time") or obj.get("t")
             if not isinstance(ts, str):
                 ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
                 # make deterministic order if called twice

@@ -19,9 +19,7 @@ LEARNING_LEDGER = LOGS_DIR / "learning_ledger.jsonl"
 CONFIDENCE_SUMMARY = LOGS_DIR / "confidence_summary.json"
 
 # Logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -63,9 +61,7 @@ def _normalize_strategy_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         entry["average_confidence"] = 0.0
     if "trade_count" not in entry:
         entry["trade_count"] = 0
-    if "regime_confidence" not in entry or not isinstance(
-        entry["regime_confidence"], dict
-    ):
+    if "regime_confidence" not in entry or not isinstance(entry["regime_confidence"], dict):
         entry["regime_confidence"] = {}
 
     return entry
@@ -137,9 +133,7 @@ def update_confidence_summary(strategy_name: str, confidence_score: float) -> No
     current["trade_count"] = new_count
 
     # Keep regime_confidence dict (updated elsewhere)
-    if "regime_confidence" not in current or not isinstance(
-        current["regime_confidence"], dict
-    ):
+    if "regime_confidence" not in current or not isinstance(current["regime_confidence"], dict):
         current["regime_confidence"] = {}
 
     summary[strategy_name] = current

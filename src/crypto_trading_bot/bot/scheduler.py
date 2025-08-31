@@ -5,27 +5,27 @@ Handles the scheduling of periodic trading bot tasks like trade evaluation,
 daily maintenance, and learning updates.
 """
 
-import time
-import traceback
 import json
 import os
+import time
+import traceback
 from datetime import datetime, timezone
 
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.learning.confidence_audit import (
+    run_and_cleanup as audit_run_and_cleanup,
+)
 from crypto_trading_bot.learning.learning_machine import run_learning_cycle
 from crypto_trading_bot.learning.optimization import detect_outliers
 from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
 from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
-from crypto_trading_bot.scripts.sync_validator import SyncValidator
-from crypto_trading_bot.learning.confidence_audit import (
-    run_and_cleanup as audit_run_and_cleanup,
-)
 from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
 from crypto_trading_bot.scripts.suggest_top_configs import (
     export_suggestions,
     generate_parameter_suggestions,
 )
+from crypto_trading_bot.scripts.sync_validator import SyncValidator
 
 # Constants for task intervals in seconds
 TRADE_INTERVAL = 5 * 60  # Every 5 minutes
@@ -75,9 +75,7 @@ def run_anomaly_audit() -> bool:
             )
             return False
         else:
-            print(
-                f"🧹 Audit cleanup complete — initial_errors={initial_errors}, removed={removed}, final_errors=0"
-            )
+            print(f"🧹 Audit cleanup complete — initial_errors={initial_errors}, removed={removed}, final_errors=0")
             return True
     except Exception as e:
         print(f"[Scheduler] run_anomaly_audit failed: {e}")
@@ -162,9 +160,7 @@ def should_run_anomaly_audit(last_audit_time):
     """Check if the anomaly audit should run based on time interval."""
     if last_audit_time is None:
         return True
-    return (
-        datetime.now(timezone.utc) - last_audit_time
-    ).total_seconds() >= ANOMALY_AUDIT_INTERVAL
+    return (datetime.now(timezone.utc) - last_audit_time).total_seconds() >= ANOMALY_AUDIT_INTERVAL
 
 
 def run_scheduler():
@@ -182,15 +178,10 @@ def run_scheduler():
 
     if buffer_pct > 0.25:
         adjusted_risk = 0.02 * 0.5
-        print(
-            f"🛡️ Buffer high ({round(buffer_pct * 100)}%), risk ↓ to {adjusted_risk * 100:.1f}%"
-        )
+        print(f"🛡️ Buffer high ({round(buffer_pct * 100)}%), risk ↓ to {adjusted_risk * 100:.1f}%")
     elif buffer_pct > 0.10:
         adjusted_risk = 0.02 * 0.75
-        buffer_msg = (
-            f"⚠️ Buffer elevated ({round(buffer_pct * 100)}%), "
-            f"risk ↓ to {adjusted_risk * 100:.1f}%"
-        )
+        buffer_msg = f"⚠️ Buffer elevated ({round(buffer_pct * 100)}%), " f"risk ↓ to {adjusted_risk * 100:.1f}%"
         print(buffer_msg)
     else:
         print(f"✅ Capital buffer low ({round(buffer_pct * 100)}%)")

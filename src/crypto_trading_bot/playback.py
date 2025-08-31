@@ -35,10 +35,7 @@ def main() -> int:
     rel = os.path.relpath(args.file, start=os.getcwd())
     print(f"▶️  Playback (shim) file: {rel}")
 
-    params = (
-        f"    Params: rsi_th={args.rsi_th} tp={args.tp} "
-        f"sl={args.sl} max_hold={args.max_hold} size={args.size}"
-    )
+    params = f"    Params: rsi_th={args.rsi_th} tp={args.tp} " f"sl={args.sl} max_hold={args.max_hold} size={args.size}"
     print(params)
     print(f"    Logging trades → {args.trades_out}")
 

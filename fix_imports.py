@@ -13,6 +13,7 @@ TARGET_PACKAGE = "crypto_trading_bot"
 # regex to catch imports like: from crypto_trading_bot.scripts import xyz
 PATTERN = re.compile(rf"from {TARGET_PACKAGE}(\.[\w\.]*) import (.+)")
 
+
 def fix_file(path: Path):
     """
     Rewrites absolute imports of the form 'from crypto_trading_bot.xyz' into relative imports
@@ -33,6 +34,7 @@ def fix_file(path: Path):
         print(f"[fix] {path}")
         path.write_text(new_text, encoding="utf-8")
 
+
 def sweep():
     """
     Iterates through all Python files in the project and applies import fixes,
@@ -42,6 +44,7 @@ def sweep():
         if py.name == "fix_imports.py":
             continue
         fix_file(py)
+
 
 if __name__ == "__main__":
     sweep()

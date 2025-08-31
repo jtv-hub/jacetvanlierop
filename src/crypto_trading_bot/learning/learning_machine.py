@@ -5,14 +5,15 @@ This module reads executed trades from trades.log and calculates performance
 metrics (ROI-based) for strategy evaluation and continuous improvement.
 """
 
-import os
-import json
 import datetime
+import json
 import logging
+import os
+
 import numpy as np
 
-from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)
@@ -92,9 +93,7 @@ def run_learning_cycle():
     metrics = calculate_metrics(trades)
 
     # timestamp for log entries
-    metrics["timestamp"] = datetime.datetime.now(datetime.UTC).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    metrics["timestamp"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S")
     metrics["capital_buffer"] = get_dynamic_buffer()
     return metrics
 

@@ -3,14 +3,12 @@ Review Learning Ledger
 Analyzes trade logs and generates learning suggestions.
 """
 
-import logging
 import json
+import logging
 import os
 
 logger = logging.getLogger("review_learning_ledger")
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def review_ledger():

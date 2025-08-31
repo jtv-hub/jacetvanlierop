@@ -6,6 +6,7 @@ Clears trades.log and reseeds it with dummy trades for testing.
 
 import os
 import random
+
 from crypto_trading_bot.ledger.trade_ledger import log_trade
 
 

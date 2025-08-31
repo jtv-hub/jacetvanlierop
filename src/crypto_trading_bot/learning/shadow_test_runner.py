@@ -3,13 +3,13 @@ Shadow Test Runner
 Runs shadow tests on strategy suggestions and logs results.
 """
 
-import os
 import json
 import logging
-import uuid
-from datetime import datetime, UTC
-from logging.handlers import RotatingFileHandler
+import os
 import statistics
+import uuid
+from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 
 # === Setup rotating logger ===
 os.makedirs("logs", exist_ok=True)
@@ -17,9 +17,7 @@ os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger("shadow_test_runner")
 logger.setLevel(logging.INFO)
 
-handler = RotatingFileHandler(
-    "logs/shadow_test_runner.log", maxBytes=50 * 1024 * 1024, backupCount=3  # 50 MB
-)
+handler = RotatingFileHandler("logs/shadow_test_runner.log", maxBytes=50 * 1024 * 1024, backupCount=3)  # 50 MB
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 
@@ -31,9 +29,7 @@ SUGGESTIONS_FILE = "reports/suggestions_latest.json"
 RESULTS_FILE = "reports/shadow_test_results.jsonl"
 
 
-def run_shadow_tests(
-    input_file: str = SUGGESTIONS_FILE, output_file: str = RESULTS_FILE
-):
+def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESULTS_FILE):
     """
     Run shadow tests on suggestions from the learning engine.
     Produces results with adaptive pass/fail threshold and audit trail.
@@ -43,8 +39,7 @@ def run_shadow_tests(
         with open(input_file, "w", encoding="utf-8"):
             pass
         logger.info(
-            "Created empty suggestions file at %s. "
-            "Please run review_learning_ledger.py to add suggestions.",
+            "Created empty suggestions file at %s. " "Please run review_learning_ledger.py to add suggestions.",
             input_file,
         )
         return
@@ -69,9 +64,7 @@ def run_shadow_tests(
                 suggestions = []
 
         if not suggestions:
-            logger.warning(
-                "No valid suggestions found in %s. Skipping shadow tests.", input_file
-            )
+            logger.warning("No valid suggestions found in %s. Skipping shadow tests.", input_file)
             return
 
         # === Determine adaptive threshold ===

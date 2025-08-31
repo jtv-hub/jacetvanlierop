@@ -4,12 +4,13 @@ Trade Replay Module
 Reconstructs trades visually using OHLCV data and ledger entries.
 """
 
-import os
-import json
 import argparse
+import json
+import os
 from datetime import datetime, timezone
-import pandas as pd
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 DATA_DIR = "data"
 REPORTS_DIR = "reports/replays"
@@ -66,16 +67,12 @@ class TradeReplay:
 
         plt.figure(figsize=(10, 5))
         plt.plot(df["timestamp"], df["close"], label="Close Price")
-        plt.axvline(
-            pd.to_datetime(start_time), color="g", linestyle="--", label="Entry"
-        )
+        plt.axvline(pd.to_datetime(start_time), color="g", linestyle="--", label="Entry")
 
         # Optional: mark price point
         if "price" in trade:
             entry_price = trade["price"]
-            plt.axhline(
-                entry_price, color="r", linestyle=":", label=f"Entry @ {entry_price}"
-            )
+            plt.axhline(entry_price, color="r", linestyle=":", label=f"Entry @ {entry_price}")
 
         strategy_name = trade.get("strategy", "UnknownStrategy")
 
@@ -96,9 +93,7 @@ class TradeReplay:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trade Replay CLI")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--latest", action="store_true", help="Replay the most recent trade"
-    )
+    group.add_argument("--latest", action="store_true", help="Replay the most recent trade")
     group.add_argument("--all", action="store_true", help="Replay all trades")
     group.add_argument("--trade", type=int, help="Replay a specific trade by index")
 

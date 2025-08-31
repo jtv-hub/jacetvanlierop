@@ -17,9 +17,7 @@ from typing import Any, Dict, List
 PROPOSALS_LOG = Path("logs/learning_proposals.jsonl")
 REPORTS_DIR = Path("logs/reports")
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 

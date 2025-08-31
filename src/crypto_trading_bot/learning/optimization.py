@@ -2,13 +2,13 @@
 Module for generating and exporting optimization suggestions based on trading performance reports.
 """
 
-import json
 import csv
+import json
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
-from collections import defaultdict
 from statistics import mean, stdev
+from typing import Dict, List
 
 REPORTS_DIR = Path("reports")
 REPORTS_DIR.mkdir(exist_ok=True)
@@ -45,10 +45,7 @@ def generate_suggestions(report: Dict) -> List[Dict]:
                 "category": "risk",
                 "suggestion": "Improve risk-adjusted returns by optimizing stop losses or trade exits.",
                 "confidence": 0.6,
-                "reason": (
-                    f"Sharpe low ({sharpe:.2f}) while Sortino acceptable "
-                    f"({sortino:.2f})."
-                ),
+                "reason": (f"Sharpe low ({sharpe:.2f}) while Sortino acceptable " f"({sortino:.2f})."),
             }
         )
 
@@ -57,10 +54,7 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "risk",
-                "suggestion": (
-                    "Introduce stricter drawdown limits or reduce position sizing "
-                    "in volatile regimes."
-                ),
+                "suggestion": ("Introduce stricter drawdown limits or reduce position sizing " "in volatile regimes."),
                 "confidence": 0.8,
                 "reason": f"Max drawdown high ({drawdown:.1f}).",
             }
@@ -71,14 +65,9 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "capital_allocation",
-                "suggestion": (
-                    "Consider increasing capital allocation for strategies "
-                    "in trending regimes."
-                ),
+                "suggestion": ("Consider increasing capital allocation for strategies " "in trending regimes."),
                 "confidence": 0.85,
-                "reason": (
-                    f"Strong ROI ({roi:.2f}%) with solid win rate " f"({win_rate:.2f})."
-                ),
+                "reason": (f"Strong ROI ({roi:.2f}%) with solid win rate " f"({win_rate:.2f})."),
             }
         )
 
@@ -116,16 +105,12 @@ def export_suggestions(suggestions: List[Dict]) -> None:
 
     # CSV Export
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["category", "suggestion", "confidence", "reason"]
-        )
+        writer = csv.DictWriter(f, fieldnames=["category", "suggestion", "confidence", "reason"])
         writer.writeheader()
         writer.writerows(suggestions)
 
     with open(latest_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["category", "suggestion", "confidence", "reason"]
-        )
+        writer = csv.DictWriter(f, fieldnames=["category", "suggestion", "confidence", "reason"])
         writer.writeheader()
         writer.writerows(suggestions)
 
@@ -157,9 +142,7 @@ def detect_outliers(min_trades=25, top_n=3):
         if len(group) < min_trades:
             continue
 
-        rois = [
-            t.get("roi", 0.0) for t in group if isinstance(t.get("roi"), (int, float))
-        ]
+        rois = [t.get("roi", 0.0) for t in group if isinstance(t.get("roi"), (int, float))]
         win_rate = sum(1 for r in rois if r > 0) / len(rois)
         avg_roi = mean(rois)
         sharpe = avg_roi / (stdev(rois) or 1e-6)

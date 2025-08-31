@@ -5,12 +5,13 @@ Validates consistency between trades.log and positions.jsonl.
 Includes duplicate checks, timestamps, and repair capability.
 """
 
-import os
-import json
 import importlib
-from datetime import datetime, timezone
-from typing import List, Dict, Optional
+import json
 import logging
+import os
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 
 # Update this import path based on your project structure
@@ -118,21 +119,14 @@ class SyncValidator:
                         t_dt = datetime.fromisoformat(t_time)
                         p_dt = datetime.fromisoformat(p_time)
                         if abs((t_dt - p_dt).total_seconds()) > 60:
-                            msg = (
-                                f"Timestamp mismatch for trade_id {tid}: "
-                                f"trade={t_time}, position={p_time}"
-                            )
+                            msg = f"Timestamp mismatch for trade_id {tid}: " f"trade={t_time}, position={p_time}"
                             self.validation_errors.append(msg)
                     except (ValueError, TypeError):
                         # Handle timestamp format or comparison errors gracefully
-                        self.validation_errors.append(
-                            f"Invalid timestamp format for trade_id {tid}"
-                        )
+                        self.validation_errors.append(f"Invalid timestamp format for trade_id {tid}")
 
                 if trade.get("exit_price") is None and trade.get("status") == "closed":
-                    self.validation_errors.append(
-                        f"Closed trade missing exit_price: {tid}"
-                    )
+                    self.validation_errors.append(f"Closed trade missing exit_price: {tid}")
                 if trade.get("exit_price") and trade.get("status") != "closed":
                     self.validation_errors.append(f"Open trade has exit_price: {tid}")
 
@@ -162,9 +156,7 @@ class SyncValidator:
 
         Recreates entries in the log using position data and the ledger."""
         if not self.ledger:
-            self.validation_errors.append(
-                "Repair skipped: TradeLedgerClass not provided."
-            )
+            self.validation_errors.append("Repair skipped: TradeLedgerClass not provided.")
             self.log_validation_errors(self.log_file)
             return 0
 
@@ -178,9 +170,7 @@ class SyncValidator:
             if getattr(ledger_module, "TRADES_LOG_PATH", None) != self.trades_file:
                 setattr(ledger_module, "TRADES_LOG_PATH", self.trades_file)
         except AttributeError as e:
-            self.validation_errors.append(
-                f"Warning: could not align ledger TRADES_LOG_PATH: {e}"
-            )
+            self.validation_errors.append(f"Warning: could not align ledger TRADES_LOG_PATH: {e}")
 
         repairs = 0
 
@@ -202,9 +192,7 @@ class SyncValidator:
                     self.validation_errors.append(f"Repaired missing trade: {tid}")
                     repairs += 1
                 except (AttributeError, TypeError, ValueError) as e:
-                    self.validation_errors.append(
-                        f"Repair failed for trade_id {tid}: {e}"
-                    )
+                    self.validation_errors.append(f"Repair failed for trade_id {tid}: {e}")
         self.log_validation_errors(self.log_file)
         return repairs
 

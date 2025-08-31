@@ -5,7 +5,8 @@ Part of Step 4.6.5.2.
 
 import json
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List
+
 from crypto_trading_bot.learning.optimization import detect_outliers, export_suggestions
 
 SUGGESTIONS_DIR = Path("reports")

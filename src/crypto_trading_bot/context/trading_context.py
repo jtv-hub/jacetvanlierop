@@ -7,8 +7,9 @@ Provides the current trading environment, including market regime and reinvestme
 Used to standardize decision-making based on market conditions.
 """
 
-from datetime import datetime, timezone
 import random
+from datetime import datetime, timezone
+
 from crypto_trading_bot.config import CONFIG
 
 

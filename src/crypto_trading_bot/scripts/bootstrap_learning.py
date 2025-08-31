@@ -9,6 +9,7 @@ to verify imports, logging, and end-to-end functionality.
 """
 
 import logging
+
 from crypto_trading_bot.learning.learning_machine import LearningMachine
 
 logger = logging.getLogger(__name__)
@@ -55,8 +56,6 @@ class BootstrapLearning:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     tester = BootstrapLearning()
     tester.run_test()

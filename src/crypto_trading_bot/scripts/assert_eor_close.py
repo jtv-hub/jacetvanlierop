@@ -14,7 +14,6 @@ import json
 import sys
 from pathlib import Path
 
-
 LOG_PATH = Path("logs/paper_trades.jsonl")
 
 

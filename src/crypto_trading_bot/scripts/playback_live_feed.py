@@ -23,7 +23,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Iterable
+from typing import Any, Dict, Iterable, List, Optional
 
 # ---------- utils ----------
 
@@ -150,9 +150,7 @@ def close_long(cfg: PlaybackConfig, state: SimState, price: float, reason: str) 
 
     if cfg.debug:
         pct = chg * 100.0
-        print(
-            f"Closed ({reason}) at {price:.2f} | entry={entry:.2f} change={pct:+.2f}%"
-        )
+        print(f"Closed ({reason}) at {price:.2f} | entry={entry:.2f} change={pct:+.2f}%")
 
     log_event(
         cfg.log_file,
@@ -172,9 +170,7 @@ def close_long(cfg: PlaybackConfig, state: SimState, price: float, reason: str) 
     state.pos = None
 
 
-def tick(
-    cfg: PlaybackConfig, state: SimState, price: float, rsi: Optional[float]
-) -> None:
+def tick(cfg: PlaybackConfig, state: SimState, price: float, rsi: Optional[float]) -> None:
     """
     Process one bar:
     - If flat and RSI < threshold -> BUY
@@ -228,10 +224,7 @@ def infer_pair_from_path(p: Path) -> Optional[str]:
 def playback(cfg: PlaybackConfig) -> None:
     """Run the full playback loop and print a brief summary."""
     print(f"▶️  Playback file: {cfg.file}")
-    print(
-        f"    Params: rsi_th={cfg.rsi_threshold} "
-        f"tp={cfg.tp} sl={cfg.sl} max_hold={cfg.max_hold} size={cfg.size}"
-    )
+    print(f"    Params: rsi_th={cfg.rsi_threshold} " f"tp={cfg.tp} sl={cfg.sl} max_hold={cfg.max_hold} size={cfg.size}")
     print(f"    Logging trades → {cfg.log_file}")
 
     ensure_file_parent(cfg.log_file)
@@ -246,11 +239,7 @@ def playback(cfg: PlaybackConfig) -> None:
                 continue
 
             price = rec.get("last")
-            if (
-                price is None
-                or not isinstance(price, (int, float))
-                or math.isnan(price)
-            ):
+            if price is None or not isinstance(price, (int, float)) or math.isnan(price):
                 continue
 
             state.prices.append(float(price))
@@ -283,9 +272,7 @@ def playback(cfg: PlaybackConfig) -> None:
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments for playback."""
-    p = argparse.ArgumentParser(
-        description="Playback JSONL live feed and simulate an RSI strategy."
-    )
+    p = argparse.ArgumentParser(description="Playback JSONL live feed and simulate an RSI strategy.")
     p.add_argument(
         "--file",
         required=True,

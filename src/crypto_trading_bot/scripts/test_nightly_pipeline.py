@@ -3,8 +3,9 @@ Integration test for the nightly pipeline.
 Creates mock data, runs the full pipeline, and checks outputs.
 """
 
-import os
 import json
+import os
+
 from scripts import nightly_pipeline
 
 # === Setup directories ===

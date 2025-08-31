@@ -170,9 +170,7 @@ def main() -> int:
     times, equity, wins, losses = build_equity(trades, args.start_equity)
     total = wins + losses
     final_eq = equity[-1]
-    ret_pct = (
-        0.0 if args.start_equity == 0 else (final_eq / args.start_equity - 1.0) * 100.0
-    )
+    ret_pct = 0.0 if args.start_equity == 0 else (final_eq / args.start_equity - 1.0) * 100.0
     win_rate = 0.0 if total == 0 else wins / total
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -183,13 +181,8 @@ def main() -> int:
     _save_plot(png_path, equity)
 
     print("✅ Plot & analysis")
-    print(
-        f"Trades: {total} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.2%}"
-    )
-    print(
-        f"Start equity: {args.start_equity:.2f} → Final equity: {final_eq:.2f}  "
-        f"(Return: {ret_pct:.2f}%)"
-    )
+    print(f"Trades: {total} | Wins: {wins} | Losses: {losses} | Win rate: {win_rate:.2%}")
+    print(f"Start equity: {args.start_equity:.2f} → Final equity: {final_eq:.2f}  " f"(Return: {ret_pct:.2f}%)")
     if HAVE_MPL:
         print(f"PNG: {png_path}")
     else:

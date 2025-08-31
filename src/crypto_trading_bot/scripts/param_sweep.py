@@ -12,11 +12,11 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import subprocess
 import sys
 import time
-import subprocess
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 
 def _read_csv_rows(path: str) -> List[List[str]]:

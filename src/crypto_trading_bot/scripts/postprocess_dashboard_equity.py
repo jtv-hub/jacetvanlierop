@@ -8,10 +8,11 @@
 """
 
 from __future__ import annotations
+
 import argparse
+import re
 import sys
 import time
-import re
 from pathlib import Path
 
 HTML_PATH = Path("logs/reports/dashboard.html")
@@ -32,10 +33,7 @@ def ensure_equity_img(html: str, png_abs: Path, *, verbose: bool) -> tuple[str, 
 
     # Insert immediately after the Equity header (<h2> or <h3>)
     header_pat = re.compile(r"(<h[23]>\s*Equity\s*</h[23]>)", re.I)
-    img_tag = (
-        f'\n<p><img alt="latest equity" src="{src}" '
-        'style="max-width:880px;width:100%;height:auto;"></p>\n'
-    )
+    img_tag = f'\n<p><img alt="latest equity" src="{src}" ' 'style="max-width:880px;width:100%;height:auto;"></p>\n'
 
     header_found = bool(header_pat.search(html))
     if header_found:
@@ -61,9 +59,7 @@ def main() -> None:
     Exits non‑zero on failure unless --force is provided.
     """
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--force", action="store_true", help="Always exit 0 (don’t fail pipeline)."
-    )
+    ap.add_argument("--force", action="store_true", help="Always exit 0 (don’t fail pipeline).")
     ap.add_argument("--verbose", action="store_true", help="Print diagnostics.")
     args = ap.parse_args()
 

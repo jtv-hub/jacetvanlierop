@@ -3,11 +3,11 @@ Gatekeeper module for final decision-making on learning suggestions.
 Evaluates shadow test results and approves/rejects changes.
 """
 
-import os
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+import os
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 # === Setup rotating logger ===
 os.makedirs("logs", exist_ok=True)
@@ -15,9 +15,7 @@ os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger("gatekeeper")
 logger.setLevel(logging.INFO)
 
-handler = RotatingFileHandler(
-    "logs/gatekeeper.log", maxBytes=50 * 1024 * 1024, backupCount=5  # 50 MB
-)
+handler = RotatingFileHandler("logs/gatekeeper.log", maxBytes=50 * 1024 * 1024, backupCount=5)  # 50 MB
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 
@@ -54,11 +52,7 @@ def evaluate():
                     "param_change": result.get("param_change"),
                     "confidence": confidence,
                     "shadow_test_status": status,
-                    "final_decision": (
-                        "approved"
-                        if status == "pass" and confidence >= 0.7
-                        else "rejected"
-                    ),
+                    "final_decision": ("approved" if status == "pass" and confidence >= 0.7 else "rejected"),
                 }
 
                 final_decisions.append(decision)

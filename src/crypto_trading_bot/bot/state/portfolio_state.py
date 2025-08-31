@@ -5,9 +5,10 @@ Manages current reinvestment rate based on market conditions and portfolio value
 Refreshes the reinvestment rate once per day using logic from reinvestment.py.
 """
 
-import os
 import json
+import os
 from datetime import datetime
+
 from crypto_trading_bot.bot.utils.reinvestment import calculate_reinvestment_rate
 
 STATE_FILE = "state/reinvestment_state.json"

@@ -14,8 +14,8 @@ What it does (no external deps):
 from __future__ import annotations
 
 import os
-import sys
 import subprocess  # moved to top-level to satisfy pylint C0415
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional

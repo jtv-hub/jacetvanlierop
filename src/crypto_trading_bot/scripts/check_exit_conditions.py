@@ -7,10 +7,10 @@ and updates the trade log accordingly.
 
 import os
 
-from crypto_trading_bot.bot.trading_logic import position_manager, mock_price_data
-from crypto_trading_bot.ledger.trade_ledger import TradeLedger
-from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.bot.trading_logic import mock_price_data, position_manager
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
 
 def main():
@@ -24,9 +24,7 @@ def main():
     ledger.reload_trades()
 
     # Simulate current prices (latest mock data point)
-    current_prices = {
-        f"{asset}/USD": prices[-1] for asset, prices in mock_price_data.items()
-    }
+    current_prices = {f"{asset}/USD": prices[-1] for asset, prices in mock_price_data.items()}
 
     # Add RSI-based exit pass to increase coverage
     for _, pos in position_manager.positions.items():

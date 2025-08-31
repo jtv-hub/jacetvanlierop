@@ -4,11 +4,12 @@ Utility script to verify that the latest JSON and CSV learning reports
 match exactly. Helps catch data export mismatches early.
 """
 
-import os
-import json
 import csv
+import json
+import os
 
 REPORTS_DIR = "reports"
+
 
 def load_latest_files():
     """Find the most recent JSON and CSV report file paths.
@@ -27,6 +28,7 @@ def load_latest_files():
     latest_csv = os.path.join(REPORTS_DIR, csv_files[-1])
     return latest_json, latest_csv
 
+
 def load_json(path):
     """Load JSON data from a file.
 
@@ -38,6 +40,7 @@ def load_json(path):
     """
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def load_csv(path):
     """Load CSV data from a file and convert to a dictionary of floats.
@@ -54,6 +57,7 @@ def load_csv(path):
         if len(rows) != 1:
             raise ValueError("CSV report should contain exactly one row of metrics.")
         return {k: float(v) if v else 0.0 for k, v in rows[0].items()}
+
 
 def compare_reports(json_data, csv_data):
     """Compare two dictionaries of metrics for mismatches beyond tolerance.
@@ -72,6 +76,7 @@ def compare_reports(json_data, csv_data):
         if abs(json_val - csv_val) > 1e-8:  # tolerance for float rounding
             mismatches[key] = (json_val, csv_val)
     return mismatches
+
 
 if __name__ == "__main__":
     json_path, csv_path = load_latest_files()

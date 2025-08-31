@@ -1,10 +1,12 @@
 """Unit test for TradeReplay functionality."""
 
-import os
 import json
-from datetime import datetime, timedelta, UTC
+import os
+from datetime import UTC, datetime, timedelta
+
 import pandas as pd
-from crypto_trading_bot.replay.trade_replay import TradeReplay, DATA_DIR
+
+from crypto_trading_bot.replay.trade_replay import DATA_DIR, TradeReplay
 
 
 def test_trade_replay_creates_png(tmp_path):
@@ -29,14 +31,16 @@ def test_trade_replay_creates_png(tmp_path):
     os.makedirs(DATA_DIR, exist_ok=True)
     fake_csv = os.path.join(DATA_DIR, "FAKE-USD.csv")
     now = datetime.now(UTC)
-    df = pd.DataFrame({
-        "timestamp": pd.date_range(now - timedelta(minutes=5), periods=10, freq="min"),
-        "open": [100 + i for i in range(10)],
-        "high": [101 + i for i in range(10)],
-        "low": [99 + i for i in range(10)],
-        "close": [100 + i for i in range(10)],
-        "volume": [10] * 10,
-    })
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(now - timedelta(minutes=5), periods=10, freq="min"),
+            "open": [100 + i for i in range(10)],
+            "high": [101 + i for i in range(10)],
+            "low": [99 + i for i in range(10)],
+            "close": [100 + i for i in range(10)],
+            "volume": [10] * 10,
+        }
+    )
     df.to_csv(fake_csv, index=False)
 
     # --- Run TradeReplay ---

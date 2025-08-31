@@ -61,14 +61,8 @@ def analyze_feedback(trade_log_path):
 
     for bucket, bucket_trades in sorted(grouped.items()):
         total = len(bucket_trades)
-        wins = sum(
-            1
-            for t in bucket_trades
-            if t.get("status") == "executed" and t.get("roi", 0) > 0
-        )
-        avg_roi = (
-            (sum(t.get("roi", 0) for t in bucket_trades) / total) if total > 0 else 0
-        )
+        wins = sum(1 for t in bucket_trades if t.get("status") == "executed" and t.get("roi", 0) > 0)
+        avg_roi = (sum(t.get("roi", 0) for t in bucket_trades) / total) if total > 0 else 0
         win_rate = wins / total if total > 0 else 0
 
         analysis.append(
@@ -93,10 +87,7 @@ def print_confidence_analysis(analysis_report):
     print("Confidence Feedback Report:")
     print(f"{'Confidence':<15} {'Trades':<15} {'Win Rate':<15} {'Avg ROI':<15}")
     for r in analysis_report:
-        print(
-            f"{r['confidence_bucket']:<15} {r['trade_count']:<15} "
-            f"{r['win_rate']:<15} {r['avg_roi']:<15}"
-        )
+        print(f"{r['confidence_bucket']:<15} {r['trade_count']:<15} " f"{r['win_rate']:<15} {r['avg_roi']:<15}")
 
 
 if __name__ == "__main__":
