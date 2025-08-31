@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtualenv
+venv/
+
+# Local env & secrets
+.env
+
+# Data & logs (keep repo clean)
+data/
+logs/
+reports/
+.state/
+state/
+src/logs/
+
+# OS/editor junk
+.DS_Store
+.vscode/

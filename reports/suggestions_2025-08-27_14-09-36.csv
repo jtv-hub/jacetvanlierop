@@ -1,2 +1,0 @@
-category,suggestion,confidence,reason
-parameter_tuning,Use params {} for SimpleRSIStrategy (score: -954.369),-954.369,"Backtest shows ROI=-0.01, Win Rate=0.00, Sharpe=-9543.65"
