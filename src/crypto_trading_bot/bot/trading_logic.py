@@ -505,23 +505,48 @@ def evaluate_signals_and_trade(check_exits_only=False):
 
 
 def gather_signals(prices, volumes, context):
-    """Collect and compute raw indicators/signals needed for decisions.
-
-    Parameters
-    ----------
-    prices : Any
-        Price series or last-tick structure.
-    volumes : Any
-        Volume series or last-tick structure.
-    context : Any
-        TradingContext or equivalent.
-
-    Returns
-    -------
-    dict
-        Minimal placeholder structure; populated in later refactors.
+    """Collect & compute minimal indicators (safe, no side effects).
+    Computes RSI with a robust period + return-shape coercion.
     """
-    return {"rsi": None, "trend": None, "raw": {"prices": prices, "volumes": volumes}}
+    out = {"rsi": None, "trend": None, "raw": {"prices": prices, "volumes": volumes}}
+
+    def _to_scalar(x):
+        # Accept list/tuple/dict/number; take a reasonable "last value".
+        if isinstance(x, (list, tuple)) and x:
+            return x[-1]
+        if isinstance(x, dict):
+            for k in ("rsi", "current", "value", "last"):
+                if k in x:
+                    return x[k]
+        return x
+
+    try:
+        if prices and hasattr(prices, "__len__"):
+            n = len(prices)
+            if n >= 3:
+                # default = 14; take from context if available
+                period = 14
+                try:
+                    if context is not None:
+                        cfg = getattr(context, "config", None) or getattr(context, "CONFIG", None) or {}
+                        if hasattr(cfg, "get"):
+                            period = cfg.get("rsi", {}).get("period", 14)
+                        elif isinstance(cfg, dict):
+                            period = cfg.get("rsi", {}).get("period", 14)
+                except Exception:
+                    pass
+                # clamp to valid range (some impls need <= n-1)
+                period = max(2, min(int(period), max(2, n - 1)))
+                try:
+                    from crypto_trading_bot.indicators.rsi import calculate_rsi
+
+                    val = calculate_rsi(prices, period)
+                    out["rsi"] = _to_scalar(val)
+                except Exception:
+                    out["rsi"] = None
+    except Exception:
+        pass
+    return out
 
 
 def risk_screen(signals, context) -> bool:
