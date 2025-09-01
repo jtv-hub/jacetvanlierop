@@ -208,16 +208,8 @@ def save_portfolio_state(ctx):
 
 
 def evaluate_signals_and_trade(check_exits_only=False):
-    # REFRACTOR-HOOKS: harmless calls while we peel logic out
-    try:
-        _signals = gather_signals(prices=None, volumes=None, context=None)
-        _ok = risk_screen(_signals, context=None)
-        _ = (_signals, _ok, execute_trade(_signals, context=None), check_and_close_exits(context=None))
-    except Exception:
-        # swallow: keep exact runtime behavior for now
-        pass
-
     """Evaluates trade signals and manages trade execution and exits."""
+    # REFRACTOR-HOOKS: harmless calls while we peel logic out
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
     current_prices = {f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()}
@@ -524,23 +516,63 @@ def gather_signals(prices, volumes, context):
     return {"rsi": None, "trend": None, "raw": {"prices": prices, "volumes": volumes}}
 
 
-def risk_screen(signals, context) -> bool:
-    """Placeholder risk gate. Return True if it's *allowed* to trade.
+def risk_screen(signal_bundle, context):
+    """Minimal, safe risk checks. Returns True to allow, False to block."""
+    try:
+        sb = signal_bundle or {}
 
-    This stub is permissive (always True) to avoid behavior changes.
-    """
-    _ = (signals, context)
-    return True
+        # ---- config (defensive) ----
+        cfg = getattr(context, "config", None) or getattr(context, "CONFIG", None) or {}
 
+        def cfg_get(path, default):
+            cur = cfg
+            for k in path:
+                if hasattr(cur, "get"):
+                    cur = cur.get(k, default if k is path[-1] else {})
+                elif isinstance(cur, dict):
+                    cur = cur.get(k, default if k is path[-1] else {})
+                else:
+                    return default
+            return cur
 
-def execute_trade(signals, context):
-    """Execute trade(s) based on signals.
+        max_positions = int(cfg_get(("risk", "max_open_positions"), 3))
+        capital_buffer = float(cfg_get(("risk", "capital_buffer"), 0.25))
 
-    Returns a list of trade-like dicts for testing only; production flow
-    still uses existing paths until we finish the split.
-    """
-    _ = (signals, context)
-    return []
+        # ---- portfolio guards ----
+        portfolio = getattr(context, "portfolio", None)
+        if portfolio is not None:
+            opens = len(getattr(portfolio, "open_positions", []) or [])
+            if opens >= max_positions:
+                return False
+
+            cash = float(getattr(portfolio, "cash", 0.0) or 0.0)
+            equity = float(getattr(portfolio, "equity", cash) or cash)
+            if equity > 0 and (cash / equity) < capital_buffer:
+                return False
+
+        # ---- RSI guard for long entries ----
+        intent = sb.get("signal")
+        rsi = sb.get("rsi")
+
+        # scalarize rsi
+        if isinstance(rsi, (list, tuple)):
+            rsi = rsi[-1] if rsi else None
+        elif isinstance(rsi, dict):
+            rsi = rsi.get("rsi") or rsi.get("current") or rsi.get("value") or rsi.get("last")
+
+        # numeric cast (best effort)
+        try:
+            rsi_num = float(rsi) if rsi is not None else None
+        except (ValueError, TypeError):
+            rsi_num = None
+
+        if intent == "buy" and rsi_num is not None and rsi_num > 70.0:
+            return False
+
+        return True
+    except Exception:
+        # fail-open so we never crash the engine
+        return True
 
 
 def check_and_close_exits(context) -> int:
@@ -554,3 +586,8 @@ def check_and_close_exits(context) -> int:
 
 if __name__ == "__main__":
     evaluate_signals_and_trade()
+
+
+def execute_trade(signal_bundle, context):
+    """Execute orders. Day-2 stub: return an empty list (no side-effects)."""
+    return []
