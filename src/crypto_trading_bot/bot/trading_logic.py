@@ -20,6 +20,12 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
+
+# Optional RSI calculator (import may vary by environment)
+try:
+    from src.crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    calculate_rsi = None  # type: ignore[assignment]
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
@@ -129,20 +135,19 @@ class PositionManager:
                 asset = pos["pair"].split("/")[0]
                 history = mock_price_data.get(asset)
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
-                    from crypto_trading_bot.indicators.rsi import (
-                        calculate_rsi,
-                    )  # pylint: disable=import-outside-toplevel
-
-                    rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])
-                    exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
-                    if rsi_val is not None and rsi_val >= exit_upper:
-                        exit_price = price
-                        reason = "RSI_EXIT"
-                        print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
-                        exits.append((trade_id, exit_price, reason))
-                        keys_to_delete.append(trade_id)
-                        continue
-            except (ImportError, KeyError, ValueError, TypeError, IndexError) as e:
+                    if calculate_rsi is None:
+                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+                    else:
+                        rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])  # type: ignore[misc]
+                        exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
+                        if rsi_val is not None and rsi_val >= exit_upper:
+                            exit_price = price
+                            reason = "RSI_EXIT"
+                            print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
+                            exits.append((trade_id, exit_price, reason))
+                            keys_to_delete.append(trade_id)
+                            continue
+            except (KeyError, ValueError, TypeError, IndexError) as e:
                 print(f"[EXIT] RSI check error for {trade_id}: {e}")
 
             random_win = random.random() < 0.3
@@ -231,9 +236,8 @@ def evaluate_signals_and_trade(check_exits_only=False):
             execute_trade(_signals, ctx=None),  # type: ignore[name-defined]
             check_and_close_exits(ctx=None),  # type: ignore[name-defined]
         )
-    except Exception:  # pylint: disable=broad-exception-caught
-        # swallow: keep exact runtime behavior for now
-        pass
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
 
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
@@ -572,15 +576,14 @@ def gather_signals(prices, volumes, ctx=None, **kwargs):
                     pass
                 # clamp to valid range (some impls need <= n-1)
                 period = max(2, min(int(period), max(2, n - 1)))
-                try:
-                    from crypto_trading_bot.indicators.rsi import (
-                        calculate_rsi,
-                    )  # pylint: disable=import-outside-toplevel
-
-                    val = calculate_rsi(prices, period)
-                    out["rsi"] = _to_scalar(val)
-                except (ImportError, ValueError, TypeError, ZeroDivisionError, IndexError):
-                    out["rsi"] = None
+                if calculate_rsi is None:
+                    print("⚠️ RSI calculator unavailable — skipping RSI computation.")
+                else:
+                    try:
+                        val = calculate_rsi(prices, period)  # type: ignore[misc]
+                        out["rsi"] = _to_scalar(val)
+                    except (ValueError, TypeError, ZeroDivisionError, IndexError):
+                        out["rsi"] = None
     except Exception:  # pylint: disable=broad-exception-caught
         # fail-open: never break the loop due to indicator calc
         pass
@@ -635,7 +638,7 @@ def risk_screen(signals, ctx=None, **kwargs) -> bool:
             equity = getattr(portfolio, "equity", None)
 
             if equity is None or equity == 0:
-                print("⚠️ Equity is missing or zero — skipping buffer ratio check.")
+                print("⚠️ Equity missing or zero — skipping trade.")
                 return False
 
             equity = float(equity)
