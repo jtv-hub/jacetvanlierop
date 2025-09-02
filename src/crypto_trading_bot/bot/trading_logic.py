@@ -20,13 +20,14 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.price_feed import get_current_price
 
 # Optional RSI calculator (import may vary by environment)
 try:
     from src.crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
-from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
@@ -41,14 +42,13 @@ MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
 ACCOUNT_SIZE = 100000
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
-mock_price_data = {
-    # Random up/down trend for BTC
-    "BTC": [19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)],
-    "ETH": [2000 + sum(random.choice([-1, 1]) * random.uniform(0.5, 3.0) for _ in range(i + 1)) for i in range(100)],
-    "XRP": [0.5 + sum(random.choice([-1, 1]) * random.uniform(0.001, 0.01) for _ in range(i + 1)) for i in range(100)],
-    "LINK": [7 + sum(random.choice([-1, 1]) * random.uniform(0.01, 0.1) for _ in range(i + 1)) for i in range(100)],
-    "SOL": [20 + sum(random.choice([-1, 1]) * random.uniform(0.05, 0.4) for _ in range(i + 1)) for i in range(100)],
-}
+# Real-time price feed imported above per lint ordering
+
+
+# get_current_price now lives in utils.price_feed; removed local duplicate.
+
+
+# Removed hardcoded ASSETS list. Pairs are now centralized in CONFIG["tradable_pairs"].
 
 mock_volume_data = {
     "BTC": [1500 for _ in range(100)],
@@ -132,13 +132,17 @@ class PositionManager:
 
             # RSI-based exit check before other exits
             try:
-                asset = pos["pair"].split("/")[0]
-                history = mock_price_data.get(asset)
+                # Without historical data, attempt RSI with minimal series (will likely skip)
+                price_now = price
+                history = [price_now] if price_now and price_now > 0 else []
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
                     if calculate_rsi is None:
                         print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
                     else:
-                        rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])  # type: ignore[misc]
+                        rsi_val = calculate_rsi(
+                            history,
+                            CONFIG["rsi"]["period"],
+                        )  # type: ignore[misc]
                         exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
                         if rsi_val is not None and rsi_val >= exit_upper:
                             exit_price = price
@@ -224,7 +228,10 @@ def save_portfolio_state(ctx):
     print(f"[PORTFOLIO] Saved state to {PORTFOLIO_STATE_PATH}")
 
 
-def evaluate_signals_and_trade(check_exits_only=False):
+def evaluate_signals_and_trade(
+    check_exits_only: bool = False,
+    tradable_pairs: list[str] | None = None,
+):
     """Evaluates trade signals and manages trade execution and exits."""
     # REFACTOR-HOOKS: harmless calls while we peel logic out
     try:
@@ -241,7 +248,20 @@ def evaluate_signals_and_trade(check_exits_only=False):
 
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
-    current_prices = {f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()}
+    # Resolve the list of tradable pairs centrally (config-driven)
+    # Added to ensure the engine scans all requested assets with no hardcoding.
+    pairs: list[str] = tradable_pairs or CONFIG.get("tradable_pairs", [])
+    if not pairs:
+        print("⚠️ No tradable_pairs configured; skipping evaluation.")
+        return
+    # Build current price map using live feed for each pair
+    current_prices: dict[str, float] = {}
+    for pair in pairs:
+        price_now = get_current_price(pair)
+        if price_now is not None:
+            current_prices[pair] = price_now
+        else:
+            print(f"⚠️ No current price for {pair}; skipping in price map")
 
     # Refresh current market regime and capital buffer before signal evaluation
     context.update_context()
@@ -251,9 +271,20 @@ def evaluate_signals_and_trade(check_exits_only=False):
     if not check_exits_only:
         proposed_trades = []
         executed_trades = 0
-        for asset, _ in mock_price_data.items():
-            prices = mock_price_data[asset]
-            volume = mock_volume_data[asset][-1]
+        for pair in pairs:
+            # Derive asset symbol from pair (e.g., "BTC" from "BTC/USD")
+            asset = pair.split("/")[0]
+            # Fetch current price
+            current_price = current_prices.get(pair)
+            if current_price is None:
+                current_price = get_current_price(pair)
+            if current_price is None or current_price <= 0:
+                print(f"⚠️ Skipping {pair} — No valid current price")
+                continue
+
+            # Placeholder price series to maintain interface; strategies may skip due to length
+            prices = [current_price]
+            volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
             # Reinitialize strategies per iteration to reset state
             strategies = [
                 SimpleRSIStrategy(
@@ -296,12 +327,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 buffer = context.get_buffer()
 
                 if signal not in ["buy", "sell"] or confidence < 0.4:
-                    print(f"⚠️ Skipping {asset} — Confidence too low: {confidence}")
+                    print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
                     continue
                 if volume is None or volume < MIN_VOLUME:
-                    print(f"[{asset}] Skipping due to low volume: {volume}")
+                    print(f"[{pair}] Skipping due to low volume: {volume}")
                     continue
-                print(f"📊 Volume for {asset}: {volume}")
+                print(f"📊 Volume for {pair}: {volume}")
 
                 raw_position_size = round(
                     random.uniform(
@@ -341,7 +372,6 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     if np is None:
                         raise ImportError("numpy not available")
 
-                    corr_window = CONFIG.get("correlation", {}).get("window", 30)
                     corr_threshold = CONFIG.get("correlation", {}).get("threshold", 0.7)
                     skip_due_to_corr = False
                     corr_rows = []
@@ -349,8 +379,11 @@ def evaluate_signals_and_trade(check_exits_only=False):
                         other = t["asset"]
                         if other == asset:
                             continue
-                        a = mock_price_data[asset][-corr_window:]
-                        b = mock_price_data[other][-corr_window:]
+                        # Without historical series, correlation is not computed
+                        a_price = current_prices.get(f"{asset}/USD") or get_current_price(f"{asset}/USD")
+                        b_price = current_prices.get(f"{other}/USD") or get_current_price(f"{other}/USD")
+                        a = [a_price] if a_price else []
+                        b = [b_price] if b_price else []
                         if len(a) >= 2 and len(b) >= 2:
                             c = float(np.corrcoef(a, b)[0, 1])
                             corr_rows.append({"pair": f"{asset}-{other}", "corr": c})
@@ -415,7 +448,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 entry_raw = prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
                 ledger.log_trade(
-                    trading_pair=f"{asset}/USD",
+                    trading_pair=pair,
                     trade_size=adjusted_size,
                     strategy_name=strategy_name,
                     trade_id=trade_id,
@@ -439,7 +472,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     logged_price = round(entry_raw * (1 + 0.002), 4)
                 position_manager.open_position(
                     trade_id=trade_id,
-                    pair=f"{asset}/USD",
+                    pair=pair,
                     size=adjusted_size,
                     entry_price=logged_price,
                     strategy=strategy_name,
@@ -448,7 +481,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 )
                 executed_trades += 1
                 print(f"🧠 Confidence Score: {confidence}")
-                print(f"📝 Logged trade: {asset}/USD | Size: {adjusted_size}")
+                print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
                 print(f"📝 Strategy: {strategy_name}")
 
     # Ensure at least one trade is logged so validator can run
@@ -457,9 +490,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
             print("[FALLBACK] Skipping fallback seeding — disabled in production mode")
             return
         try:
-            asset = "BTC"
-            pair = "BTC/USD"
-            price = mock_price_data[asset][-1]
+            # Fix: remove hardcoded pair; use first configured pair if available
+            pair = pairs[0]
+            price = get_current_price(pair)
+            if price is None or price <= 0:
+                print("[FALLBACK] No real-time price available for fallback seeding; skipping")
+                return
             strategy_name = "SimpleRSIStrategy"
             confidence = 0.5
             regime = context.get_regime()

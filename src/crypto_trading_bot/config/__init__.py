@@ -1,6 +1,16 @@
 # src/crypto_trading_bot/config/__init__.py
 
 CONFIG: dict = {
+    # Centralized list of tradable pairs used across the app.
+    # Added to ensure no hardcoded pairs scattered in the codebase.
+    # Ordering matches requested scan order.
+    "tradable_pairs": [
+        "BTC/USD",
+        "ETH/USD",
+        "SOL/USD",
+        "XRP/USD",
+        "LINK/USD",
+    ],
     "rsi": {
         "period": 14,
         "lower": 48,

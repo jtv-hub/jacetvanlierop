@@ -23,20 +23,29 @@ if not logger.hasHandlers():
 
 
 def load_trades(log_path="logs/trades.log"):
-    """Load trades from the log file and return as a list of dicts."""
+    """Load trades from the log file and return as a list of dicts.
+
+    Fix: Include closed trades with ROI (not only executed), and skip malformed lines
+    gracefully so the learning cycle never crashes.
+    """
     trades = []
     if not os.path.exists(log_path):
         return trades
 
     with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                trade = json.loads(line.strip())
-                # only include executed trades with valid ROI
-                if trade.get("status") == "executed" and trade.get("roi") is not None:
-                    trades.append(trade)
+                trade = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            status = trade.get("status")
+            roi = trade.get("roi")
+            # Only learn from trades that have realized ROI (i.e., closed)
+            if status == "closed" and isinstance(roi, (int, float)):
+                trades.append(trade)
     return trades
 
 
