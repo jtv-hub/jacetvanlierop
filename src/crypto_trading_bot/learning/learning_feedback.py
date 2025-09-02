@@ -12,7 +12,14 @@ from datetime import datetime
 LEARNING_LOG_PATH = "logs/learning_feedback.log"
 
 
-def log_learning_feedback(suggestion_id, strategy_name, parameters, accepted, simulated_roi, actual_roi):
+def log_learning_feedback(
+    suggestion_id,
+    strategy_name,
+    parameters,
+    accepted,
+    simulated_roi,
+    actual_roi,
+):
     """
     Logs the result of a learning suggestion and its performance.
 

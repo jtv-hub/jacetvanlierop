@@ -199,7 +199,10 @@ class TradeLedger:
                     if pos and pos.get("exit_price") is None:
                         trade = {
                             "trade_id": trade_id,
-                            "timestamp": pos.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                            "timestamp": pos.get(
+                                "timestamp",
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
                             "pair": pos.get("pair", "BTC/USD"),
                             "size": pos.get("size", 0.001),
                             "strategy": pos.get("strategy", "Unknown"),
@@ -224,7 +227,7 @@ class TradeLedger:
 
                 # If still not found, log a clear error and stop
                 if trade_id not in [t.get("trade_id") for t in trades]:
-                    print(f"[Ledger] Trade ID {trade_id} not found in memory or " "trades.log — aborting update")
+                    print((f"[Ledger] Trade ID {trade_id} not found in memory or " "trades.log — aborting update"))
                     return
 
                 # Apply update
@@ -236,7 +239,10 @@ class TradeLedger:
                             timestamp = datetime.fromisoformat(trade["timestamp"])
                         except ValueError as e:
                             print(
-                                f"[Ledger] Invalid timestamp for trade {trade_id}:" f"{trade['timestamp']} - Error: {e}"
+                                (
+                                    f"[Ledger] Invalid timestamp for trade {trade_id}:"
+                                    f"{trade['timestamp']} - Error: {e}"
+                                )
                             )
                             continue
 
@@ -254,7 +260,14 @@ class TradeLedger:
                                     2,
                                 ),
                                 "realized_gain": round((exit_adj - entry_price) * size, 4),
-                                "roi": (round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0),
+                                "roi": (
+                                    round(
+                                        (exit_adj - entry_price) / entry_price,
+                                        6,
+                                    )
+                                    if entry_price
+                                    else 0.0
+                                ),
                                 # Slippage metadata
                                 "exit_slippage_rate": round(slip_rate, 6),
                                 "exit_slippage_amount": exit_slippage_amount,
@@ -305,14 +318,17 @@ class TradeLedger:
                             os.replace(tmp_pos, POSITIONS_PATH)
                             print(("[DEBUG] Synchronized positions.jsonl — removed closed " "position " f"{trade_id}"))
                     except (OSError, IOError) as e:
-                        print(f"[Ledger] Warning: failed to sync positions.jsonl for {trade_id}: {e}")
+                        print((f"[Ledger] Warning: failed to sync positions.jsonl for {trade_id}: " f"{e}"))
                 else:
                     # If trade is already closed, treat this as idempotent
-                    existing = next((t for t in trades if t.get("trade_id") == trade_id), None)
+                    existing = next(
+                        (t for t in trades if t.get("trade_id") == trade_id),
+                        None,
+                    )
                     if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
                         print(f"[Ledger] Idempotent update — trade {trade_id} already closed")
                     else:
-                        print(f"[Ledger] No update applied — trade_id {trade_id} not in open state")
+                        print((f"[Ledger] No update applied — trade_id {trade_id} " "not in open state"))
                 return
 
             except (OSError, IOError, json.JSONDecodeError) as e:
@@ -337,7 +353,7 @@ class TradeLedger:
                             if trade.get("trade_id"):
                                 self.trades.append(trade)
                         except json.JSONDecodeError as e:
-                            print(f"[Ledger] Skipping invalid line in trades.log:" f"{line.strip()} - Error: {e}")
+                            print(("[Ledger] Skipping invalid line in trades.log:" f"{line.strip()} - Error: {e}"))
             print(f"[Ledger] Reloaded {len(self.trades)} trades from trades.log")
         else:
             print("[Ledger] No trades.log file found.")

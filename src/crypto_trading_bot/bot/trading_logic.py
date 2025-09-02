@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
-from crypto_trading_bot.indicators.rsi import calculate_rsi
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
@@ -37,7 +36,8 @@ ACCOUNT_SIZE = 100000
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
 mock_price_data = {
-    "BTC": [19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)],  # Random up/down trend
+    # Random up/down trend for BTC
+    "BTC": [19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)],
     "ETH": [2000 + sum(random.choice([-1, 1]) * random.uniform(0.5, 3.0) for _ in range(i + 1)) for i in range(100)],
     "XRP": [0.5 + sum(random.choice([-1, 1]) * random.uniform(0.001, 0.01) for _ in range(i + 1)) for i in range(100)],
     "LINK": [7 + sum(random.choice([-1, 1]) * random.uniform(0.01, 0.1) for _ in range(i + 1)) for i in range(100)],
@@ -98,13 +98,21 @@ class PositionManager:
         except (OSError, IOError) as e:
             print(f"[PositionManager] Error writing to positions.jsonl: {e}")
 
-    def check_exits(self, current_prices, tp=0.002, sl=0.0015, trailing_stop=0.01, max_hold_bars=14):
+    def check_exits(
+        self,
+        current_prices,
+        tp=0.002,
+        sl=0.0015,
+        trailing_stop=0.01,
+        max_hold_bars=14,
+    ):
         """Checks each open position for exit criteria like SL, TP, or max hold."""
         exits = []
         current_time = datetime.datetime.now(datetime.UTC)
         keys_to_delete = []
         for trade_id, pos in self.positions.items():
-            price = current_prices.get(pos["pair"], pos["entry_price"])  # ledger applies exit slippage
+            # Current price (ledger applies exit slippage at write time)
+            price = current_prices.get(pos["pair"], pos["entry_price"])
             if price <= 0:
                 continue
             if "high_water_mark" not in pos:
@@ -121,16 +129,20 @@ class PositionManager:
                 asset = pos["pair"].split("/")[0]
                 history = mock_price_data.get(asset)
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
+                    from crypto_trading_bot.indicators.rsi import (
+                        calculate_rsi,
+                    )  # pylint: disable=import-outside-toplevel
+
                     rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])
                     exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
                     if rsi_val is not None and rsi_val >= exit_upper:
                         exit_price = price
                         reason = "RSI_EXIT"
-                        print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} rsi={rsi_val:.2f}")
+                        print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
                         exits.append((trade_id, exit_price, reason))
                         keys_to_delete.append(trade_id)
                         continue
-            except (KeyError, ValueError, TypeError, IndexError) as e:
+            except (ImportError, KeyError, ValueError, TypeError, IndexError) as e:
                 print(f"[EXIT] RSI check error for {trade_id}: {e}")
 
             random_win = random.random() < 0.3
@@ -208,16 +220,21 @@ def save_portfolio_state(ctx):
 
 
 def evaluate_signals_and_trade(check_exits_only=False):
-    # REFRACTOR-HOOKS: harmless calls while we peel logic out
+    """Evaluates trade signals and manages trade execution and exits."""
+    # REFACTOR-HOOKS: harmless calls while we peel logic out
     try:
-        _signals = gather_signals(prices=None, volumes=None, context=None)
-        _ok = risk_screen(_signals, context=None)
-        _ = (_signals, _ok, execute_trade(_signals, context=None), check_and_close_exits(context=None))
-    except Exception:
+        _signals = gather_signals(prices=None, volumes=None, ctx=None)  # type: ignore[name-defined]
+        _ok = risk_screen(_signals, ctx=None)  # type: ignore[name-defined]
+        _ = (
+            _signals,
+            _ok,
+            execute_trade(_signals, ctx=None),  # type: ignore[name-defined]
+            check_and_close_exits(ctx=None),  # type: ignore[name-defined]
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
         # swallow: keep exact runtime behavior for now
         pass
 
-    """Evaluates trade signals and manages trade execution and exits."""
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
     current_prices = {f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()}
@@ -337,11 +354,15 @@ def evaluate_signals_and_trade(check_exits_only=False):
                                 skip_due_to_corr = True
                                 # Log block event
                                 os.makedirs("logs", exist_ok=True)
-                                with open("logs/portfolio_metrics.log", "a", encoding="utf-8") as f:
+                                with open(
+                                    "logs/portfolio_metrics.log",
+                                    "a",
+                                    encoding="utf-8",
+                                ) as f:
                                     f.write(
                                         json.dumps(
                                             {
-                                                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                                                "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
                                                 "type": "correlation_block",
                                                 "asset": asset,
                                                 "other": other,
@@ -356,12 +377,16 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     # Log all evaluated correlations
                     if corr_rows:
                         os.makedirs("logs", exist_ok=True)
-                        with open("logs/portfolio_metrics.log", "a", encoding="utf-8") as f:
+                        with open(
+                            "logs/portfolio_metrics.log",
+                            "a",
+                            encoding="utf-8",
+                        ) as f:
                             for row in corr_rows:
                                 f.write(
                                     json.dumps(
                                         {
-                                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                                            "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
                                             "type": "correlation",
                                             **row,
                                         }
@@ -504,13 +529,23 @@ def evaluate_signals_and_trade(check_exits_only=False):
         )
 
 
-def gather_signals(prices, volumes, context):
-    """Collect & compute minimal indicators (safe, no side effects).
-    Computes RSI with a robust period + return-shape coercion.
+def gather_signals(prices, volumes, ctx=None, **kwargs):
+    """Collect and compute minimal indicators safely.
+
+    Computes RSI and returns a dict with simple fields. Accepts optional
+    ``ctx`` or ``context`` for config lookup.
     """
+    # Back-compat: accept callers passing 'context='
+    if ctx is None:
+        ctx = kwargs.get("context")
     out = {"rsi": None, "trend": None, "raw": {"prices": prices, "volumes": volumes}}
 
     def _to_scalar(x):
+        """Coerce various container types to a single representative value.
+
+        Takes the last item for sequences, preferred keys for mappings, or
+        returns the value unchanged for numerics/others.
+        """
         # Accept list/tuple/dict/number; take a reasonable "last value".
         if isinstance(x, (list, tuple)) and x:
             return x[-1]
@@ -527,53 +562,133 @@ def gather_signals(prices, volumes, context):
                 # default = 14; take from context if available
                 period = 14
                 try:
-                    if context is not None:
-                        cfg = getattr(context, "config", None) or getattr(context, "CONFIG", None) or {}
+                    if ctx is not None:
+                        cfg = getattr(ctx, "config", None) or getattr(ctx, "CONFIG", None) or {}
                         if hasattr(cfg, "get"):
                             period = cfg.get("rsi", {}).get("period", 14)
                         elif isinstance(cfg, dict):
                             period = cfg.get("rsi", {}).get("period", 14)
-                except Exception:
+                except (AttributeError, TypeError, ValueError):
                     pass
                 # clamp to valid range (some impls need <= n-1)
                 period = max(2, min(int(period), max(2, n - 1)))
                 try:
-                    from crypto_trading_bot.indicators.rsi import calculate_rsi
+                    from crypto_trading_bot.indicators.rsi import (
+                        calculate_rsi,
+                    )  # pylint: disable=import-outside-toplevel
 
                     val = calculate_rsi(prices, period)
                     out["rsi"] = _to_scalar(val)
-                except Exception:
+                except (ImportError, ValueError, TypeError, ZeroDivisionError, IndexError):
                     out["rsi"] = None
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
+        # fail-open: never break the loop due to indicator calc
         pass
     return out
 
 
-def risk_screen(signals, context) -> bool:
-    """Placeholder risk gate. Return True if it's *allowed* to trade.
+def risk_screen(signals, ctx=None, **kwargs) -> bool:
+    """Lightweight risk gate. Returns True to allow, False to block.
 
-    This stub is permissive (always True) to avoid behavior changes.
+    Rules:
+    - Block new *long* entries if RSI > 70 (overbought).
+    - Enforce max open positions (default 3).
+    - Enforce cash buffer ratio (cash/equity) >= capital_buffer (default 0.25).
+    - Fail-open on unexpected errors (never halt the loop).
     """
-    _ = (signals, context)
-    return True
+    # Back-compat: accept callers passing 'context='
+    if ctx is None:
+        ctx = kwargs.get("context")
+    try:
+        sb = signals or {}
+
+        # ---- config (defensive) ----
+        cfg = getattr(ctx, "config", None) or getattr(ctx, "CONFIG", None) or {}
+
+        def cfg_get(path, default):
+            """Safely traverse nested config dicts with defaults.
+
+            Accepts a tuple path like ("risk", "max_open_positions") and
+            returns the value if present; otherwise returns ``default``.
+            """
+            cur = cfg
+            for k in path:
+                if hasattr(cur, "get"):
+                    cur = cur.get(k, default if k is path[-1] else {})
+                elif isinstance(cur, dict):
+                    cur = cur.get(k, default if k is path[-1] else {})
+                else:
+                    return default
+            return cur
+
+        max_positions = int(cfg_get(("risk", "max_open_positions"), 3))
+        capital_buffer = float(cfg_get(("risk", "capital_buffer"), 0.25))
+
+        # ---- portfolio guards ----
+        portfolio = getattr(ctx, "portfolio", None)
+        if portfolio is not None:
+            opens = len(getattr(portfolio, "open_positions", []) or [])
+            if opens >= max_positions:
+                return False
+
+            cash = float(getattr(portfolio, "cash", 0.0) or 0.0)
+            equity = getattr(portfolio, "equity", None)
+
+            if equity is None or equity == 0:
+                print("⚠️ Equity is missing or zero — skipping buffer ratio check.")
+                return False
+
+            equity = float(equity)
+            if equity > 0 and (cash / equity) < capital_buffer:
+                return False
+
+        # ---- RSI guard for long entries ----
+        intent = sb.get("signal")
+        rsi = sb.get("rsi")
+
+        # scalarize rsi
+        if isinstance(rsi, (list, tuple)):
+            rsi = rsi[-1] if rsi else None
+        elif isinstance(rsi, dict):
+            rsi = rsi.get("rsi") or rsi.get("current") or rsi.get("value") or rsi.get("last")
+
+        # numeric cast (best effort)
+        try:
+            rsi_num = float(rsi) if rsi is not None else None
+        except (ValueError, TypeError):
+            rsi_num = None
+
+        if intent == "buy" and rsi_num is not None and rsi_num > 70.0:
+            return False
+
+        return True
+    except Exception:  # pylint: disable=broad-exception-caught
+        # fail-open so the engine doesn't halt on a guard bug
+        return True
 
 
-def execute_trade(signals, context):
+def execute_trade(signals, ctx=None, **kwargs):
     """Execute trade(s) based on signals.
 
     Returns a list of trade-like dicts for testing only; production flow
     still uses existing paths until we finish the split.
     """
-    _ = (signals, context)
+    # Back-compat: accept callers passing 'context='
+    if ctx is None:
+        ctx = kwargs.get("context")
+    _ = (signals, ctx)
     return []
 
 
-def check_and_close_exits(context) -> int:
+def check_and_close_exits(ctx=None, **kwargs) -> int:
     """Check exit rules and close positions if needed.
 
     Returns the number of closed positions (0 in stub).
     """
-    _ = context
+    # Back-compat: accept callers passing 'context='
+    if ctx is None:
+        ctx = kwargs.get("context")
+    _ = ctx
     return 0
 
 

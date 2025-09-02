@@ -48,9 +48,9 @@ def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
             payload.update({"context": context})
         with open(ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
-    except Exception:
+    except (OSError, IOError):
         # Best-effort alerting; ignore failures
-        pass
+        return
 
 
 def run_anomaly_audit() -> bool:
@@ -75,9 +75,12 @@ def run_anomaly_audit() -> bool:
             )
             return False
         else:
-            print(f"🧹 Audit cleanup complete — initial_errors={initial_errors}, removed={removed}, final_errors=0")
+            msg = (
+                "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, " "final_errors=0"
+            )
+            print(msg)
             return True
-    except Exception as e:
+    except (OSError, IOError, ValueError, KeyError, RuntimeError) as e:
         print(f"[Scheduler] run_anomaly_audit failed: {e}")
         send_alert("run_anomaly_audit failed", context={"error": str(e)})
         return False
@@ -117,10 +120,10 @@ def update_shadow_test_results():
         os.makedirs("logs", exist_ok=True)
         with open("logs/shadow_test_results.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(out) + "\n")
-    except Exception as e:
+    except (OSError, IOError, ValueError) as e:
         send_alert("update_shadow_test_results failed", context={"error": str(e)})
         # Non-fatal
-        pass
+        return
 
 
 def run_daily_pipeline():
@@ -178,7 +181,7 @@ def run_scheduler():
 
     if buffer_pct > 0.25:
         adjusted_risk = 0.02 * 0.5
-        print(f"🛡️ Buffer high ({round(buffer_pct * 100)}%), risk ↓ to {adjusted_risk * 100:.1f}%")
+        print(f"🛡️ Buffer high ({round(buffer_pct * 100)}%), " f"risk ↓ to {adjusted_risk * 100:.1f}%")
     elif buffer_pct > 0.10:
         adjusted_risk = 0.02 * 0.75
         buffer_msg = f"⚠️ Buffer elevated ({round(buffer_pct * 100)}%), " f"risk ↓ to {adjusted_risk * 100:.1f}%"
@@ -209,7 +212,7 @@ def run_scheduler():
                         print(f" - {err}")
                 else:
                     print("✅ Sync validation passed.")
-            except Exception as e:
+            except (ValueError, RuntimeError, OSError) as e:
                 print(f"[Scheduler] SyncValidator failed: {e}")
 
             # Run anomaly audit every 6 hours
