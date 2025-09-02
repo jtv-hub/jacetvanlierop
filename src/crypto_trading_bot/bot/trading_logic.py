@@ -25,7 +25,7 @@ from crypto_trading_bot.utils.price_feed import get_current_price
 
 # Optional RSI calculator (import may vary by environment)
 try:
-    from src.crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
+    from crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
 

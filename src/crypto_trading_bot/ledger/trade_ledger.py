@@ -126,7 +126,11 @@ class TradeLedger:
         side = kwargs.get("side")
         if side not in ("buy", "sell"):
             side = "buy" if strategy_name.lower().find("sell") == -1 else "sell"
-        entry_price_adj, slippage_amount_entry, slip_rate = _apply_slippage(trading_pair, float(entry_price), side)
+        entry_price_adj, slippage_amount_entry, slip_rate = _apply_slippage(
+            trading_pair,
+            float(entry_price),
+            side,
+        )
 
         capital_buffer = kwargs.get("capital_buffer", 0.25)
         tax_method = kwargs.get("tax_method", "FIFO")
@@ -268,7 +272,10 @@ class TradeLedger:
 
                 # If still not found, log a clear error and stop
                 if trade_id not in self.trade_index:
-                    logger.error("Trade ID %s not found in memory or trades.log — aborting update", trade_id)
+                    logger.error(
+                        "Trade ID %s not found in memory or trades.log — aborting update",
+                        trade_id,
+                    )
                     return
 
                 # Apply update
@@ -284,7 +291,10 @@ class TradeLedger:
                         except (TypeError, ZeroDivisionError):
                             entry_price = None
                     if entry_price is None:
-                        logger.error("Missing entry_price for trade %s; cannot compute PnL/ROI", trade_id)
+                        logger.error(
+                            "Missing entry_price for trade %s; cannot compute PnL/ROI",
+                            trade_id,
+                        )
                         return
                     try:
                         timestamp = datetime.fromisoformat(t_obj["timestamp"])
