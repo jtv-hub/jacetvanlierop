@@ -13,7 +13,9 @@ import random
 import time
 import uuid
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 
+from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG
 
@@ -29,7 +31,12 @@ SLIPPAGE = 0.002  # default fallback; per-asset slippage from CONFIG overrides t
 system_logger = logging.getLogger("trade_ledger.system")
 if not system_logger.hasHandlers():
     os.makedirs("logs", exist_ok=True)
-    sys_handler = logging.FileHandler(SYSTEM_LOG_PATH, encoding="utf-8")
+    sys_handler = RotatingFileHandler(
+        SYSTEM_LOG_PATH,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
     sys_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     system_logger.addHandler(sys_handler)
     system_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
@@ -39,11 +46,19 @@ if not system_logger.hasHandlers():
 trade_logger = logging.getLogger("trade_ledger.trades")
 if not trade_logger.hasHandlers():
     os.makedirs("logs", exist_ok=True)
-    trade_handler = logging.FileHandler(TRADES_LOG_PATH, encoding="utf-8")
+    trade_handler = RotatingFileHandler(
+        TRADES_LOG_PATH,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
     trade_handler.setFormatter(logging.Formatter("%(message)s"))
     trade_logger.addHandler(trade_handler)
     trade_logger.setLevel(logging.INFO)
     trade_logger.propagate = False
+
+# Shared anomalies logger (compact JSONL)
+anomalies_logger = get_anomalies_logger()
 
 
 def _slippage_rate_for_pair(pair: str) -> float:
@@ -190,20 +205,18 @@ class TradeLedger:
             validate_trade_schema(trade)
         except (ValueError, TypeError) as e:
             try:
-                os.makedirs("logs", exist_ok=True)
-                with open("logs/anomalies.log", "a", encoding="utf-8") as af:
-                    af.write(
-                        json.dumps(
-                            {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "type": "Trade Schema Error",
-                                "error": str(e),
-                                "trade": trade,
-                            }
-                        )
-                        + "\n"
+                anomalies_logger.info(
+                    json.dumps(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "type": "Trade Schema Error",
+                            "error": str(e),
+                            "trade": trade,
+                        },
+                        separators=(",", ":"),
                     )
-            except (OSError, IOError):
+                )
+            except (TypeError, ValueError):
                 pass
             raise
 
@@ -234,8 +247,33 @@ class TradeLedger:
         If trade is missing, attempts to reload from file and/or reconstruct from positions.
         Retries up to 3 times on failure and safely resyncs positions.jsonl.
         """
-        if not isinstance(exit_price, (int, float)) or exit_price <= 0:
-            raise ValueError(f"[Ledger] Invalid exit_price for trade {trade_id}: {exit_price}")
+        # If exit_price is missing/invalid, log anomaly and return without raising.
+        if exit_price is None or not isinstance(exit_price, (int, float)) or exit_price <= 0:
+            try:
+                t_obj = self.trade_index.get(trade_id) if hasattr(self, "trade_index") else None
+            except Exception:
+                t_obj = None
+            try:
+                anomalies_logger.info(
+                    json.dumps(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "type": "Missing Exit Price",
+                            "trade_id": trade_id,
+                            "pair": (t_obj or {}).get("pair"),
+                            "strategy": (t_obj or {}).get("strategy"),
+                            "reason": "exit_price is None or not logged",
+                            "confidence": (t_obj or {}).get("confidence"),
+                            "roi": (t_obj or {}).get("roi"),
+                            "regime": (t_obj or {}).get("regime"),
+                            "side": (t_obj or {}).get("side"),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            return
 
         if not os.path.exists(TRADES_LOG_PATH):
             system_logger.error("Trade file not found: %s", TRADES_LOG_PATH)
@@ -352,22 +390,43 @@ class TradeLedger:
                         validate_trade_schema(t_obj)
                     except (ValueError, TypeError) as e:
                         try:
-                            os.makedirs("logs", exist_ok=True)
-                            with open("logs/anomalies.log", "a", encoding="utf-8") as af:
-                                af.write(
-                                    json.dumps(
-                                        {
-                                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                                            "type": "Trade Schema Error (post-update)",
-                                            "error": str(e),
-                                            "trade": t_obj,
-                                        }
-                                    )
-                                    + "\n"
+                            anomalies_logger.info(
+                                json.dumps(
+                                    {
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "type": "Trade Schema Error (post-update)",
+                                        "error": str(e),
+                                        "trade": t_obj,
+                                    },
+                                    separators=(",", ":"),
                                 )
-                        except (OSError, IOError):
+                            )
+                        except (TypeError, ValueError):
                             pass
                     updated = True
+
+                    # After update, if exit_price still missing/None, log anomaly but continue
+                    if t_obj.get("exit_price") is None:
+                        try:
+                            anomalies_logger.info(
+                                json.dumps(
+                                    {
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "type": "Missing Exit Price",
+                                        "trade_id": trade_id,
+                                        "pair": t_obj.get("pair"),
+                                        "strategy": t_obj.get("strategy"),
+                                        "reason": "exit_price is None or not logged",
+                                        "confidence": t_obj.get("confidence"),
+                                        "roi": t_obj.get("roi"),
+                                        "regime": t_obj.get("regime"),
+                                        "side": t_obj.get("side"),
+                                    },
+                                    separators=(",", ":"),
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            pass
 
                 if updated:
                     # Safely rewrite trades.log with exclusive lock held on source
@@ -416,7 +475,11 @@ class TradeLedger:
                                 trade_id,
                             )
                     except (OSError, IOError) as e:
-                        system_logger.warning("Failed to sync positions.jsonl for %s: %s", trade_id, e)
+                        system_logger.warning(
+                            "Failed to sync positions.jsonl for %s: %s",
+                            trade_id,
+                            e,
+                        )
                 else:
                     # If trade is already closed, treat this as idempotent
                     existing = next(
@@ -426,7 +489,10 @@ class TradeLedger:
                     if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
                         system_logger.info("Idempotent update — trade %s already closed", trade_id)
                     else:
-                        system_logger.info("No update applied — trade_id %s not in open state", trade_id)
+                        system_logger.info(
+                            "No update applied — trade_id %s not in open state",
+                            trade_id,
+                        )
                 return
 
             except (OSError, IOError, json.JSONDecodeError) as e:

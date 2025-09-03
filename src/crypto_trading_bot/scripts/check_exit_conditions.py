@@ -7,6 +7,7 @@ evaluates exit conditions using PositionManager, and updates the trade log.
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 
 from crypto_trading_bot.bot.trading_logic import position_manager
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
@@ -14,10 +15,21 @@ from crypto_trading_bot.utils.kraken_api import get_ticker_price
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
+    # Preserve console output format
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Add rotating file handler for exit checks
+    os.makedirs("logs", exist_ok=True)
+    file_handler = RotatingFileHandler(
+        filename="logs/exit_check.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(file_handler)
 
 
 def get_live_prices(positions) -> dict:

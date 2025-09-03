@@ -5,10 +5,13 @@ Implements the Relative Strength Index (RSI) calculation for trading strategies.
 """
 
 import json
-import os
 from datetime import datetime, timezone
 
 import numpy as np
+
+from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
+
+anomalies_logger = get_anomalies_logger()
 
 
 def calculate_rsi(prices, period=14):
@@ -84,23 +87,19 @@ def calculate_rsi(prices, period=14):
     elif not np.isfinite(rs) or rs < 0:
         # unexpected numeric state; log and fallback
         try:
-            os.makedirs("logs", exist_ok=True)
-            with open("logs/anomalies.log", "a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "type": "RSI Invalid RS",
-                            "avg_gain": float(avg_gain),
-                            "avg_loss": float(avg_loss),
-                            "rs": str(rs),
-                        }
-                    )
-                    + "\n"
+            anomalies_logger.info(
+                json.dumps(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "RSI Invalid RS",
+                        "avg_gain": float(avg_gain),
+                        "avg_loss": float(avg_loss),
+                        "rs": str(rs),
+                    },
+                    separators=(",", ":"),
                 )
-                f.flush()
-                os.fsync(f.fileno())
-        except (OSError, IOError, ValueError, TypeError):
+            )
+        except (ValueError, TypeError):
             # Best-effort anomaly logging
             pass
         first_rsi = 50.0
@@ -135,21 +134,17 @@ def calculate_rsi(prices, period=14):
     # Clamp after validations and log invalid values
     if not np.isfinite(rsi_out):
         try:
-            os.makedirs("logs", exist_ok=True)
-            with open("logs/anomalies.log", "a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "type": "RSI Invalid Output",
-                            "value": str(rsi_out),
-                        }
-                    )
-                    + "\n"
+            anomalies_logger.info(
+                json.dumps(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "RSI Invalid Output",
+                        "value": str(rsi_out),
+                    },
+                    separators=(",", ":"),
                 )
-                f.flush()
-                os.fsync(f.fileno())
-        except (OSError, IOError, ValueError, TypeError):
+            )
+        except (ValueError, TypeError):
             # Best-effort anomaly logging
             pass
         rsi_out = 50.0

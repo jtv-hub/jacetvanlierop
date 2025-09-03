@@ -6,37 +6,29 @@ Audits the trade log to identify malformed or out-of-range confidence values.
 
 import fcntl
 import json
-import logging
 import os
 from datetime import datetime, timezone
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
 
-ANOMALY_LOG_PATH = "logs/anomalies.log"
-
-logger = logging.getLogger("confidence_audit")
-logger.setLevel(logging.INFO)
-if not logger.hasHandlers():
-    rotating_handler = get_rotating_handler("anomalies.log")
-    logger.addHandler(rotating_handler)
+anomalies_logger = get_anomalies_logger()
 
 
 def log_anomaly(anomaly, source="audit"):
-    """Log a malformed trade anomaly with timestamp and source."""
+    """Log a malformed trade anomaly with timestamp and source.
+
+    Uses a rotating file handler bound to this module's logger to ensure
+    anomalies.log rotates at 10MB with up to 3 backups. Preserves JSONL format.
+    """
     os.makedirs("logs", exist_ok=True)
     anomaly_record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": source,
         **anomaly,
     }
-    with open(ANOMALY_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(anomaly_record) + "\n")
-        try:
-            f.flush()
-            os.fsync(f.fileno())
-        except (OSError, IOError):
-            pass
+    # Compact JSONL format
+    anomalies_logger.info(json.dumps(anomaly_record, separators=(",", ":")))
 
 
 def load_trades(path):

@@ -12,8 +12,8 @@ import os
 
 import numpy as np
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
-from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
+from src.crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from src.crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)

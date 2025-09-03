@@ -2,8 +2,6 @@
 Market regime detection module.
 """
 
-import pandas as pd
-
 
 def detect_regime(prices, window: int = 10):
     """
@@ -20,6 +18,10 @@ def detect_regime(prices, window: int = 10):
         return "unknown"
 
     # ✅ Ensure prices is a pandas Series
+    try:  # Lazy import to avoid hard dependency for linting environments
+        import pandas as pd  # pylint: disable=import-error, import-outside-toplevel
+    except ImportError:
+        return "unknown"
     if isinstance(prices, list):
         prices = pd.Series(prices)
 

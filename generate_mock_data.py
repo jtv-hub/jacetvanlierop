@@ -7,15 +7,17 @@ Creates CSVs for BTC, ETH, and SOL in /data folder.
 import os
 from datetime import datetime, timedelta
 
-import numpy as np
-import pandas as pd
-
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def generate_mock_data(pair_name: str, days: int = 1):
     """Generate random OHLCV data for a given trading pair."""
+    # Local imports to avoid hard dependency at module import time
+    # Local imports avoid hard dependency at module import time
+    import numpy as np  # pylint: disable=import-error, import-outside-toplevel
+    import pandas as pd  # pylint: disable=import-error, import-outside-toplevel
+
     end = datetime.now()
     start = end - timedelta(days=days)
     timestamps = pd.date_range(start=start, end=end, freq="T")  # 1-minute candles

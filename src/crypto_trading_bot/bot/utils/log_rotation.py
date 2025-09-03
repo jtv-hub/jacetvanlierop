@@ -11,8 +11,9 @@ import shutil
 from logging.handlers import RotatingFileHandler
 
 LOG_DIR = "logs"
-MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
-BACKUP_COUNT = 5
+# Standardize rotation policy: 10MB, keep 3 backups
+MAX_LOG_SIZE = 10 * 1024 * 1024
+BACKUP_COUNT = 3
 
 
 def get_rotating_handler(log_file: str) -> RotatingFileHandler:
@@ -43,6 +44,37 @@ def get_rotating_handler(log_file: str) -> RotatingFileHandler:
     handler.namer = compress_namer
 
     return handler
+
+
+_ANOMALIES_LOGGER_NAME = "anomalies_logger"
+
+
+def get_anomalies_logger() -> logging.Logger:
+    """Return a shared rotating logger for logs/anomalies.log.
+
+    - Rotates at MAX_LOG_SIZE with BACKUP_COUNT
+    - UTF-8 encoding; compact message-only lines (JSONL provided by caller)
+    - Singleton per process to avoid duplicate handlers
+    """
+    logger = logging.getLogger(_ANOMALIES_LOGGER_NAME)
+    if logger.handlers:
+        return logger
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handler = RotatingFileHandler(
+        filename=os.path.join(LOG_DIR, "anomalies.log"),
+        mode="a",
+        maxBytes=MAX_LOG_SIZE,
+        backupCount=BACKUP_COUNT,
+        encoding="utf-8",
+        delay=True,
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
 
 
 def compress_old_log(source: str, dest: str):
