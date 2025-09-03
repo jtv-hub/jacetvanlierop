@@ -43,7 +43,7 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "risk",
-                "suggestion": "Improve risk-adjusted returns by optimizing stop losses or trade exits.",
+                "suggestion": ("Improve risk-adjusted returns by optimizing stop losses " "or trade exits."),
                 "confidence": 0.6,
                 "reason": (f"Sharpe low ({sharpe:.2f}) while Sortino acceptable " f"({sortino:.2f})."),
             }

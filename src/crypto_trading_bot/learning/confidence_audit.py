@@ -242,7 +242,10 @@ def print_audit_report(results):
         )
 
 
-def cleanup_closed_positions(trades_file="logs/trades.log", positions_file="logs/positions.jsonl") -> int:
+def cleanup_closed_positions(
+    trades_file: str = "logs/trades.log",
+    positions_file: str = "logs/positions.jsonl",
+) -> int:
     """Remove any positions whose matching trade is closed from positions.jsonl.
 
     Returns the number of positions removed.
@@ -283,7 +286,10 @@ def cleanup_closed_positions(trades_file="logs/trades.log", positions_file="logs
         return 0
 
 
-def run_and_cleanup(trade_log_path="logs/trades.log", positions_file="logs/positions.jsonl") -> dict:
+def run_and_cleanup(
+    trade_log_path: str = "logs/trades.log",
+    positions_file: str = "logs/positions.jsonl",
+) -> dict:
     """Run audit, perform cleanup of closed positions, rerun audit, and return summary.
 
     Returns a dict: {"initial_errors": int, "removed": int, "final_errors": int, "errors": [..]}

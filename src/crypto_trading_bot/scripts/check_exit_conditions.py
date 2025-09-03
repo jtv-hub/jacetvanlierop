@@ -1,54 +1,114 @@
 """
 Exit Check Script
 
-This script loads positions and current mock prices, checks exit conditions,
-and updates the trade log accordingly.
+Loads open positions, fetches latest prices (live where available),
+evaluates exit conditions using PositionManager, and updates the trade log.
 """
 
+import logging
 import os
 
-from crypto_trading_bot.bot.trading_logic import mock_price_data, position_manager
-from crypto_trading_bot.config import CONFIG
-from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.bot.trading_logic import position_manager
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.kraken_api import get_ticker_price
+
+logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def get_live_prices(positions) -> dict:
+    """Fetch live prices for all pairs present in open positions.
+
+    Falls back to the first seen entry_price for a pair if live fetch fails.
+    """
+    prices: dict[str, float] = {}
+    pairs = {p.get("pair") for p in positions if p.get("pair")}
+    if not pairs:
+        logger.info("No open positions — skipping price fetch.")
+        return {}
+
+    # Precompute first valid entry_price per pair to avoid repeated scans.
+    fallback_prices: dict[str, float] = {}
+    for pos in positions:
+        pair = pos.get("pair")
+        entry = pos.get("entry_price")
+        if pair and pair not in fallback_prices and isinstance(entry, (int, float)) and entry > 0:
+            fallback_prices[pair] = float(entry)
+
+    for pair in pairs:
+        # First, attempt to fetch from API
+        try:
+            raw_px = get_ticker_price(pair)
+        except Exception as api_err:  # pylint: disable=broad-exception-caught
+            logger.warning("Failed to fetch live price for %s: %s", pair, api_err)
+            raw_px = None
+
+        # Then, attempt to parse/cast
+        px = None
+        if raw_px is not None:
+            try:
+                px = float(raw_px)
+            except (TypeError, ValueError) as parse_err:
+                logger.warning(
+                    "Failed to parse live price for %s: %r (%s)",
+                    pair,
+                    raw_px,
+                    parse_err,
+                )
+
+        if px is None or px <= 0:
+            entry = fallback_prices.get(pair)
+            if isinstance(entry, (int, float)) and entry > 0:
+                prices[pair] = float(entry)
+        else:
+            prices[pair] = float(px)
+
+    if not prices:
+        logger.warning("No prices available; cannot evaluate exits.")
+        return {}
+    return prices
 
 
 def main():
-    """
-    Loads positions and mock prices, evaluates exit conditions, and updates the trade log.
-    """
+    """Load positions, build a current price map, evaluate exits, and update the ledger."""
+
+    # Ensure positions in memory
     position_manager.load_positions_from_file()
 
     # Sync trade ledger state with reloaded trades
     ledger = TradeLedger(position_manager)
     ledger.reload_trades()
 
-    # Simulate current prices (latest mock data point)
-    current_prices = {f"{asset}/USD": prices[-1] for asset, prices in mock_price_data.items()}
+    # Build current prices from live Kraken feed (with fallback to entry price)
+    current_prices = get_live_prices(position_manager.positions.values())
 
-    # Add RSI-based exit pass to increase coverage
-    for _, pos in position_manager.positions.items():
-        pair = pos.get("pair")
-        asset = pair.split("/")[0] if pair else None
-        series = mock_price_data.get(asset)
-        if series and len(series) >= CONFIG["rsi"]["period"] + 1:
-            rsi_val = calculate_rsi(series, CONFIG["rsi"]["period"])
-            if rsi_val is not None and rsi_val >= CONFIG["rsi"].get("exit_upper", 70):
-                current_prices[pair] = series[-1]
-    exits = position_manager.check_exits(current_prices)
+    # Optional enhancement: incorporate RSI-based exits using historical prices.
+
+    if not current_prices:
+        return
+
+    try:
+        exits = position_manager.check_exits(current_prices)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Exit evaluation failed")
+        return
     for trade_id, exit_price, reason in exits:
-        print(f"🚪 Closing trade {trade_id} at {exit_price}: {reason}")
+        logger.info("Closing trade %s at %s: %s", trade_id, exit_price, reason)
         try:
             ledger.update_trade(trade_id=trade_id, exit_price=exit_price, reason=reason)
             # Force trades.log sync
             with open("logs/trades.log", "a", encoding="utf-8") as f:
                 f.flush()
                 os.fsync(f.fileno())
-        except (IOError, ValueError) as e:
-            print(f"[Error] Failed to update trade {trade_id}: {e}")
+        except (IOError, ValueError):
+            logger.exception("Failed to update trade %s", trade_id)
 
     if not exits:
-        print("ℹ️ No exit conditions triggered or already updated.")
+        logger.info("No exit conditions triggered or already updated.")
 
 
 if __name__ == "__main__":

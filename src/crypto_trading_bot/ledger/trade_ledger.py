@@ -14,19 +14,36 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG
 
-logger = logging.getLogger("trade_ledger")
-logger.setLevel(logging.INFO)
-if not logger.hasHandlers():
-    rotating_handler = get_rotating_handler("trades.log")
-    logger.addHandler(rotating_handler)
+# Enable extra debug output when explicitly requested
+DEBUG_MODE = os.getenv("DEBUG_MODE", "0") == "1"
 
 TRADES_LOG_PATH = "logs/trades.log"
+SYSTEM_LOG_PATH = "logs/system.log"
 POSITIONS_PATH = "logs/positions.jsonl"
 SLIPPAGE = 0.002  # default fallback; per-asset slippage from CONFIG overrides this
+
+# System logger (warnings/errors/debug) to logs/system.log
+system_logger = logging.getLogger("trade_ledger.system")
+if not system_logger.hasHandlers():
+    os.makedirs("logs", exist_ok=True)
+    sys_handler = logging.FileHandler(SYSTEM_LOG_PATH, encoding="utf-8")
+    sys_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    system_logger.addHandler(sys_handler)
+    system_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+    system_logger.propagate = False
+
+# Trade logger (message-only JSON lines) to logs/trades.log
+trade_logger = logging.getLogger("trade_ledger.trades")
+if not trade_logger.hasHandlers():
+    os.makedirs("logs", exist_ok=True)
+    trade_handler = logging.FileHandler(TRADES_LOG_PATH, encoding="utf-8")
+    trade_handler.setFormatter(logging.Formatter("%(message)s"))
+    trade_logger.addHandler(trade_handler)
+    trade_logger.setLevel(logging.INFO)
+    trade_logger.propagate = False
 
 
 def _slippage_rate_for_pair(pair: str) -> float:
@@ -58,7 +75,7 @@ def _apply_slippage(pair: str, price: float, side: str) -> tuple[float, float, f
         amount = raw - adjusted
     adjusted = round(adjusted, 4)
     amount = round(amount, 4)
-    logger.debug(
+    system_logger.debug(
         "Applied slippage pair=%s side=%s raw=%.6f adj=%.6f rate=%.6f amount=%.6f",
         pair,
         side,
@@ -161,6 +178,13 @@ class TradeLedger:
             "entry_slippage_amount": slippage_amount_entry,
         }
 
+        # Debug: emit the trade being logged for diagnostics (opt-in)
+        if DEBUG_MODE:
+            try:
+                system_logger.debug("Logging trade: %s", json.dumps(trade, indent=2))
+            except (TypeError, OSError):
+                pass
+
         # Validate schema; on failure, log anomaly for audit and re-raise.
         try:
             validate_trade_schema(trade)
@@ -183,14 +207,8 @@ class TradeLedger:
                 pass
             raise
 
-        with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(json.dumps(trade) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-        logger.info("Trade logged: %s", json.dumps(trade))
+        # Write compact, one-line JSON to trades.log via trade_logger
+        trade_logger.info(json.dumps(trade, separators=(",", ":")))
         self.trades.append(trade)
         self.trade_index[trade_id] = trade
         return trade_id
@@ -208,7 +226,7 @@ class TradeLedger:
             f.flush()
             os.fsync(f.fileno())
             fcntl.flock(f, fcntl.LOCK_UN)
-        logger.debug("Position %s written to positions.jsonl", trade_id)
+        system_logger.debug("Position %s written to positions.jsonl", trade_id)
 
     def update_trade(self, trade_id, exit_price, reason):
         """
@@ -220,11 +238,11 @@ class TradeLedger:
             raise ValueError(f"[Ledger] Invalid exit_price for trade {trade_id}: {exit_price}")
 
         if not os.path.exists(TRADES_LOG_PATH):
-            logger.error("Trade file not found: %s", TRADES_LOG_PATH)
+            system_logger.error("Trade file not found: %s", TRADES_LOG_PATH)
             return
 
         if not hasattr(self.position_manager, "positions") or self.position_manager.positions is None:
-            logger.error("position_manager.positions unavailable for trade %s", trade_id)
+            system_logger.error("position_manager.positions unavailable for trade %s", trade_id)
             return
 
         max_retries = 3
@@ -268,11 +286,11 @@ class TradeLedger:
                         }
                         trades.append(trade)
                         self.trade_index[trade_id] = trade
-                        logger.warning("Synced missing trade %s from position", trade_id)
+                        system_logger.warning("Synced missing trade %s from position", trade_id)
 
                 # If still not found, log a clear error and stop
                 if trade_id not in self.trade_index:
-                    logger.error(
+                    system_logger.error(
                         "Trade ID %s not found in memory or trades.log — aborting update",
                         trade_id,
                     )
@@ -291,7 +309,7 @@ class TradeLedger:
                         except (TypeError, ZeroDivisionError):
                             entry_price = None
                     if entry_price is None:
-                        logger.error(
+                        system_logger.error(
                             "Missing entry_price for trade %s; cannot compute PnL/ROI",
                             trade_id,
                         )
@@ -301,7 +319,7 @@ class TradeLedger:
                         if timestamp.tzinfo is None:
                             timestamp = timestamp.replace(tzinfo=timezone.utc)
                     except (ValueError, TypeError) as e:
-                        logger.error(
+                        system_logger.error(
                             "Invalid timestamp for trade %s: %s (error: %s)",
                             trade_id,
                             t_obj.get("timestamp"),
@@ -368,7 +386,7 @@ class TradeLedger:
                             fcntl.flock(src, fcntl.LOCK_UN)
                     self.trades = trades
                     self.trade_index = {t.get("trade_id"): t for t in trades if t and t.get("trade_id")}
-                    logger.debug("Successfully updated trade %s in trades.log", trade_id)
+                    system_logger.debug("Successfully updated trade %s in trades.log", trade_id)
 
                     # Safely resync positions.jsonl by removing the closed position
                     try:
@@ -393,12 +411,12 @@ class TradeLedger:
                                     finally:
                                         fcntl.flock(dst, fcntl.LOCK_UN)
                             os.replace(tmp_pos, POSITIONS_PATH)
-                            logger.debug(
+                            system_logger.debug(
                                 "Synchronized positions.jsonl — removed closed position %s",
                                 trade_id,
                             )
                     except (OSError, IOError) as e:
-                        logger.warning("Failed to sync positions.jsonl for %s: %s", trade_id, e)
+                        system_logger.warning("Failed to sync positions.jsonl for %s: %s", trade_id, e)
                 else:
                     # If trade is already closed, treat this as idempotent
                     existing = next(
@@ -406,16 +424,16 @@ class TradeLedger:
                         None,
                     )
                     if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
-                        logger.info("Idempotent update — trade %s already closed", trade_id)
+                        system_logger.info("Idempotent update — trade %s already closed", trade_id)
                     else:
-                        logger.info("No update applied — trade_id %s not in open state", trade_id)
+                        system_logger.info("No update applied — trade_id %s not in open state", trade_id)
                 return
 
             except (OSError, IOError, json.JSONDecodeError) as e:
-                logger.error("Error updating trade (attempt %s): %s", attempt + 1, e)
+                system_logger.error("Error updating trade (attempt %s): %s", attempt + 1, e)
                 time.sleep(1)
 
-        logger.error("Failed to update trade %s after %s attempts", trade_id, max_retries)
+        system_logger.error("Failed to update trade %s after %s attempts", trade_id, max_retries)
 
     def reload_trades(self):
         """
@@ -427,21 +445,24 @@ class TradeLedger:
         if os.path.exists(TRADES_LOG_PATH):
             with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        try:
-                            trade = json.loads(line)
-                            if trade.get("trade_id"):
-                                self.trades.append(trade)
-                        except json.JSONDecodeError as e:
-                            logger.warning(
-                                "Skipping invalid line in trades.log: %s - Error: %s",
-                                line.strip(),
-                                e,
-                            )
+                    if not line.strip():
+                        continue
+                    try:
+                        trade = json.loads(line)
+                        if trade.get("trade_id"):
+                            self.trades.append(trade)
+                    except json.JSONDecodeError as e:
+                        raw = line.strip()
+                        redacted = (raw[:200] + "...") if len(raw) > 200 else raw
+                        system_logger.warning(
+                            "Skipping malformed line in trades.log: %s — Error: %s",
+                            redacted,
+                            e,
+                        )
             self.trade_index = {t.get("trade_id"): t for t in self.trades if t and t.get("trade_id")}
-            logger.info("Reloaded %s trades from trades.log", len(self.trades))
+            system_logger.info("Reloaded %s trades from trades.log", len(self.trades))
         else:
-            logger.info("No trades.log file found.")
+            system_logger.info("No trades.log file found.")
         return self.trades
 
     def verify_trade_update(self, target_trade_id):
@@ -453,14 +474,14 @@ class TradeLedger:
         trades = self.trades
         matching = [t for t in trades if t.get("trade_id") == target_trade_id]
         if not matching:
-            logger.info("No entries found for trade_id: %s", target_trade_id)
+            system_logger.info("No entries found for trade_id: %s", target_trade_id)
             return False
         latest = max(matching, key=lambda x: x.get("timestamp", "1970-01-01T00:00:00+00:00"))
         required_fields = ["status", "exit_price", "reason", "roi"]
         status_ok = latest.get("status") == "closed"
         fields_ok = all(latest.get(f) is not None for f in required_fields)
         if status_ok and fields_ok:
-            logger.info("Verified update for trade %s", target_trade_id)
+            system_logger.info("Verified update for trade %s", target_trade_id)
             return True
-        logger.info("Trade found but not fully updated: %s", latest)
+        system_logger.info("Trade found but not fully updated: %s", latest)
         return False

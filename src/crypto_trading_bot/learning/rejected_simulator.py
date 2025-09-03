@@ -10,7 +10,14 @@ from datetime import datetime
 from crypto_trading_bot.learning.shadow_test_logger import log_shadow_test_result
 
 
-def simulate_rejected_strategy(suggestion_id, strategy_class, parameters, price_data, asset="BTC", timeframe="5m"):
+def simulate_rejected_strategy(
+    suggestion_id,
+    strategy_class,
+    parameters,
+    price_data,
+    asset="BTC",
+    timeframe="5m",
+):
     """
     Simulates a rejected strategy on historical price data and logs the result.
 
