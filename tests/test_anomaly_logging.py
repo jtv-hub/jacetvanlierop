@@ -90,7 +90,11 @@ def test_anomaly_logging_rsi_and_audit():
     # Log a test anomaly via the shared anomalies logger
     rsi.anomalies_logger.info(
         json.dumps(
-            {"timestamp": datetime.now(timezone.utc).isoformat(), "type": "test_rsi_anomaly", "marker": marker},
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "test_rsi_anomaly",
+                "marker": marker,
+            },
             separators=(",", ":"),
         )
     )
@@ -157,6 +161,8 @@ def test_missing_exit_price_anomaly_logged():
 
     # Minimal stub PM
     class PM:
+        """Minimal position manager stub used for tests."""
+
         def __init__(self):
             self.positions = {}
 

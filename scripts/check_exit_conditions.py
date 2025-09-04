@@ -10,8 +10,10 @@ Assumes the package is importable as `crypto_trading_bot` (src layout).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict
 
 from crypto_trading_bot.bot.trading_logic import PositionManager as TLPositionManager
@@ -81,6 +83,24 @@ def main() -> None:
             with open("logs/trades.log", "a", encoding="utf-8") as f:
                 f.flush()
                 os.fsync(f.fileno())
+            # Append exit record to exit_check.log (JSONL)
+            os.makedirs("logs", exist_ok=True)
+            # Compute a simple ROI from the position if available
+            pos = pm.positions.get(trade_id, {})
+            try:
+                entry_price = float(pos.get("entry_price")) if pos.get("entry_price") else None
+            except (TypeError, ValueError):
+                entry_price = None
+            roi = (exit_price - entry_price) / entry_price if entry_price else None
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "trade_id": trade_id,
+                "exit_price": round(float(exit_price), 8),
+                "reason": reason,
+                "roi": round(float(roi), 8) if isinstance(roi, float) else None,
+            }
+            with open("logs/exit_check.log", "a", encoding="utf-8") as ef:
+                ef.write(json.dumps(record, separators=(",", ":")) + "\n")
         except (OSError, IOError, ValueError) as e:
             logger.error("Failed to update trade %s: %s", trade_id, e)
 

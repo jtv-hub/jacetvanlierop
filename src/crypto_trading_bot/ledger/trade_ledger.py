@@ -112,6 +112,73 @@ def _apply_exit_slippage(pair: str, exit_price: float) -> float:
     return float(exit_price)
 
 
+def _infer_side(strategy: str | None, roi: float | None) -> str:
+    """Infer trade side ('long' or 'short') from strategy hints and ROI.
+
+    - If strategy mentions 'RSI' or 'Threshold' and ROI >= 0 -> long
+    - If ROI < 0 -> short
+    - Fallback default -> long
+    """
+    s = strategy.lower() if isinstance(strategy, str) else ""
+    try:
+        r = float(roi) if roi is not None else None
+    except (TypeError, ValueError):
+        r = None
+    if ("rsi" in s or "threshold" in s) and (r is None or r >= 0):
+        return "long"
+    if r is not None and r < 0:
+        return "short"
+    return "long"
+
+
+def _normalize_side(side: str | None, strategy: str | None = None, roi: float | None = None) -> str:
+    """Normalize side to 'long'/'short', mapping common aliases.
+
+    Accepts 'buy' -> 'long', 'sell' -> 'short'; falls back to inference.
+    """
+    if isinstance(side, str):
+        s = side.strip().lower()
+        if s in {"long", "short"}:
+            return s
+        if s in {"buy", "sell"}:
+            return "long" if s == "buy" else "short"
+    return _infer_side(strategy, roi)
+
+
+def validate_trade_entry(trade: dict) -> dict:
+    """Best-effort validation and normalization for a trade entry.
+
+    - Ensures 'strategy' is non-empty string; defaults to 'Unknown'
+    - Normalizes 'side' to 'long'/'short' (infers if missing)
+    - If 'exit_price' present, ensures 'roi' is numeric; if not, warns and sets 0.0
+    - Logs warnings to system_logger; returns mutated trade dict.
+    """
+    # Strategy
+    if not isinstance(trade.get("strategy"), str) or not trade.get("strategy").strip():
+        system_logger.warning("Missing/invalid strategy; defaulting to 'Unknown'")
+        trade["strategy"] = "Unknown"
+
+    # Side normalization
+    norm_side = _normalize_side(
+        trade.get("side"),
+        strategy=trade.get("strategy"),
+        roi=trade.get("roi"),
+    )
+    if trade.get("side") != norm_side:
+        system_logger.warning("Normalized side %s -> %s", trade.get("side"), norm_side)
+        trade["side"] = norm_side
+
+    # Exit/ROI consistency (do not raise)
+    if trade.get("exit_price") is not None:
+        try:
+            _ = float(trade.get("roi"))  # ensure numeric
+        except (TypeError, ValueError):
+            system_logger.warning("Exit present but ROI invalid; setting ROI=0.0")
+            trade["roi"] = 0.0
+
+    return trade
+
+
 class TradeLedger:
     """
     A class to manage trade lifecycle logging, updating, and validation.
@@ -154,14 +221,17 @@ class TradeLedger:
 
         trade_id = kwargs.get("trade_id") or str(uuid.uuid4())
         entry_price = kwargs.get("entry_price", 18000 + 250 * (0.5 - random.random()))
-        # Prefer explicit side; fallback to legacy inference to preserve behavior
-        side = kwargs.get("side")
-        if side not in ("buy", "sell"):
-            side = "buy" if strategy_name.lower().find("sell") == -1 else "sell"
+        # Normalize side to long/short; map to order side for slippage
+        side_norm = _normalize_side(
+            kwargs.get("side"),
+            strategy=strategy_name,
+            roi=kwargs.get("roi"),
+        )
+        order_side = "buy" if side_norm == "long" else "sell"
         entry_price_adj, slippage_amount_entry, slip_rate = _apply_slippage(
             trading_pair,
             float(entry_price),
-            side,
+            order_side,
         )
 
         capital_buffer = kwargs.get("capital_buffer", 0.25)
@@ -181,7 +251,7 @@ class TradeLedger:
             "cost_basis": round(entry_price_adj * trade_size, 4),
             "entry_price": entry_price_adj,
             # Persist side so downstream logic can apply correct exit behavior
-            "side": side,
+            "side": side_norm,
             "exit_price": None,
             "realized_gain": None,
             "holding_period_days": None,
@@ -199,6 +269,9 @@ class TradeLedger:
                 system_logger.debug("Logging trade: %s", json.dumps(trade, indent=2))
             except (TypeError, OSError):
                 pass
+
+        # Best-effort validate/normalize fields to prevent schema issues
+        trade = validate_trade_entry(trade)
 
         # Validate schema; on failure, log anomaly for audit and re-raise.
         try:
@@ -231,7 +304,37 @@ class TradeLedger:
         Record a newly opened trade into the positions file (positions.jsonl).
         Uses the trade ID as key reference.
         """
+        # Validate essential fields with safe fallbacks
+        trade = dict(trade)
         trade["trade_id"] = trade_id
+        # Enforce basic required fields
+        if not isinstance(trade.get("pair"), str) or not trade.get("pair").strip():
+            system_logger.warning("Position missing pair; defaulting to BTC/USD")
+            trade["pair"] = "BTC/USD"
+        if not isinstance(trade.get("strategy"), str) or not trade.get("strategy").strip():
+            system_logger.warning("Position missing strategy; defaulting to Unknown")
+            trade["strategy"] = "Unknown"
+        # Ensure entry_price
+        try:
+            ep = float(trade.get("entry_price"))
+            if ep <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            # Fallback: reuse cost_basis/size or set to plausible default
+            cb = trade.get("cost_basis")
+            sz = trade.get("size") or 0.001
+            try:
+                trade["entry_price"] = round(float(cb) / float(sz), 4) if cb else 18000.0
+            except (TypeError, ZeroDivisionError):
+                trade["entry_price"] = 18000.0
+            system_logger.warning("Position missing/invalid entry_price; default set")
+        # Normalize side
+        trade["side"] = _normalize_side(
+            trade.get("side"),
+            strategy=trade.get("strategy"),
+            roi=trade.get("roi"),
+        )
+
         with open(POSITIONS_PATH, "a", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             json.dump(trade, f)
@@ -241,7 +344,7 @@ class TradeLedger:
             fcntl.flock(f, fcntl.LOCK_UN)
         system_logger.debug("Position %s written to positions.jsonl", trade_id)
 
-    def update_trade(self, trade_id, exit_price, reason):
+    def update_trade(self, trade_id, exit_price, reason, exit_reason=None):
         """
         Update a trade with exit information such as exit_price, reason, and ROI.
         If trade is missing, attempts to reload from file and/or reconstruct from positions.
@@ -249,10 +352,11 @@ class TradeLedger:
         """
         # If exit_price is missing/invalid, log anomaly and return without raising.
         if exit_price is None or not isinstance(exit_price, (int, float)) or exit_price <= 0:
-            try:
-                t_obj = self.trade_index.get(trade_id) if hasattr(self, "trade_index") else None
-            except Exception:
-                t_obj = None
+            # Retrieve trade object safely without broad exception catching
+            t_obj = None
+            trade_idx = getattr(self, "trade_index", None)
+            if isinstance(trade_idx, dict):
+                t_obj = trade_idx.get(trade_id)
             try:
                 anomalies_logger.info(
                     json.dumps(
@@ -365,8 +469,14 @@ class TradeLedger:
                         )
                         return
 
-                    # Use opposite side for exit to account for shorts
-                    exit_side = "buy" if t_obj.get("side") == "sell" else "sell"
+                    # Use opposite order side for exit to account for shorts/longs
+                    cur_side = t_obj.get("side")
+                    norm_side = _normalize_side(
+                        cur_side,
+                        strategy=t_obj.get("strategy"),
+                        roi=t_obj.get("roi"),
+                    )
+                    exit_side = "buy" if norm_side == "short" else "sell"
                     exit_adj, exit_slippage_amount, slip_rate = _apply_slippage(
                         t_obj.get("pair"), float(exit_price), exit_side
                     )
@@ -385,6 +495,9 @@ class TradeLedger:
                             "exit_slippage_amount": exit_slippage_amount,
                         }
                     )
+                    # Include optional exit_reason if provided by the caller
+                    if exit_reason is not None:
+                        t_obj["exit_reason"] = exit_reason
                     # Revalidate updated trade; log anomaly but do not abort update flow
                     try:
                         validate_trade_schema(t_obj)
@@ -487,7 +600,10 @@ class TradeLedger:
                         None,
                     )
                     if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
-                        system_logger.info("Idempotent update — trade %s already closed", trade_id)
+                        system_logger.info(
+                            "Idempotent update — trade %s already closed",
+                            trade_id,
+                        )
                     else:
                         system_logger.info(
                             "No update applied — trade_id %s not in open state",

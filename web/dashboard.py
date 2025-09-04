@@ -7,12 +7,28 @@ Run locally:
     PYTHONPATH=. FLASK_APP=web/dashboard.py flask run --host=0.0.0.0 --port=5000
 or:
     python web/dashboard.py
+
+Remote access (developer tips):
+
+- A) Tailscale (preferred)
+  1. Install Tailscale on your machine and phone.
+  2. Log in on both devices so they join the same tailnet.
+  3. Run this dashboard with host=0.0.0.0 (already configured) and note your
+     device's Tailscale IP (e.g., 100.x.x.x). On your phone, open:
+       http://100.x.x.x:5000
+
+- B) Ngrok (fallback)
+  1. Install ngrok and sign in (ngrok config add-authtoken <token>).
+  2. Start the dashboard locally (port 5000).
+  3. In a separate terminal run: ngrok http 5000
+  4. Use the forwarded HTTPS URL shown by ngrok to access the dashboard remotely.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timezone
 
 import numpy as np
@@ -21,6 +37,8 @@ from flask import Flask, jsonify, render_template_string
 LOG_DIR = "logs"
 TRADES_LOG = os.path.join(LOG_DIR, "trades.log")
 POSITIONS_LOG = os.path.join(LOG_DIR, "positions.jsonl")
+LEARN_FEEDBACK_LOG = os.path.join(LOG_DIR, "learning_feedback.jsonl")
+SHADOW_RESULTS_LOG = os.path.join(LOG_DIR, "shadow_test_results.jsonl")
 
 app = Flask(__name__)
 
@@ -125,19 +143,18 @@ def compute_performance_summary(trades: list[dict]) -> dict:
     reason_counts: dict[str, int] = {}
     for t in closed:
         r = str(t.get("reason") or "unknown").upper()
-        key = (
-            "STOP_LOSS"
-            if "STOP" in r and "TRAIL" not in r
-            else (
-                "TRAILING_STOP"
-                if "TRAIL" in r
-                else (
-                    "TAKE_PROFIT"
-                    if "TAKE" in r or "PROFIT" in r
-                    else "RSI_EXIT" if "RSI" in r else "MAX_HOLD" if "MAX_HOLD" in r or "HOLD" in r else r
-                )
-            )
-        )
+        if "STOP" in r and "TRAIL" not in r:
+            key = "STOP_LOSS"
+        elif "TRAIL" in r:
+            key = "TRAILING_STOP"
+        elif "TAKE" in r or "PROFIT" in r:
+            key = "TAKE_PROFIT"
+        elif "RSI" in r:
+            key = "RSI_EXIT"
+        elif "MAX_HOLD" in r or "HOLD" in r:
+            key = "MAX_HOLD"
+        else:
+            key = r
         reason_counts[key] = reason_counts.get(key, 0) + 1
 
     return {
@@ -192,6 +209,219 @@ def build_metrics() -> dict:
         "positions": positions,
         "latest_trades": latest_trades(20),
         "equity_curve": equity,
+    }
+
+
+# ---- Additional summaries reused by new endpoints ----
+
+
+def _count_exit_reasons(path: str) -> dict:
+    counts: dict[str, int] = {}
+    for row in load_json_lines(path):
+        if row.get("status") != "closed":
+            continue
+        reason = row.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            key = reason.strip().upper()
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _is_numeric(val) -> bool:
+    try:
+        float(val)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_closed_trades(path: str) -> dict:
+    total = 0
+    valid = 0
+    invalid = 0
+    missing: dict[str, int] = {}
+    for row in load_json_lines(path):
+        if row.get("status") != "closed":
+            continue
+        total += 1
+        errors = []
+        if not _is_numeric(row.get("capital_buffer")):
+            errors.append("capital_buffer")
+        side = row.get("side")
+        if not (isinstance(side, str) and side.lower() in {"long", "short"}):
+            errors.append("side")
+        if not _is_numeric(row.get("roi")):
+            errors.append("roi")
+        reason = row.get("reason")
+        if not (isinstance(reason, str) and reason.strip()):
+            errors.append("reason")
+        if errors:
+            invalid += 1
+            for k in errors:
+                missing[k] = missing.get(k, 0) + 1
+        else:
+            valid += 1
+    return {
+        "total_closed_trades": total,
+        "valid": valid,
+        "invalid": invalid,
+        "missing_fields": missing,
+    }
+
+
+def _live_stats_summary(path: str) -> dict:
+    trades = [r for r in load_json_lines(path) if r.get("status") == "closed" and _is_numeric(r.get("roi"))]
+    total = len(trades)
+    wins = sum(1 for t in trades if float(t.get("roi", 0.0)) > 0)
+    losses = total - wins
+    win_rate = (wins / total) if total else 0.0
+    cum_roi = sum(float(t.get("roi", 0.0)) for t in trades)
+    avg_roi = (cum_roi / total) if total else 0.0
+    # leaderboard by strategy (wins, roi)
+    wins_by: dict[str, int] = {}
+    roi_by: dict[str, float] = {}
+    for t in trades:
+        s = str(t.get("strategy") or "Unknown")
+        if float(t.get("roi", 0.0)) > 0:
+            wins_by[s] = wins_by.get(s, 0) + 1
+        roi_by[s] = roi_by.get(s, 0.0) + float(t.get("roi", 0.0))
+    strategies = set(wins_by) | set(roi_by)
+    combo = [{"strategy": s, "wins": wins_by.get(s, 0), "roi": roi_by.get(s, 0.0)} for s in strategies]
+    top = sorted(combo, key=lambda x: (x["wins"], x["roi"]), reverse=True)[:5]
+    # biggest winner/loser
+    biggest_winner = None
+    biggest_loser = None
+    for trade in trades:
+        roi = trade.get("roi")
+        if roi is None:
+            continue
+        if biggest_winner is None or roi > biggest_winner.get("roi", -float("inf")):
+            biggest_winner = trade
+        if biggest_loser is None or roi < biggest_loser.get("roi", float("inf")):
+            biggest_loser = trade
+
+    def _brief(t: dict) -> dict:
+        return (
+            {
+                "pair": t.get("pair"),
+                "roi": float(t.get("roi", 0.0)) if _is_numeric(t.get("roi")) else None,
+                "exit_reason": t.get("reason"),
+                "strategy": t.get("strategy"),
+                "timestamp": t.get("timestamp"),
+            }
+            if t
+            else None
+        )
+
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 4),
+        "cumulative_roi": round(cum_roi, 6),
+        "average_roi": round(avg_roi, 6),
+        "top_strategies": top,
+        "biggest_winner": _brief(biggest_winner),
+        "biggest_loser": _brief(biggest_loser),
+    }
+
+
+def _first(obj: dict, *keys: str):
+    for k in keys:
+        if k in obj:
+            return obj.get(k)
+    return None
+
+
+def _learning_feedback_summary(path: str) -> dict:
+    entries = []
+    for row in load_json_lines(path):
+        strat = _first(row, "strategy", "strategy_name") or "Unknown"
+        status = _first(row, "status", "result", "outcome")
+        confidence = _first(row, "confidence", "confidence_score")
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            pass
+        parameter = _first(row, "parameter")
+        value = _first(row, "suggested_value", "value")
+        if not parameter and isinstance(row.get("parameters"), dict):
+            try:
+                parameter = next(iter(row["parameters"].keys()))
+                if value is None:
+                    value = row["parameters"].get(parameter)
+            except StopIteration:
+                pass
+        entries.append(
+            {
+                "strategy": strat,
+                "status": status,
+                "confidence": confidence,
+                "parameter": parameter,
+                "value": value,
+            }
+        )
+    total = len(entries)
+    strat_counts = Counter(e["strategy"] for e in entries)
+    top_strategy = strat_counts.most_common(1)[0][0] if strat_counts else None
+
+    def _cat(s):
+        s = (s or "").lower()
+        if s in {"approved", "accepted", "applied"}:
+            return "passed"
+        if s in {"rejected", "declined", "denied"}:
+            return "failed"
+        return "other"
+
+    passed = sum(1 for e in entries if _cat(e["status"]) == "passed")
+    failed = sum(1 for e in entries if _cat(e["status"]) == "failed")
+    recent = entries[-3:]
+    return {
+        "total_suggestions": total,
+        "unique_strategies": len(strat_counts),
+        "top_strategy": top_strategy,
+        "passed": passed,
+        "failed": failed,
+        "recent": recent,
+    }
+
+
+def _shadow_results_summary(path: str) -> dict:
+    def to_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    entries = []
+    for row in load_json_lines(path):
+        strategy = _first(row, "strategy", "strategy_name") or "Unknown"
+        status = _first(row, "result", "status", "outcome")
+        success = to_float(_first(row, "win_rate", "success_rate"))
+        trades = _first(row, "trades_tested", "sample_size")
+        try:
+            trades = int(trades) if trades is not None else None
+        except (TypeError, ValueError):
+            trades = None
+        entries.append(
+            {
+                "strategy": strategy,
+                "status": status,
+                "success_rate": success,
+                "trades_tested": trades,
+            }
+        )
+    total = len(entries)
+    unique = len(Counter(e["strategy"] for e in entries))
+    passed = sum(1 for e in entries if isinstance(e.get("success_rate"), float) and e["success_rate"] >= 0.6)
+    failed = total - passed
+    recent = entries[-3:]
+    return {
+        "total": total,
+        "unique_strategies": unique,
+        "passed": passed,
+        "failed": failed,
+        "recent": recent,
     }
 
 
@@ -375,11 +605,200 @@ BASE_HTML = """
           </div>
         </div>
       </div>
+      <!-- New dynamic summaries row -->
+      <div class="row mt-3">
+        <div class="col-12 col-lg-6">
+          <div class="card mb-3">
+            <div class="card-header">📈 Live Stats</div>
+            <div class="card-body" id="liveStatsBody">Loading…</div>
+          </div>
+          <div class="card mb-3">
+            <div class="card-header">🩺 Trade Health</div>
+            <div class="card-body" id="tradeHealthBody">Loading…</div>
+          </div>
+        </div>
+        <div class="col-12 col-lg-6">
+          <div class="card mb-3">
+            <div class="card-header">📤 Exit Reasons</div>
+            <div class="card-body">
+              <ul class="list-group list-group-flush" id="exitSummaryList">
+                <li class="list-group-item">Loading…</li>
+              </ul>
+            </div>
+          </div>
+          <div class="card mb-3">
+            <div class="card-header">🧠 Learning Feedback</div>
+            <div class="card-body" id="learningFeedbackBody">Loading…</div>
+          </div>
+          <div class="card mb-3">
+            <div class="card-header">🧪 Shadow Test Results</div>
+            <div class="card-body" id="shadowResultsBody">Loading…</div>
+          </div>
+        </div>
+      </div>
+      <div class="row mt-4">
+        <div class="col-md-6">
+          <div class="card border-success">
+            <div class="card-header bg-success text-white">📈 Biggest Winner</div>
+            <div class="card-body" id="biggestWinnerBody">Loading...</div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card border-danger">
+            <div class="card-header bg-danger text-white">📉 Biggest Loser</div>
+            <div class="card-body" id="biggestLoserBody">Loading...</div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </body>
 <script>
-  // Render equity curve when data is available
+  // Utility: fetch JSON with graceful failure
+  async function fetchJson(url){
+    try{
+      const r = await fetch(url, {cache:'no-store'});
+      if(!r.ok) return null;
+      return await r.json();
+    }catch(_e){ return null; }
+  }
+  function pct(x, digits=2){
+    if(typeof x !== 'number') return 'n/a';
+    return (x*100).toFixed(digits) + '%';
+  }
+  async function refreshLiveStats(){
+    const el = document.getElementById('liveStatsBody');
+    const data = await fetchJson('/live-stats');
+    if(!data){ el.textContent = 'Data unavailable'; return; }
+    el.innerHTML = `
+      <ul class="list-group list-group-flush">
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Total trades</span>
+          <strong>${data.total_trades}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Wins</span>
+          <strong>${data.wins}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Losses</span>
+          <strong>${data.losses}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Win rate</span>
+          <strong>${pct(data.win_rate,1)}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Cumulative ROI</span>
+          <strong>${pct(data.cumulative_roi,2)}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Average ROI</span>
+          <strong>${pct(data.average_roi,2)}</strong>
+        </li>
+      </ul>`;
+    const formatTrade = (t) => {
+      if (!t) return "No data";
+      return `
+        <strong>Pair:</strong> ${t.pair || "N/A"}<br>
+        <strong>ROI:</strong> ${(t.roi || 0).toFixed(2)}%<br>
+        <strong>Exit:</strong> ${t.exit_reason || "N/A"}<br>
+        <strong>Strategy:</strong> ${t.strategy || "N/A"}
+      `;
+    };
+    document.getElementById("biggestWinnerBody").innerHTML = formatTrade(data.biggest_winner);
+    document.getElementById("biggestLoserBody").innerHTML = formatTrade(data.biggest_loser);
+  }
+  async function refreshExitSummary(){
+    const ul = document.getElementById('exitSummaryList');
+    const data = await fetchJson('/exit-summary');
+    if(!data || !data.counts){ ul.innerHTML = '<li class="list-group-item">No data</li>'; return; }
+    const items = Object.entries(data.counts)
+      .sort((a,b)=>b[1]-a[1])
+      .map(([k,v])=>
+        `
+        <li class="list-group-item d-flex justify-content-between">
+          <span>${k}</span>
+          <span class="badge text-bg-secondary">${v}</span>
+        </li>`
+      ).join('');
+    ul.innerHTML = items || '<li class="list-group-item">No data</li>';
+  }
+  async function refreshTradeHealth(){
+    const el = document.getElementById('tradeHealthBody');
+    const d = await fetchJson('/trade-health');
+    if(!d){ el.textContent='Data unavailable'; return; }
+    const missing = d.missing_fields || {};
+    const top = Object.entries(missing).sort((a,b)=>b[1]-a[1]).slice(0,3)
+      .map(([k,v])=>`${k}: ${v}`).join(', ');
+    el.innerHTML = `
+      <ul class="list-group list-group-flush">
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Total closed</span>
+          <strong>${d.total_closed_trades}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Valid</span>
+          <strong>${d.valid}</strong>
+        </li>
+        <li class="list-group-item d-flex justify-content-between">
+          <span>Invalid</span>
+          <strong>${d.invalid}</strong>
+        </li>
+        <li class="list-group-item">
+          <span>Top missing fields</span><br>
+          <small>${top || '—'}</small>
+        </li>
+      </ul>`;
+  }
+  function fmtRecentItems(items, mapper){
+    if(!items || !items.length) return '<em>No recent items</em>';
+    return '<ul class="list-group list-group-flush">' + items.map(mapper).join('') + '</ul>';
+  }
+  async function refreshLearningFeedback(){
+    const el = document.getElementById('learningFeedbackBody');
+    const d = await fetchJson('/learning-feedback');
+    if(!d){ el.textContent='Data unavailable'; return; }
+    const recent = fmtRecentItems(d.recent, r => {
+      const conf = (typeof r.confidence === 'number') ? ` (conf: ${r.confidence.toFixed(2)})` : '';
+      const param = r.parameter || '(n/a)';
+      const val = (r.value !== undefined) ? r.value : 'n/a';
+      const stat = r.status || '';
+      return `<li class="list-group-item">${r.strategy}: ${param} → ${val}${conf} — ${stat}</li>`;
+    });
+    el.innerHTML = `
+      <div class="mb-2">
+        Total: <strong>${d.total_suggestions}</strong>
+        | Top: <strong>${d.top_strategy || 'n/a'}</strong>
+      </div>
+      <div class="mb-2">Passed: <strong>${d.passed}</strong> | Failed: <strong>${d.failed}</strong></div>
+      ${recent}`;
+  }
+  async function refreshShadowResults(){
+    const el = document.getElementById('shadowResultsBody');
+    const d = await fetchJson('/shadow-results');
+    if(!d){ el.textContent='Data unavailable'; return; }
+    const recent = fmtRecentItems(d.recent, r => {
+      const sr = (typeof r.success_rate === 'number') ? r.success_rate.toFixed(2) : 'n/a';
+      const n = (typeof r.trades_tested === 'number') ? r.trades_tested : 'n/a';
+      const stat = r.status || '';
+      return `<li class="list-group-item">${r.strategy}: success=${sr}, trades=${n} — ${stat}</li>`;
+    });
+    el.innerHTML = `
+      <div class="mb-2">Total: <strong>${d.total}</strong> | Unique: <strong>${d.unique_strategies}</strong></div>
+      <div class="mb-2">Passed: <strong>${d.passed}</strong> | Failed: <strong>${d.failed}</strong></div>
+      ${recent}`;
+  }
+  async function refreshAll(){
+    refreshLiveStats();
+    refreshExitSummary();
+    refreshTradeHealth();
+    refreshLearningFeedback();
+    refreshShadowResults();
+  }
+  refreshAll();
+  setInterval(refreshAll, 60000);
+// Render equity curve when data is available
   (function(){
     const ec = {{ equity_curve|tojson }};
     const el = document.getElementById('equityChart');
@@ -411,10 +830,21 @@ BASE_HTML = """
         plugins: { legend: { display: false } },
         scales: {
           x: {
-            ticks: { maxTicksLimit: 5, color: '#6c757d' },
+            ticks: {
+              autoSkip: true,
+              maxTicksLimit: 10,
+              callback: function(value, index, values) {
+                const label = this.getLabelForValue(value);
+                return label.length > 10 ? label.substring(5) : label;
+              },
+              maxRotation: 45,
+              minRotation: 20,
+              color: '#6c757d'
+            },
             grid: { display: false }
           },
           y: {
+            beginAtZero: true,
             ticks: { color: '#6c757d' },
             grid: { color: 'rgba(0,0,0,0.05)' }
           }
@@ -446,6 +876,60 @@ def metrics():
     return jsonify(build_metrics())
 
 
+@app.route("/exit-summary")
+def exit_summary():
+    """Return a summary of exit reasons from the trades log."""
+    return jsonify({"counts": _count_exit_reasons(TRADES_LOG)})
+
+
+@app.route("/trade-health")
+def trade_health():
+    """Return a health summary of closed trades."""
+    return jsonify(_validate_closed_trades(TRADES_LOG))
+
+
+@app.route("/live-stats")
+def live_stats():
+    """Return live trading statistics from the trades log."""
+    return jsonify(_live_stats_summary(TRADES_LOG))
+
+
+@app.route("/learning-feedback")
+def learning_feedback():
+    """Return a summary of learning feedback suggestions."""
+    if not os.path.exists(LEARN_FEEDBACK_LOG):
+        return jsonify(
+            {
+                "total_suggestions": 0,
+                "unique_strategies": 0,
+                "passed": 0,
+                "failed": 0,
+                "recent": [],
+            }
+        )
+    return jsonify(_learning_feedback_summary(LEARN_FEEDBACK_LOG))
+
+
+@app.route("/shadow-results")
+def shadow_results():
+    """Return a summary of shadow test results."""
+    if not os.path.exists(SHADOW_RESULTS_LOG):
+        return jsonify(
+            {
+                "total": 0,
+                "unique_strategies": 0,
+                "passed": 0,
+                "failed": 0,
+                "recent": [],
+            }
+        )
+    return jsonify(_shadow_results_summary(SHADOW_RESULTS_LOG))
+
+
 if __name__ == "__main__":
     # Run directly for quick local use
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+    )

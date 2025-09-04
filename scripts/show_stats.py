@@ -126,19 +126,18 @@ def compute_metrics(closed: List[Dict[str, Any]], positions_count: int) -> Dict[
     reasons = []
     for t in closed_sorted:
         r = str(t.get("reason") or "unknown").upper()
-        key = (
-            "STOP_LOSS"
-            if "STOP" in r and "TRAIL" not in r
-            else (
-                "TRAILING_STOP"
-                if "TRAIL" in r
-                else (
-                    "TAKE_PROFIT"
-                    if "TAKE" in r or "PROFIT" in r
-                    else "RSI_EXIT" if "RSI" in r else "MAX_HOLD" if "MAX_HOLD" in r or "HOLD" in r else r
-                )
-            )
-        )
+        if "STOP" in r and "TRAIL" not in r:
+            key = "STOP_LOSS"
+        elif "TRAIL" in r:
+            key = "TRAILING_STOP"
+        elif "TAKE" in r or "PROFIT" in r:
+            key = "TAKE_PROFIT"
+        elif "RSI" in r:
+            key = "RSI_EXIT"
+        elif "MAX_HOLD" in r or "HOLD" in r:
+            key = "MAX_HOLD"
+        else:
+            key = r
         reasons.append(key)
     reason_counts = dict(Counter(reasons).most_common())
 

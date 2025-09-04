@@ -55,6 +55,24 @@ def is_valid_strategy(value):
     return isinstance(value, str) and value.strip() != ""
 
 
+def is_known_strategy(value):
+    """Heuristic for unknown strategy labels.
+
+    Treat empty, 'unknown', 'n/a' as unknown; otherwise assume valid.
+    """
+    if not isinstance(value, str):
+        return False
+    label = value.strip().lower()
+    return label not in {"", "unknown", "n/a", "na"}
+
+
+def is_valid_side(value):
+    """Check if side is 'buy' or 'sell' (case-insensitive)."""
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in {"buy", "sell"}
+
+
 def is_valid_size(value):
     """Check if a trade size is a positive number."""
     try:
@@ -71,8 +89,21 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
     """
     trades = load_trades(trade_log_path)
     bad_trades = []
-
     for i, trade in enumerate(trades):
+        # Side validation
+        if not is_valid_side(trade.get("side")):
+            anomaly = {
+                "index": i,
+                "type": "invalid_side",
+                "value": trade.get("side"),
+                "pair": trade.get("pair"),
+                "strategy": trade.get("strategy"),
+                "timestamp": trade.get("timestamp"),
+                "trade_id": trade.get("trade_id"),
+            }
+            log_anomaly(anomaly, source="audit")
+            bad_trades.append(anomaly)
+
         if not is_valid_confidence(trade.get("confidence")):
             anomaly = {
                 "index": i,
@@ -90,6 +121,20 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
             anomaly = {
                 "index": i,
                 "type": "invalid_strategy",
+                "value": trade.get("strategy"),
+                "pair": trade.get("pair"),
+                "confidence": trade.get("confidence"),
+                "timestamp": trade.get("timestamp"),
+                "trade_id": trade.get("trade_id"),
+            }
+            log_anomaly(anomaly, source="audit")
+            bad_trades.append(anomaly)
+
+        # Flag unknown labels as well
+        if not is_known_strategy(trade.get("strategy")):
+            anomaly = {
+                "index": i,
+                "type": "unknown_strategy",
                 "value": trade.get("strategy"),
                 "pair": trade.get("pair"),
                 "confidence": trade.get("confidence"),
@@ -217,6 +262,19 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
         log_anomaly({"type": "audit_validator_error", "error": str(e)}, source="audit")
 
     return bad_trades
+
+
+def summarize_anomalies(results, total_trades: int | None = None) -> dict:
+    """Summarize anomalies by category and include total trades checked."""
+    summary = {}
+    for r in results:
+        k = r.get("type", "unknown")
+        summary[k] = summary.get(k, 0) + 1
+    return {
+        "total_trades": int(total_trades or 0),
+        "anomalies_total": sum(summary.values()),
+        "by_category": summary,
+    }
 
 
 def print_audit_report(results):

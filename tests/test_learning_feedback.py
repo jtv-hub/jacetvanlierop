@@ -69,9 +69,10 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
         # Fallback: run cycle and generate suggestions using optimization module
         metrics = lm.run_learning_cycle()
         try:
+            # pylint: disable-next=import-outside-toplevel
             from src.crypto_trading_bot.learning.optimization import (
                 generate_suggestions,
-            )  # pylint: disable=import-outside-toplevel
+            )
         except ImportError:
 
             def generate_suggestions(_report):

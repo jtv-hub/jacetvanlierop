@@ -546,7 +546,12 @@ def evaluate_signals_and_trade(
         if reason == "TAKE_PROFIT" and trade_position:
             current_prices[trade_position["pair"]] = exit_price  # Apply immediately
         print(f"🚪 Closing trade {trade_id} at {exit_price:.4f}: {reason}")
-        ledger.update_trade(trade_id=trade_id, exit_price=exit_price, reason=reason)
+        ledger.update_trade(
+            trade_id=trade_id,
+            exit_price=exit_price,
+            reason=reason,
+            exit_reason=reason,
+        )
         with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
             f.flush()
             os.fsync(f.fileno())  # Sync after update
