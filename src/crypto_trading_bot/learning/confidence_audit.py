@@ -6,37 +6,29 @@ Audits the trade log to identify malformed or out-of-range confidence values.
 
 import fcntl
 import json
-import logging
 import os
 from datetime import datetime, timezone
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
 
-ANOMALY_LOG_PATH = "logs/anomalies.log"
-
-logger = logging.getLogger("confidence_audit")
-logger.setLevel(logging.INFO)
-if not logger.hasHandlers():
-    rotating_handler = get_rotating_handler("anomalies.log")
-    logger.addHandler(rotating_handler)
+anomalies_logger = get_anomalies_logger()
 
 
 def log_anomaly(anomaly, source="audit"):
-    """Log a malformed trade anomaly with timestamp and source."""
+    """Log a malformed trade anomaly with timestamp and source.
+
+    Uses a rotating file handler bound to this module's logger to ensure
+    anomalies.log rotates at 10MB with up to 3 backups. Preserves JSONL format.
+    """
     os.makedirs("logs", exist_ok=True)
     anomaly_record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": source,
         **anomaly,
     }
-    with open(ANOMALY_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(anomaly_record) + "\n")
-        try:
-            f.flush()
-            os.fsync(f.fileno())
-        except (OSError, IOError):
-            pass
+    # Compact JSONL format
+    anomalies_logger.info(json.dumps(anomaly_record, separators=(",", ":")))
 
 
 def load_trades(path):
@@ -63,6 +55,24 @@ def is_valid_strategy(value):
     return isinstance(value, str) and value.strip() != ""
 
 
+def is_known_strategy(value):
+    """Heuristic for unknown strategy labels.
+
+    Treat empty, 'unknown', 'n/a' as unknown; otherwise assume valid.
+    """
+    if not isinstance(value, str):
+        return False
+    label = value.strip().lower()
+    return label not in {"", "unknown", "n/a", "na"}
+
+
+def is_valid_side(value):
+    """Check if side is 'buy' or 'sell' (case-insensitive)."""
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in {"buy", "sell"}
+
+
 def is_valid_size(value):
     """Check if a trade size is a positive number."""
     try:
@@ -79,8 +89,21 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
     """
     trades = load_trades(trade_log_path)
     bad_trades = []
-
     for i, trade in enumerate(trades):
+        # Side validation
+        if not is_valid_side(trade.get("side")):
+            anomaly = {
+                "index": i,
+                "type": "invalid_side",
+                "value": trade.get("side"),
+                "pair": trade.get("pair"),
+                "strategy": trade.get("strategy"),
+                "timestamp": trade.get("timestamp"),
+                "trade_id": trade.get("trade_id"),
+            }
+            log_anomaly(anomaly, source="audit")
+            bad_trades.append(anomaly)
+
         if not is_valid_confidence(trade.get("confidence")):
             anomaly = {
                 "index": i,
@@ -98,6 +121,20 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
             anomaly = {
                 "index": i,
                 "type": "invalid_strategy",
+                "value": trade.get("strategy"),
+                "pair": trade.get("pair"),
+                "confidence": trade.get("confidence"),
+                "timestamp": trade.get("timestamp"),
+                "trade_id": trade.get("trade_id"),
+            }
+            log_anomaly(anomaly, source="audit")
+            bad_trades.append(anomaly)
+
+        # Flag unknown labels as well
+        if not is_known_strategy(trade.get("strategy")):
+            anomaly = {
+                "index": i,
+                "type": "unknown_strategy",
                 "value": trade.get("strategy"),
                 "pair": trade.get("pair"),
                 "confidence": trade.get("confidence"),
@@ -227,6 +264,19 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
     return bad_trades
 
 
+def summarize_anomalies(results, total_trades: int | None = None) -> dict:
+    """Summarize anomalies by category and include total trades checked."""
+    summary = {}
+    for r in results:
+        k = r.get("type", "unknown")
+        summary[k] = summary.get(k, 0) + 1
+    return {
+        "total_trades": int(total_trades or 0),
+        "anomalies_total": sum(summary.values()),
+        "by_category": summary,
+    }
+
+
 def print_audit_report(results):
     """Print a formatted report of all trades with validation issues."""
     if not results:
@@ -242,7 +292,10 @@ def print_audit_report(results):
         )
 
 
-def cleanup_closed_positions(trades_file="logs/trades.log", positions_file="logs/positions.jsonl") -> int:
+def cleanup_closed_positions(
+    trades_file: str = "logs/trades.log",
+    positions_file: str = "logs/positions.jsonl",
+) -> int:
     """Remove any positions whose matching trade is closed from positions.jsonl.
 
     Returns the number of positions removed.
@@ -283,7 +336,10 @@ def cleanup_closed_positions(trades_file="logs/trades.log", positions_file="logs
         return 0
 
 
-def run_and_cleanup(trade_log_path="logs/trades.log", positions_file="logs/positions.jsonl") -> dict:
+def run_and_cleanup(
+    trade_log_path: str = "logs/trades.log",
+    positions_file: str = "logs/positions.jsonl",
+) -> dict:
     """Run audit, perform cleanup of closed positions, rerun audit, and return summary.
 
     Returns a dict: {"initial_errors": int, "removed": int, "final_errors": int, "errors": [..]}

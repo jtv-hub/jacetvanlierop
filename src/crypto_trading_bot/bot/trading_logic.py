@@ -21,6 +21,17 @@ except ImportError:  # pragma: no cover - optional dependency
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.price_feed import get_current_price
+from crypto_trading_bot.utils.price_history import (
+    append_live_price,
+    get_history_prices,
+)
+
+# Optional RSI calculator (import may vary by environment)
+try:
+    from crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    calculate_rsi = None  # type: ignore[assignment]
 
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
@@ -35,14 +46,13 @@ MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
 ACCOUNT_SIZE = 100000
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
-mock_price_data = {
-    # Random up/down trend for BTC
-    "BTC": [19155.3 + (random.choice([-1, 1]) * i * 10) for i in range(100)],
-    "ETH": [2000 + sum(random.choice([-1, 1]) * random.uniform(0.5, 3.0) for _ in range(i + 1)) for i in range(100)],
-    "XRP": [0.5 + sum(random.choice([-1, 1]) * random.uniform(0.001, 0.01) for _ in range(i + 1)) for i in range(100)],
-    "LINK": [7 + sum(random.choice([-1, 1]) * random.uniform(0.01, 0.1) for _ in range(i + 1)) for i in range(100)],
-    "SOL": [20 + sum(random.choice([-1, 1]) * random.uniform(0.05, 0.4) for _ in range(i + 1)) for i in range(100)],
-}
+# Real-time price feed imported above per lint ordering
+
+
+# get_current_price now lives in utils.price_feed; removed local duplicate.
+
+
+# Removed hardcoded ASSETS list. Pairs are now centralized in CONFIG["tradable_pairs"].
 
 mock_volume_data = {
     "BTC": [1500 for _ in range(100)],
@@ -126,23 +136,26 @@ class PositionManager:
 
             # RSI-based exit check before other exits
             try:
-                asset = pos["pair"].split("/")[0]
-                history = mock_price_data.get(asset)
+                # Without historical data, attempt RSI with minimal series (will likely skip)
+                price_now = price
+                history = [price_now] if price_now and price_now > 0 else []
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
-                    from crypto_trading_bot.indicators.rsi import (
-                        calculate_rsi,
-                    )  # pylint: disable=import-outside-toplevel
-
-                    rsi_val = calculate_rsi(history, CONFIG["rsi"]["period"])
-                    exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
-                    if rsi_val is not None and rsi_val >= exit_upper:
-                        exit_price = price
-                        reason = "RSI_EXIT"
-                        print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
-                        exits.append((trade_id, exit_price, reason))
-                        keys_to_delete.append(trade_id)
-                        continue
-            except (ImportError, KeyError, ValueError, TypeError, IndexError) as e:
+                    if calculate_rsi is None:
+                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+                    else:
+                        rsi_val = calculate_rsi(
+                            history,
+                            CONFIG["rsi"]["period"],
+                        )  # type: ignore[misc]
+                        exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
+                        if rsi_val is not None and rsi_val >= exit_upper:
+                            exit_price = price
+                            reason = "RSI_EXIT"
+                            print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
+                            exits.append((trade_id, exit_price, reason))
+                            keys_to_delete.append(trade_id)
+                            continue
+            except (KeyError, ValueError, TypeError, IndexError) as e:
                 print(f"[EXIT] RSI check error for {trade_id}: {e}")
 
             random_win = random.random() < 0.3
@@ -219,7 +232,10 @@ def save_portfolio_state(ctx):
     print(f"[PORTFOLIO] Saved state to {PORTFOLIO_STATE_PATH}")
 
 
-def evaluate_signals_and_trade(check_exits_only=False):
+def evaluate_signals_and_trade(
+    check_exits_only: bool = False,
+    tradable_pairs: list[str] | None = None,
+):
     """Evaluates trade signals and manages trade execution and exits."""
     # REFACTOR-HOOKS: harmless calls while we peel logic out
     try:
@@ -231,25 +247,147 @@ def evaluate_signals_and_trade(check_exits_only=False):
             execute_trade(_signals, ctx=None),  # type: ignore[name-defined]
             check_and_close_exits(ctx=None),  # type: ignore[name-defined]
         )
-    except Exception:  # pylint: disable=broad-exception-caught
-        # swallow: keep exact runtime behavior for now
-        pass
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
 
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
-    current_prices = {f"{asset}/USD": data[-1] for asset, data in mock_price_data.items()}
+    # Resolve the list of tradable pairs centrally (config-driven)
+    # Added to ensure the engine scans all requested assets with no hardcoding.
+    pairs: list[str] = tradable_pairs or CONFIG.get("tradable_pairs", [])
+    if not pairs:
+        print("⚠️ No tradable_pairs configured; skipping evaluation.")
+        return
+    # Build current price map using live feed for each pair
+    current_prices: dict[str, float] = {}
+    for pair in pairs:
+        price_now = get_current_price(pair)
+        asset = pair.split("/")[0]
+        if price_now is not None and price_now > 0:
+            current_prices[pair] = price_now
+            print(f"[FEED] {asset} price OK: {price_now}")
+        else:
+            print(f"⚠️ No current price for {pair}; skipping in price map")
+
+    # Preload seeded history for all pairs (startup fallback)
+    try:
+        preload_period = CONFIG.get("rsi", {}).get("period", 21)
+        preload_min = max(int(preload_period) + 1, 14)
+        for p in pairs:
+            _ = get_history_prices(p, min_len=preload_min)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Non-fatal: trading loop can still proceed using live prices only
+        pass
 
     # Refresh current market regime and capital buffer before signal evaluation
     context.update_context()
     print(f"[CONTEXT] Regime: {context.get_regime()} | Buffer: {context.get_buffer()}")
     save_portfolio_state(context)
 
+    # Daily trade limit (configurable; ENV override allowed)
+    max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "0") or 0)
+
+    def _today_trade_count() -> int:
+        try:
+            if not os.path.exists(TRADES_LOG_PATH):
+                return 0
+            today = datetime.datetime.now(datetime.UTC).date().isoformat()
+            count = 0
+            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        ts = rec.get("timestamp")
+                        if ts and ts[:10] == today:
+                            if (rec.get("status") or "").lower() in {"executed", "closed"}:
+                                count += 1
+                    except json.JSONDecodeError:
+                        continue
+            return count
+        except OSError:
+            return 0
+
+    def _last_closed_trades(n: int) -> list[dict]:
+        """Return the most recent n closed trades with valid ROI.
+
+        Parses `logs/trades.log` and sorts by timestamp (UTC).
+        """
+        items: list[dict] = []
+        try:
+            if not os.path.exists(TRADES_LOG_PATH):
+                return items
+            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (rec.get("status") or "").lower() != "closed":
+                        continue
+                    if rec.get("roi") is None:
+                        continue
+                    ts = rec.get("timestamp") or "1970-01-01T00:00:00+00:00"
+                    rec["_ts"] = ts
+                    items.append(rec)
+            # Sort by timestamp string (ISO 8601 lexicographic works for UTC)
+            items.sort(key=lambda r: r.get("_ts", ""))
+            return items[-n:]
+        except OSError:
+            return items[:n]
+
+    # ---- Daily limits with streak rules ----
+    default_daily_cap = int(CONFIG.get("MAX_TRADES_PER_DAY", 5))
+    bonus_cap = int(CONFIG.get("BONUS_LIMIT_IF_WINNING_STREAK", 7))
+    loss_streak_stop = int(CONFIG.get("STOP_IF_LOSS_STREAK", 3))
+
+    # Start from ENV override if provided, else config default
+    current_daily_cap = max_trades_per_day if max_trades_per_day > 0 else default_daily_cap
+
+    today_count = _today_trade_count()
+    recent = _last_closed_trades(5)
+
+    # Loss streak: last loss_streak_stop closed trades all losers
+    if len(recent) >= loss_streak_stop:
+        last_n = recent[-loss_streak_stop:]
+        if all((t.get("roi") or 0) < 0 for t in last_n):
+            print("[STREAK HALT] 3-loss streak detected — Trading paused for the day")
+            return
+
+    # Winning streak: last 5 closed trades all winners
+    if len(recent) >= 5 and all((t.get("roi") or 0) > 0 for t in recent[-5:]):
+        if current_daily_cap < bonus_cap:
+            current_daily_cap = bonus_cap
+            print("[STREAK BONUS] 5-win streak detected — Daily trade cap raised to 7")
+
+    # Enforce daily cap before scanning assets
+    if today_count >= current_daily_cap:
+        print(f"[LIMIT] Daily trade limit reached ({today_count})")
+        return
+
     if not check_exits_only:
         proposed_trades = []
         executed_trades = 0
-        for asset, _ in mock_price_data.items():
-            prices = mock_price_data[asset]
-            volume = mock_volume_data[asset][-1]
+        for pair in pairs:
+            # Derive asset symbol from pair (e.g., "BTC" from "BTC/USD")
+            asset = pair.split("/")[0]
+            # Fetch current price
+            current_price = current_prices.get(pair)
+            if current_price is None:
+                current_price = get_current_price(pair)
+            if current_price is None or current_price <= 0:
+                print(f"⚠️ Skipping {pair} — No valid current price")
+                continue
+
+            # Ensure seeded history is available, then append live price
+            rsi_period = CONFIG.get("rsi", {}).get("period", 21)
+            min_needed = max(int(rsi_period) + 1, 14)
+            _ = get_history_prices(pair, min_len=min_needed)
+            append_live_price(pair, float(current_price))
+            prices = get_history_prices(pair, min_len=min_needed)
+            volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
+            if volume < MIN_VOLUME:
+                print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
+                continue
             # Reinitialize strategies per iteration to reset state
             strategies = [
                 SimpleRSIStrategy(
@@ -262,6 +400,10 @@ def evaluate_signals_and_trade(check_exits_only=False):
             for strategy in strategies:
                 try:
                     signal_result = strategy.generate_signal(prices, volume=volume)
+                    print(
+                        f"[SCAN] {asset} strat={strategy.__class__.__name__} "
+                        f"price={current_price:.4f} vol={volume} -> {signal_result}"
+                    )
                 except (ValueError, RuntimeError) as e:
                     log_path = "logs/anomalies.log"
                     with open(log_path, "a", encoding="utf-8") as f:
@@ -292,12 +434,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 buffer = context.get_buffer()
 
                 if signal not in ["buy", "sell"] or confidence < 0.4:
-                    print(f"⚠️ Skipping {asset} — Confidence too low: {confidence}")
+                    print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
                     continue
                 if volume is None or volume < MIN_VOLUME:
-                    print(f"[{asset}] Skipping due to low volume: {volume}")
+                    print(f"[{pair}] Skipping due to low volume: {volume}")
                     continue
-                print(f"📊 Volume for {asset}: {volume}")
+                print(f"📊 Volume for {pair}: {volume}")
 
                 raw_position_size = round(
                     random.uniform(
@@ -327,7 +469,8 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 proposed_trades.append(trade_data)
                 total_risk = calculate_total_risk(proposed_trades)
                 if total_risk > MAX_PORTFOLIO_RISK:
-                    print(f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap")
+                    msg = f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap"
+                    print(msg)
                     proposed_trades.pop()
                     continue
 
@@ -337,7 +480,6 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     if np is None:
                         raise ImportError("numpy not available")
 
-                    corr_window = CONFIG.get("correlation", {}).get("window", 30)
                     corr_threshold = CONFIG.get("correlation", {}).get("threshold", 0.7)
                     skip_due_to_corr = False
                     corr_rows = []
@@ -345,8 +487,13 @@ def evaluate_signals_and_trade(check_exits_only=False):
                         other = t["asset"]
                         if other == asset:
                             continue
-                        a = mock_price_data[asset][-corr_window:]
-                        b = mock_price_data[other][-corr_window:]
+                        # Without historical series, correlation is not computed
+                        pair_a = f"{asset}/USD"
+                        pair_b = f"{other}/USD"
+                        a_price = current_prices.get(pair_a) or get_current_price(pair_a)
+                        b_price = current_prices.get(pair_b) or get_current_price(pair_b)
+                        a = [a_price] if a_price else []
+                        b = [b_price] if b_price else []
                         if len(a) >= 2 and len(b) >= 2:
                             c = float(np.corrcoef(a, b)[0, 1])
                             corr_rows.append({"pair": f"{asset}-{other}", "corr": c})
@@ -405,13 +552,21 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 print("✅ Trades to execute:")
                 print(trade_data)
 
+                # Daily trade limit check (re-evaluate per attempt)
+                if current_daily_cap > 0:
+                    today_count = _today_trade_count()
+                    print(f"[LIMIT] Today trade count: {today_count} / {current_daily_cap}")
+                    if today_count >= current_daily_cap:
+                        print("[LIMIT] Daily trade limit reached — skipping new trade")
+                        continue
+
                 trade_id = str(uuid.uuid4())
-                print(f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}")
+                print((f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}"))
 
                 entry_raw = prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
                 ledger.log_trade(
-                    trading_pair=f"{asset}/USD",
+                    trading_pair=pair,
                     trade_size=adjusted_size,
                     strategy_name=strategy_name,
                     trade_id=trade_id,
@@ -435,7 +590,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                     logged_price = round(entry_raw * (1 + 0.002), 4)
                 position_manager.open_position(
                     trade_id=trade_id,
-                    pair=f"{asset}/USD",
+                    pair=pair,
                     size=adjusted_size,
                     entry_price=logged_price,
                     strategy=strategy_name,
@@ -444,7 +599,7 @@ def evaluate_signals_and_trade(check_exits_only=False):
                 )
                 executed_trades += 1
                 print(f"🧠 Confidence Score: {confidence}")
-                print(f"📝 Logged trade: {asset}/USD | Size: {adjusted_size}")
+                print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
                 print(f"📝 Strategy: {strategy_name}")
 
     # Ensure at least one trade is logged so validator can run
@@ -453,9 +608,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
             print("[FALLBACK] Skipping fallback seeding — disabled in production mode")
             return
         try:
-            asset = "BTC"
-            pair = "BTC/USD"
-            price = mock_price_data[asset][-1]
+            # Fix: remove hardcoded pair; use first configured pair if available
+            pair = pairs[0]
+            price = get_current_price(pair)
+            if price is None or price <= 0:
+                print("[FALLBACK] No real-time price available for fallback seeding; skipping")
+                return
             strategy_name = "SimpleRSIStrategy"
             confidence = 0.5
             regime = context.get_regime()
@@ -506,7 +664,12 @@ def evaluate_signals_and_trade(check_exits_only=False):
         if reason == "TAKE_PROFIT" and trade_position:
             current_prices[trade_position["pair"]] = exit_price  # Apply immediately
         print(f"🚪 Closing trade {trade_id} at {exit_price:.4f}: {reason}")
-        ledger.update_trade(trade_id=trade_id, exit_price=exit_price, reason=reason)
+        ledger.update_trade(
+            trade_id=trade_id,
+            exit_price=exit_price,
+            reason=reason,
+            exit_reason=reason,
+        )
         with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
             f.flush()
             os.fsync(f.fileno())  # Sync after update
@@ -572,15 +735,14 @@ def gather_signals(prices, volumes, ctx=None, **kwargs):
                     pass
                 # clamp to valid range (some impls need <= n-1)
                 period = max(2, min(int(period), max(2, n - 1)))
-                try:
-                    from crypto_trading_bot.indicators.rsi import (
-                        calculate_rsi,
-                    )  # pylint: disable=import-outside-toplevel
-
-                    val = calculate_rsi(prices, period)
-                    out["rsi"] = _to_scalar(val)
-                except (ImportError, ValueError, TypeError, ZeroDivisionError, IndexError):
-                    out["rsi"] = None
+                if calculate_rsi is None:
+                    print("⚠️ RSI calculator unavailable — skipping RSI computation.")
+                else:
+                    try:
+                        val = calculate_rsi(prices, period)  # type: ignore[misc]
+                        out["rsi"] = _to_scalar(val)
+                    except (ValueError, TypeError, ZeroDivisionError, IndexError):
+                        out["rsi"] = None
     except Exception:  # pylint: disable=broad-exception-caught
         # fail-open: never break the loop due to indicator calc
         pass
@@ -635,7 +797,7 @@ def risk_screen(signals, ctx=None, **kwargs) -> bool:
             equity = getattr(portfolio, "equity", None)
 
             if equity is None or equity == 0:
-                print("⚠️ Equity is missing or zero — skipping buffer ratio check.")
+                print("⚠️ Equity missing or zero — skipping trade.")
                 return False
 
             equity = float(equity)

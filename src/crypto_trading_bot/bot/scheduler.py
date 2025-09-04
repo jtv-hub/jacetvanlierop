@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
@@ -197,7 +198,7 @@ def run_scheduler():
         try:
             # Run trade evaluation
             print("\n⏱️ Evaluating trades...")
-            evaluate_signals_and_trade()
+            evaluate_signals_and_trade(tradable_pairs=CONFIG.get("tradable_pairs", []))
 
             print("🔁 Checking exit conditions...")
             run_exit_checks()

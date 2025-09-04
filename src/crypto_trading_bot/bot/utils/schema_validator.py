@@ -44,7 +44,9 @@ def validate_trade_schema(trade):
         if field not in trade:
             raise ValueError(f"Missing required field: {field}")
         if not isinstance(trade[field], expected_type):
-            raise TypeError(f"Field '{field}' should be of type {expected_type}, got {type(trade[field])}")
+            # Shorten message to satisfy line-length without changing meaning
+            actual = type(trade[field])
+            raise TypeError(f"Field '{field}' should be of type {expected_type}, got {actual}")
 
     if trade["confidence"] < 0.0 or trade["confidence"] > 1.0:
         raise ValueError(f"Confidence must be between 0.0 and 1.0, got {trade['confidence']}")
