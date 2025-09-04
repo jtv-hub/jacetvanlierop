@@ -22,6 +22,10 @@ from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.utils.price_feed import get_current_price
+from crypto_trading_bot.utils.price_history import (
+    append_live_price,
+    get_history_prices,
+)
 
 # Optional RSI calculator (import may vary by environment)
 try:
@@ -258,15 +262,107 @@ def evaluate_signals_and_trade(
     current_prices: dict[str, float] = {}
     for pair in pairs:
         price_now = get_current_price(pair)
-        if price_now is not None:
+        asset = pair.split("/")[0]
+        if price_now is not None and price_now > 0:
             current_prices[pair] = price_now
+            print(f"[FEED] {asset} price OK: {price_now}")
         else:
             print(f"⚠️ No current price for {pair}; skipping in price map")
+
+    # Preload seeded history for all pairs (startup fallback)
+    try:
+        preload_period = CONFIG.get("rsi", {}).get("period", 21)
+        preload_min = max(int(preload_period) + 1, 14)
+        for p in pairs:
+            _ = get_history_prices(p, min_len=preload_min)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Non-fatal: trading loop can still proceed using live prices only
+        pass
 
     # Refresh current market regime and capital buffer before signal evaluation
     context.update_context()
     print(f"[CONTEXT] Regime: {context.get_regime()} | Buffer: {context.get_buffer()}")
     save_portfolio_state(context)
+
+    # Daily trade limit (configurable; ENV override allowed)
+    max_trades_per_day = int(os.getenv("MAX_TRADES_PER_DAY", "0") or 0)
+
+    def _today_trade_count() -> int:
+        try:
+            if not os.path.exists(TRADES_LOG_PATH):
+                return 0
+            today = datetime.datetime.now(datetime.UTC).date().isoformat()
+            count = 0
+            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        ts = rec.get("timestamp")
+                        if ts and ts[:10] == today:
+                            if (rec.get("status") or "").lower() in {"executed", "closed"}:
+                                count += 1
+                    except json.JSONDecodeError:
+                        continue
+            return count
+        except OSError:
+            return 0
+
+    def _last_closed_trades(n: int) -> list[dict]:
+        """Return the most recent n closed trades with valid ROI.
+
+        Parses `logs/trades.log` and sorts by timestamp (UTC).
+        """
+        items: list[dict] = []
+        try:
+            if not os.path.exists(TRADES_LOG_PATH):
+                return items
+            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (rec.get("status") or "").lower() != "closed":
+                        continue
+                    if rec.get("roi") is None:
+                        continue
+                    ts = rec.get("timestamp") or "1970-01-01T00:00:00+00:00"
+                    rec["_ts"] = ts
+                    items.append(rec)
+            # Sort by timestamp string (ISO 8601 lexicographic works for UTC)
+            items.sort(key=lambda r: r.get("_ts", ""))
+            return items[-n:]
+        except OSError:
+            return items[:n]
+
+    # ---- Daily limits with streak rules ----
+    default_daily_cap = int(CONFIG.get("MAX_TRADES_PER_DAY", 5))
+    bonus_cap = int(CONFIG.get("BONUS_LIMIT_IF_WINNING_STREAK", 7))
+    loss_streak_stop = int(CONFIG.get("STOP_IF_LOSS_STREAK", 3))
+
+    # Start from ENV override if provided, else config default
+    current_daily_cap = max_trades_per_day if max_trades_per_day > 0 else default_daily_cap
+
+    today_count = _today_trade_count()
+    recent = _last_closed_trades(5)
+
+    # Loss streak: last loss_streak_stop closed trades all losers
+    if len(recent) >= loss_streak_stop:
+        last_n = recent[-loss_streak_stop:]
+        if all((t.get("roi") or 0) < 0 for t in last_n):
+            print("[STREAK HALT] 3-loss streak detected — Trading paused for the day")
+            return
+
+    # Winning streak: last 5 closed trades all winners
+    if len(recent) >= 5 and all((t.get("roi") or 0) > 0 for t in recent[-5:]):
+        if current_daily_cap < bonus_cap:
+            current_daily_cap = bonus_cap
+            print("[STREAK BONUS] 5-win streak detected — Daily trade cap raised to 7")
+
+    # Enforce daily cap before scanning assets
+    if today_count >= current_daily_cap:
+        print(f"[LIMIT] Daily trade limit reached ({today_count})")
+        return
 
     if not check_exits_only:
         proposed_trades = []
@@ -282,9 +378,16 @@ def evaluate_signals_and_trade(
                 print(f"⚠️ Skipping {pair} — No valid current price")
                 continue
 
-            # Placeholder price series to maintain interface; strategies may skip due to length
-            prices = [current_price]
+            # Ensure seeded history is available, then append live price
+            rsi_period = CONFIG.get("rsi", {}).get("period", 21)
+            min_needed = max(int(rsi_period) + 1, 14)
+            _ = get_history_prices(pair, min_len=min_needed)
+            append_live_price(pair, float(current_price))
+            prices = get_history_prices(pair, min_len=min_needed)
             volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
+            if volume < MIN_VOLUME:
+                print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
+                continue
             # Reinitialize strategies per iteration to reset state
             strategies = [
                 SimpleRSIStrategy(
@@ -297,6 +400,10 @@ def evaluate_signals_and_trade(
             for strategy in strategies:
                 try:
                     signal_result = strategy.generate_signal(prices, volume=volume)
+                    print(
+                        f"[SCAN] {asset} strat={strategy.__class__.__name__} "
+                        f"price={current_price:.4f} vol={volume} -> {signal_result}"
+                    )
                 except (ValueError, RuntimeError) as e:
                     log_path = "logs/anomalies.log"
                     with open(log_path, "a", encoding="utf-8") as f:
@@ -362,7 +469,8 @@ def evaluate_signals_and_trade(
                 proposed_trades.append(trade_data)
                 total_risk = calculate_total_risk(proposed_trades)
                 if total_risk > MAX_PORTFOLIO_RISK:
-                    print(f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap")
+                    msg = f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap"
+                    print(msg)
                     proposed_trades.pop()
                     continue
 
@@ -380,8 +488,10 @@ def evaluate_signals_and_trade(
                         if other == asset:
                             continue
                         # Without historical series, correlation is not computed
-                        a_price = current_prices.get(f"{asset}/USD") or get_current_price(f"{asset}/USD")
-                        b_price = current_prices.get(f"{other}/USD") or get_current_price(f"{other}/USD")
+                        pair_a = f"{asset}/USD"
+                        pair_b = f"{other}/USD"
+                        a_price = current_prices.get(pair_a) or get_current_price(pair_a)
+                        b_price = current_prices.get(pair_b) or get_current_price(pair_b)
                         a = [a_price] if a_price else []
                         b = [b_price] if b_price else []
                         if len(a) >= 2 and len(b) >= 2:
@@ -442,8 +552,16 @@ def evaluate_signals_and_trade(
                 print("✅ Trades to execute:")
                 print(trade_data)
 
+                # Daily trade limit check (re-evaluate per attempt)
+                if current_daily_cap > 0:
+                    today_count = _today_trade_count()
+                    print(f"[LIMIT] Today trade count: {today_count} / {current_daily_cap}")
+                    if today_count >= current_daily_cap:
+                        print("[LIMIT] Daily trade limit reached — skipping new trade")
+                        continue
+
                 trade_id = str(uuid.uuid4())
-                print(f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}")
+                print((f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}"))
 
                 entry_raw = prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price

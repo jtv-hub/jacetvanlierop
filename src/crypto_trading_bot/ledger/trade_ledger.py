@@ -273,6 +273,18 @@ class TradeLedger:
         # Best-effort validate/normalize fields to prevent schema issues
         trade = validate_trade_entry(trade)
 
+        # Normalize side for audit compatibility
+        # Convert canonical internal values to order sides expected by audits
+        try:
+            s = str(trade.get("side", "")).strip().lower()
+            if s == "long":
+                trade["side"] = "buy"
+            elif s == "short":
+                trade["side"] = "sell"
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Non-fatal: leave as-is if side is malformed
+            pass
+
         # Validate schema; on failure, log anomaly for audit and re-raise.
         try:
             validate_trade_schema(trade)
@@ -480,6 +492,30 @@ class TradeLedger:
                     exit_adj, exit_slippage_amount, slip_rate = _apply_slippage(
                         t_obj.get("pair"), float(exit_price), exit_side
                     )
+                    # Compute ROI and clamp/flag extreme values (> 500%)
+                    roi_val = round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0
+                    roi_final = roi_val
+                    roi_clamped = False
+                    if abs(roi_val) > 5.0:
+                        roi_clamped = True
+                        roi_final = 5.0 if roi_val > 0 else -5.0
+                        try:
+                            anomalies_logger.info(
+                                json.dumps(
+                                    {
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "type": "Extreme ROI",
+                                        "trade_id": trade_id,
+                                        "pair": t_obj.get("pair"),
+                                        "roi_raw": roi_val,
+                                        "roi_clamped": roi_final,
+                                    },
+                                    separators=(",", ":"),
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            pass
+
                     t_obj.update(
                         {
                             "exit_price": exit_adj,
@@ -490,7 +526,8 @@ class TradeLedger:
                                 2,
                             ),
                             "realized_gain": round((exit_adj - entry_price) * size, 4),
-                            "roi": (round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0),
+                            "roi": roi_final,
+                            "roi_was_clamped": roi_clamped,
                             "exit_slippage_rate": round(slip_rate, 6),
                             "exit_slippage_amount": exit_slippage_amount,
                         }
