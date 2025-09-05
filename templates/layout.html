@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trading Bot Dashboard</title>
+    <style>
+      :root { --bg:#0e1117; --card:#161a23; --fg:#eaecee; --muted:#9aa4b2; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
+      * { box-sizing: border-box; }
+      body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol'; background:var(--bg); color:var(--fg); }
+      a { color: #60a5fa; text-decoration: none; }
+      header { display:flex; align-items:center; justify-content:space-between; padding: 12px 16px; border-bottom: 1px solid #232838; }
+      nav a { margin-right: 12px; }
+      .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
+      .section { margin: 16px 0 28px; }
+      .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+      .card { background: var(--card); border: 1px solid #232838; border-radius: 10px; padding: 14px; }
+      .card h3 { margin: 0 0 8px; font-size: 16px; }
+      .row { display:flex; gap:12px; flex-wrap: wrap; }
+      .tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#232838; color:var(--muted); }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .bad { color: var(--bad); }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; }
+      .muted { color: var(--muted); }
+      footer { padding: 12px 16px; color: var(--muted); font-size: 12px; border-top: 1px solid #232838; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div><strong>📊 Trading Bot Dashboard</strong></div>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/learning-summary">Learning Machine Summary</a>
+      </nav>
+    </header>
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="container">Mobile-friendly cards. Data sourced from logs/.</footer>
+  </body>
+  </html>
+
