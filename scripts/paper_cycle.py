@@ -12,23 +12,28 @@ Usage:
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-# Ensure src/ is importable when running from project root
-sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
-
 import argparse
 import json
 import os
+import sys
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
-# Local imports from the package
-from src.crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
-from src.crypto_trading_bot.learning.confidence_audit import audit_trades, log_anomaly
+# Ensure src/ is importable when running from project root
+# Use parents[1] to get the repository root and prioritize via insert(0)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# Local imports from the package (kept after sys.path adjustment)
+from src.crypto_trading_bot.bot.trading_logic import (  # pylint: disable=wrong-import-position
+    evaluate_signals_and_trade,
+)
+from src.crypto_trading_bot.learning.confidence_audit import (  # pylint: disable=wrong-import-position
+    audit_trades,
+    log_anomaly,
+)
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
