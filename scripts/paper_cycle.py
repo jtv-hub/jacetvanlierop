@@ -12,6 +12,12 @@ Usage:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure src/ is importable when running from project root
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+
 import argparse
 import json
 import os
