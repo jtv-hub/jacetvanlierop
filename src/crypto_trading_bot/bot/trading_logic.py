@@ -33,6 +33,12 @@ try:
 except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
 
+from .strategies.advanced_strategies import (
+    BollingerBandStrategy,
+    KeltnerBreakoutStrategy,
+    MACDStrategy,
+    StochRSIStrategy,
+)
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 
@@ -81,6 +87,7 @@ class PositionManager:
         entry_price,
         strategy,
         confidence,
+        entry_adx: float | None = None,
         timestamp: str | None = None,
     ):
         """Opens a new position and writes it to the positions log.
@@ -97,6 +104,7 @@ class PositionManager:
             "strategy": strategy,
             "confidence": confidence,
             "high_water_mark": entry_price,
+            "entry_adx": entry_adx,
         }
         try:
             os.makedirs("logs", exist_ok=True)
@@ -151,7 +159,7 @@ class PositionManager:
                         if rsi_val is not None and rsi_val >= exit_upper:
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
+                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} rsi={rsi_val:.2f}")
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
@@ -367,6 +375,7 @@ def evaluate_signals_and_trade(
     if not check_exits_only:
         proposed_trades = []
         executed_trades = 0
+        print(f"[ASSETS] Scanning {len(pairs)} pairs: {pairs}")
         for pair in pairs:
             # Derive asset symbol from pair (e.g., "BTC" from "BTC/USD")
             asset = pair.split("/")[0]
@@ -384,22 +393,42 @@ def evaluate_signals_and_trade(
             _ = get_history_prices(pair, min_len=min_needed)
             append_live_price(pair, float(current_price))
             prices = get_history_prices(pair, min_len=min_needed)
+            # Compute ADX gate using recent prices
+            adx_val = context.get_adx(pair, prices)
+            if adx_val is not None:
+                print(f"[ADX] {pair} ADX={adx_val:.2f}")
             volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
             if volume < MIN_VOLUME:
                 print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
                 continue
             # Reinitialize strategies per iteration to reset state
+            per_asset_params = CONFIG.get("strategy_params", {})
             strategies = [
                 SimpleRSIStrategy(
                     period=CONFIG.get("rsi", {}).get("period", 21),
                     lower=CONFIG.get("rsi", {}).get("lower", 48),
                     upper=CONFIG.get("rsi", {}).get("upper", 75),
+                    per_asset=per_asset_params.get("SimpleRSIStrategy", {}),
                 ),
                 DualThresholdStrategy(),
+                MACDStrategy(per_asset=per_asset_params.get("MACDStrategy", {})),
+                KeltnerBreakoutStrategy(per_asset=per_asset_params.get("KeltnerBreakoutStrategy", {})),
+                StochRSIStrategy(per_asset=per_asset_params.get("StochRSIStrategy", {})),
+                BollingerBandStrategy(per_asset=per_asset_params.get("BollingerBandStrategy", {})),
             ]
+            # Per-asset stats
+            signals_count = 0
+            buy_count = 0
+            sell_count = 0
+            skipped_low_conf = 0
+            skipped_none = 0
             for strategy in strategies:
                 try:
-                    signal_result = strategy.generate_signal(prices, volume=volume)
+                    # Pass asset hint where supported
+                    try:
+                        signal_result = strategy.generate_signal(prices, volume=volume, asset=asset)
+                    except TypeError:
+                        signal_result = strategy.generate_signal(prices, volume=volume)
                     print(
                         f"[SCAN] {asset} strat={strategy.__class__.__name__} "
                         f"price={current_price:.4f} vol={volume} -> {signal_result}"
@@ -426,26 +455,46 @@ def evaluate_signals_and_trade(
                     continue
 
                 print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
-                signal = signal_result.get("signal")
-                confidence = signal_result.get("confidence", 0.0)
+                signal = signal_result.get("signal") or signal_result.get("side")
+                confidence = float(signal_result.get("confidence", 0.0) or 0.0)
                 strategy_name = strategy.__class__.__name__
 
                 regime = context.get_regime()
                 buffer = context.get_buffer()
 
-                if signal not in ["buy", "sell"] or confidence < 0.4:
+                if signal not in ["buy", "sell"]:
+                    skipped_none += 1
+                    print(f"⚠️ Skipping {pair} — No actionable signal")
+                    continue
+                # ADX gating
+                if adx_val is not None and adx_val < 25.0:
+                    skipped_none += 1
+                    print(f"[ADX] Skipping {pair} — weak trend ADX={adx_val:.2f}")
+                    continue
+                if adx_val is not None and adx_val > 40.0:
+                    before = confidence
+                    confidence = min(1.0, confidence * 1.15)
+                    print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
+                if confidence < 0.4:
+                    skipped_low_conf += 1
                     print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
                     continue
                 if volume is None or volume < MIN_VOLUME:
                     print(f"[{pair}] Skipping due to low volume: {volume}")
                     continue
                 print(f"📊 Volume for {pair}: {volume}")
+                signals_count += 1
+                if signal == "buy":
+                    buy_count += 1
+                elif signal == "sell":
+                    sell_count += 1
 
+                # Base position size sampled within configured bounds
+                cfg_sz = CONFIG.get("trade_size", {})
+                min_sz = float(cfg_sz.get("min", 0.001))
+                max_sz = float(cfg_sz.get("max", 0.005))
                 raw_position_size = round(
-                    random.uniform(
-                        CONFIG.get("trade_size", {}).get("min", 0.001),
-                        CONFIG.get("trade_size", {}).get("max", 0.005),
-                    ),
+                    random.uniform(min_sz, max_sz),
                     3,
                 )
                 dynamic_buffer = context.get_buffer()
@@ -454,7 +503,8 @@ def evaluate_signals_and_trade(
                     raw_position_size * dynamic_buffer * volume_multiplier * confidence,
                     3,
                 )
-                adjusted_size = max(adjusted_size, 0.001)
+                # Clamp final size to valid range and enforce minimum trade size
+                adjusted_size = max(min_sz, min(adjusted_size, max_sz))
 
                 trade_data = {
                     "asset": asset,
@@ -561,7 +611,7 @@ def evaluate_signals_and_trade(
                         continue
 
                 trade_id = str(uuid.uuid4())
-                print((f"[DEBUG] Using trade_id for both log_trade and " f"open_position: {trade_id}"))
+                print(f"[DEBUG] Using trade_id for both log_trade and open_position: {trade_id}")
 
                 entry_raw = prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
@@ -595,12 +645,21 @@ def evaluate_signals_and_trade(
                     entry_price=logged_price,
                     strategy=strategy_name,
                     confidence=confidence,
+                    entry_adx=adx_val,
                     timestamp=logged_ts,
                 )
                 executed_trades += 1
                 print(f"🧠 Confidence Score: {confidence}")
-                print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
-                print(f"📝 Strategy: {strategy_name}")
+                # Print confirmation only when a valid trade record exists and size > 0
+                if adjusted_size > 0 and logged_trade:
+                    print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
+                    print(f"📝 Strategy: {strategy_name}")
+
+            # Summary per asset
+            print(
+                f"[SUMMARY] {asset}: signals={signals_count} (buy={buy_count}, sell={sell_count}), "
+                f"skipped_none={skipped_none}, skipped_low_conf={skipped_low_conf}"
+            )
 
     # Ensure at least one trade is logged so validator can run
     if executed_trades == 0:

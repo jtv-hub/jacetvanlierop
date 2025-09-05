@@ -17,11 +17,12 @@ from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
-from crypto_trading_bot.learning.learning_machine import run_learning_cycle
+from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
 from crypto_trading_bot.learning.optimization import detect_outliers
 from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
 from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
 from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
+from crypto_trading_bot.scripts.shadow_confidence_test import run_shadow_confidence_test
 from crypto_trading_bot.scripts.suggest_top_configs import (
     export_suggestions,
     generate_parameter_suggestions,
@@ -146,8 +147,22 @@ def run_daily_pipeline():
     else:
         print("⚠️ No top configurations found for suggestion. Skipping shadow tests.")
 
+    # Emit learning suggestions for dashboard consumption
+    try:
+        wrote = run_learning_machine()
+        print(f"✍️  Learning suggestions written: {wrote}")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[Scheduler] run_learning_machine failed: {e}")
+
     metrics = run_learning_cycle()
     print("📊 Learning Summary:", metrics)
+
+    # Confidence threshold analysis (append-only diagnostics; no prod effect)
+    try:
+        n_rows = run_shadow_confidence_test()
+        print(f"📐 Confidence threshold analysis appended {n_rows} row(s).")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[Scheduler] run_shadow_confidence_test failed: {e}")
 
 
 def should_run_daily(last_run_time):
@@ -193,6 +208,14 @@ def run_scheduler():
 
     last_daily_run = None
     last_audit_run = None
+
+    # Kick off at least one suggestion write so dashboards have data on first run
+    try:
+        wrote_boot = run_learning_machine()
+        if wrote_boot:
+            print(f"✍️  Boot suggestions written: {wrote_boot}")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[Scheduler] Initial run_learning_machine failed: {e}")
 
     while True:
         try:
