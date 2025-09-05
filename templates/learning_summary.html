@@ -1,0 +1,87 @@
+{#
+  Context expected:
+  - suggestions: list of {strategy, old_confidence, new_confidence, delta, date, reason}
+  - shadow: list of {strategy, win_rate, duration, status}
+  - anomalies: list of {type, trade_id, timestamp}
+  - leaderboard: list of {strategy, trades, win_rate, avg_roi}
+  - standalone: optional bool when used as full page
+#}
+
+<div class="grid">
+  <div class="card">
+    <h3>✅ Top Confidence Suggestions</h3>
+    {% if suggestions %}
+      {% for s in suggestions %}
+        <div style="margin-bottom:10px;">
+          <div><span class="mono">{{ s.strategy }}</span></div>
+          <div class="muted">{{ s.date }}</div>
+          <div>
+            <span class="tag">old: {{ '%.3f'|format(s.old_confidence) }}</span>
+            <span class="tag">new: {{ '%.3f'|format(s.new_confidence) }}</span>
+            <span class="tag">Δ {{ '%.3f'|format(s.delta) }}</span>
+          </div>
+          {% if s.reason %}
+          <div class="muted" style="margin-top:4px;">{{ s.reason }}</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="muted">No suggestions found.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>📊 Top Shadow Tests</h3>
+    {% if shadow %}
+      {% for r in shadow %}
+        <div style="margin-bottom:10px;">
+          <div><span class="mono">{{ r.strategy }}</span></div>
+          <div>
+            <span class="tag">win rate: {{ '%.2f'|format(r.win_rate) }}</span>
+            <span class="tag">duration: {{ r.duration }}</span>
+            {% set cls = 'ok' if r.status == 'pass' else 'bad' %}
+            <span class="tag {{ cls }}">{{ r.status }}</span>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="muted">No shadow test results.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>⚠️ Recent Anomalies</h3>
+    {% if anomalies %}
+      {% for a in anomalies %}
+        <div style="margin-bottom:10px;">
+          <div><strong>{{ a.type }}</strong></div>
+          <div class="mono muted">{{ a.trade_id }}</div>
+          <div class="muted">{{ a.timestamp }}</div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="muted">No anomalies found.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>📈 Strategy Leaderboard (Last 30)</h3>
+    {% if leaderboard %}
+      {% for row in leaderboard %}
+        <div style="margin-bottom:8px; display:flex; justify-content:space-between;">
+          <div>
+            <div class="mono">{{ row.strategy }}</div>
+            <div class="muted">{{ row.trades }} trades</div>
+          </div>
+          <div style="text-align:right;">
+            <div>WR: {{ '%.2f'|format(row.win_rate * 100) }}%</div>
+            <div>Avg ROI: {{ '%.2f'|format(row.avg_roi * 100) }}%</div>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="muted">No closed trades in window.</div>
+    {% endif %}
+  </div>
+</div>
+

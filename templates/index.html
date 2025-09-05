@@ -1,0 +1,7 @@
+{% extends "layout.html" %}
+{% block content %}
+  <div class="section">
+    <h2>🧠 Learning Machine Summary</h2>
+    {% include "learning_summary.html" with suggestions=learning.suggestions, shadow=learning.shadow, anomalies=learning.anomalies, leaderboard=learning.leaderboard %}
+  </div>
+{% endblock %}

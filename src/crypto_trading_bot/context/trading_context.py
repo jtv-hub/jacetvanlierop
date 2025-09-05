@@ -11,6 +11,7 @@ import random
 from datetime import datetime, timezone
 
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.technical_indicators.adx import calculate_adx
 
 
 class TradingContext:
@@ -23,6 +24,7 @@ class TradingContext:
         self.last_updated = datetime.now(timezone.utc)
         self.regime = "unknown"
         self.buffer = 0.25  # Default buffer
+        self._adx_cache: dict[str, float] = {}
 
         self.update_context()
 
@@ -55,3 +57,21 @@ class TradingContext:
             "regime": self.regime,
             "buffer": self.buffer,
         }
+
+    def get_adx(self, pair: str, prices: list[float] | None = None, period: int = 14) -> float | None:
+        """Compute or return cached ADX for a pair using recent closes.
+
+        The caller can pass preloaded prices to avoid re-fetching.
+        """
+        try:
+            if pair in self._adx_cache:
+                return self._adx_cache.get(pair)
+            if not prices:
+                return None
+            val = calculate_adx(prices, period=period)
+            if val is not None:
+                self._adx_cache[pair] = float(val)
+            return val
+        except ValueError as e:
+            print(f"[ERROR] Failed to compute ADX for {pair}: {e}")
+            return None

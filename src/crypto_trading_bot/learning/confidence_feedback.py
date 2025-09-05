@@ -61,7 +61,8 @@ def analyze_feedback(trade_log_path):
 
     for bucket, bucket_trades in sorted(grouped.items()):
         total = len(bucket_trades)
-        wins = sum(1 for t in bucket_trades if t.get("status") == "executed" and t.get("roi", 0) > 0)
+        # Fix: use realized (closed) trades when evaluating ROI-based outcomes
+        wins = sum(1 for t in bucket_trades if t.get("status") == "closed" and (t.get("roi") or 0) > 0)
         avg_roi = (sum(t.get("roi", 0) for t in bucket_trades) / total) if total > 0 else 0
         win_rate = wins / total if total > 0 else 0
 

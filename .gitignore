@@ -10,7 +10,13 @@ venv/
 
 # Data & logs (keep repo clean)
 data/
-logs/
+# Allow selected logs for Streamlit Cloud dashboard
+# Use a narrow allowlist so general logs remain untracked
+logs/*
+!logs/trades.log
+!logs/anomalies.log
+!logs/learning_feedback.jsonl
+!logs/shadow_test_results.jsonl
 reports/
 .state/
 state/

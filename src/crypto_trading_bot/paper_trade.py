@@ -7,6 +7,7 @@ import logging
 import time
 
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
+from crypto_trading_bot.config import CONFIG
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -14,17 +15,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 def paper_trade(iterations: int = 5, interval: int = 10):
     """Run a simple paper trading loop for smoke testing."""
-    trading_pair = "BTC/USD"
-
-    logging.info("Starting paper trading for %s...", trading_pair)
+    tradable_pairs = CONFIG.get("tradable_pairs", [])
+    logging.info("Starting paper trading across pairs: %s", tradable_pairs)
 
     for i in range(iterations):
         logging.info("Iteration %s/%s", i + 1, iterations)
 
-        # Evaluate signals and/or force trade
-        evaluate_signals_and_trade()
-
-        logging.info("✅ evaluate_signals_and_trade triggered for %s", trading_pair)
+        # Evaluate signals across the centralized pair list
+        evaluate_signals_and_trade(tradable_pairs=tradable_pairs)
+        logging.info("✅ evaluate_signals_and_trade completed for all pairs")
 
         time.sleep(interval)
 
