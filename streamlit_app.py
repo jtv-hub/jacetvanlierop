@@ -23,16 +23,23 @@ from src.crypto_trading_bot.analytics.roi_calculator import compute_running_bala
 
 def main() -> None:
     st.set_page_config(page_title="Learning Machine Summary", layout="wide")
+    # Always clear caches so the dashboard reflects live files
+    try:
+        st.cache_data.clear()
+    except Exception:
+        # Safe-guard: cache API may differ across versions
+        pass
     st.set_option("client.showErrorDetails", True)
     # Auto-refresh every 60 seconds
     st_autorefresh(interval=60 * 1000, key="learning_dashboard_autorefresh")
     st.title("🧠 Learning Machine Summary")
 
     # Log paths
-    feedback_path = os.path.join("logs", "learning_feedback.jsonl")
-    shadow_path = os.path.join("logs", "shadow_test_results.jsonl")
-    anomalies_path = os.path.join("logs", "anomalies.log")
-    trades_path = os.path.join("logs", "trades.log")
+    base_dir = Path(__file__).resolve().parent
+    feedback_path = str(base_dir / "logs" / "learning_feedback.jsonl")
+    shadow_path = str(base_dir / "logs" / "shadow_test_results.jsonl")
+    anomalies_path = str(base_dir / "logs" / "anomalies.log")
+    trades_path = str(base_dir / "logs" / "trades.log")
 
     # ----------------------------
     # Equity Curve / Running Balance
@@ -67,8 +74,20 @@ def main() -> None:
             return ""
         return ts
 
-    closed = [t for t in trades_rows if (t.get("status") or "").lower() == "closed"]
-    closed_sorted = sorted(closed, key=lambda r: _parse_ts(r.get("timestamp")))
+    # Validate essential fields for closed trades
+    def _is_valid_closed(t: dict) -> bool:
+        if (t.get("status") or "").lower() != "closed":
+            return False
+        try:
+            _ = float(t.get("roi"))
+            _ = float(t.get("exit_price"))
+        except (TypeError, ValueError):
+            return False
+        ts = t.get("timestamp")
+        return isinstance(ts, str) and bool(ts.strip())
+
+    closed_valid = [t for t in trades_rows if _is_valid_closed(t)]
+    closed_sorted = sorted(closed_valid, key=lambda r: _parse_ts(r.get("timestamp")))
 
     # Warn about empty or malformed logs
     if total_lines == 0 and not trades_rows:
