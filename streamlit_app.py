@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from src.crypto_trading_bot.analytics.learning_summary import (
     get_anomalies_md,
@@ -23,6 +24,8 @@ from src.crypto_trading_bot.analytics.roi_calculator import compute_running_bala
 def main() -> None:
     st.set_page_config(page_title="Learning Machine Summary", layout="wide")
     st.set_option("client.showErrorDetails", True)
+    # Auto-refresh every 60 seconds
+    st_autorefresh(interval=60 * 1000, key="learning_dashboard_autorefresh")
     st.title("🧠 Learning Machine Summary")
 
     # Log paths
@@ -38,16 +41,25 @@ def main() -> None:
 
     # Load trades once for multiple sections
     trades_rows: list[dict] = []
+    total_lines = 0
+    malformed = 0
     if os.path.exists(trades_path):
-        with open(trades_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    trades_rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        try:
+            with open(trades_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    total_lines += 1
+                    try:
+                        trades_rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        malformed += 1
+                        continue
+        except OSError as e:
+            st.warning(f"Could not read trades log: {e}")
+    else:
+        st.warning("logs/trades.log not found. The dashboard will be empty until trades are logged.")
 
     # Filter closed trades and sort by timestamp
     def _parse_ts(ts: str | None) -> str:
@@ -57,6 +69,12 @@ def main() -> None:
 
     closed = [t for t in trades_rows if (t.get("status") or "").lower() == "closed"]
     closed_sorted = sorted(closed, key=lambda r: _parse_ts(r.get("timestamp")))
+
+    # Warn about empty or malformed logs
+    if total_lines == 0 and not trades_rows:
+        st.warning("trades.log is empty. No trades to display yet.")
+    elif malformed > 0:
+        st.warning(f"Skipped {malformed} malformed line(s) in trades.log while loading.")
 
     # Build running balance series (start 1000 by default)
     start_balance = 1000.0
