@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure src/ is importable on Streamlit Cloud
+sys.path.append(str(Path(__file__).resolve().parent / "src"))
+
 import os
 
 import streamlit as st
