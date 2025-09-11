@@ -1,48 +1,33 @@
 """
 market_data.py
-Generates mock or real market data for the trading bot.
-Initially supports mock data generation for testing purposes.
+
+Production market data helpers. No mock fallbacks.
+
+This module intentionally avoids importing any mock generators. If a live
+price cannot be fetched, a warning is logged and None is returned.
 """
 
-import random
+from __future__ import annotations
+
 from datetime import datetime
+from typing import Optional
+
+from crypto_trading_bot.ledger.trade_ledger import system_logger
+from crypto_trading_bot.utils.price_feed import get_current_price
 
 
-def generate_mock_data(trading_pair: str) -> dict:
+def get_market_snapshot(trading_pair: str) -> Optional[dict]:
     """
-    Generate mock market data for a given trading pair.
-    Includes price, RSI, MACD, VWAP, ATR, and Volume.
+    Fetch a minimal real-time market snapshot for a given trading pair.
 
-    Args:
-        trading_pair (str): The trading pair (e.g., "BTC-USD")
-
-    Returns:
-        dict: A dictionary with simulated market data
+    Returns a dict with timestamp, pair, and price on success; otherwise None.
     """
-    base_prices = {
-        "BTC-USD": 30000,
-        "ETH-USD": 2000,
-        "SOL-USD": 100,
-    }
-
-    base_price = base_prices.get(trading_pair, 1000)
-    price = base_price * random.uniform(0.95, 1.05)
-
+    price = get_current_price(trading_pair)
+    if price is None:
+        system_logger.warning("Live data unavailable for %s; returning None", trading_pair)
+        return None
     return {
         "timestamp": datetime.utcnow().isoformat(),
         "pair": trading_pair,
-        "price": price,
-        "rsi": random.uniform(20, 80),  # Overbought/oversold oscillator
-        "macd": random.uniform(-3, 3),  # Trend momentum
-        "vwap": price * random.uniform(0.98, 1.02),  # VWAP around price
-        "atr": random.uniform(20, 200),  # Volatility measure
-        "volume": random.uniform(1000, 10000),  # Random trading volume
+        "price": float(price),
     }
-
-
-if __name__ == "__main__":
-    # Quick test for BTC, ETH, and SOL
-    for pair in ["BTC-USD", "ETH-USD", "SOL-USD"]:
-        print(f"📊 Mock data for {pair}:")
-        print(generate_mock_data(pair))
-        print("-" * 40)

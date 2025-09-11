@@ -258,6 +258,9 @@ class TradeLedger:
             "roi": None,
             "reason": None,
             "regime": regime,
+            # Optional diagnostics
+            "rsi": kwargs.get("rsi"),
+            "adx": kwargs.get("adx"),
             # Slippage metadata
             "entry_slippage_rate": round(slip_rate, 6),
             "entry_slippage_amount": slippage_amount_entry,

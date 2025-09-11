@@ -58,7 +58,12 @@ class TradingContext:
             "buffer": self.buffer,
         }
 
-    def get_adx(self, pair: str, prices: list[float] | None = None, period: int = 14) -> float | None:
+    def get_adx(
+        self,
+        pair: str,
+        prices: list[float] | None = None,
+        period: int = 14,
+    ) -> float | None:
         """Compute or return cached ADX for a pair using recent closes.
 
         The caller can pass preloaded prices to avoid re-fetching.

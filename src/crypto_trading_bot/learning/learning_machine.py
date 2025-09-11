@@ -52,7 +52,13 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
                 continue
             status = (trade.get("status") or "").lower()
             roi = trade.get("roi")
-            if status == "closed" and isinstance(roi, (int, float)):
+            size = trade.get("size")
+            if (
+                status == "closed"
+                and isinstance(roi, (int, float))
+                and isinstance(size, (int, float))
+                and float(size) > 0.0
+            ):
                 trades.append(trade)
     return trades
 
@@ -79,6 +85,7 @@ def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
     wins = int(np.sum(rois > 0))
     losses = int(np.sum(rois <= 0))
     win_rate = float(wins) / float(total_trades)
+    print(f"[LEARN] Win rate calculated from {wins} wins out of {total_trades} valid trades")
 
     avg_roi = float(np.mean(rois))
     cumulative_return = float(np.prod(1 + rois) - 1)
@@ -267,6 +274,138 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                 rec.get("status"),
                 rec.get("reason"),
             )
+    # Shadow test recent performance per suggested strategy
+    try:
+        _shadow_log_path = "logs/shadow_test_results.jsonl"
+        os.makedirs(os.path.dirname(_shadow_log_path), exist_ok=True)
+        recent_trades = load_trades()
+        recent_trades = recent_trades[-100:]
+        if recent_trades and suggestions:
+            # Aggregate by strategy from recent closed trades
+            by_strategy: Dict[str, List[dict]] = {}
+            for t in recent_trades:
+                strat = t.get("strategy") or "Unknown"
+                by_strategy.setdefault(strat, []).append(t)
+            with open(_shadow_log_path, "a", encoding="utf-8") as sf:
+                for s in suggestions:
+                    strat = s.get("strategy") or s.get("strategy_name") or "Unknown"
+                    rows = by_strategy.get(strat, [])
+                    if not rows:
+                        continue
+                    rois = []
+                    for r in rows:
+                        try:
+                            rois.append(float(r.get("roi")))
+                        except (TypeError, ValueError):
+                            continue
+                    if not rois:
+                        continue
+                    wins = sum(1 for x in rois if x > 0)
+                    total = len(rois)
+                    success_rate = wins / total if total else 0.0
+                    avg_roi = float(sum(rois) / total) if total else 0.0
+                    conf_val = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
+                    rec = {
+                        "timestamp": ts,
+                        "strategy": strat,
+                        "success_rate": round(success_rate, 4),
+                        "avg_roi": round(avg_roi, 6),
+                        "confidence": conf_val,
+                    }
+                    sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                    print(f"[SHADOW TEST] {strat} -> {success_rate*100:.2f}%, ROI={avg_roi:.2f}")
+    except Exception as _e:  # pragma: no cover - diagnostics only
+        logger.info("Shadow test logging skipped: %s", _e)
+
+    # Bayesian optimization for confidence (optional dependency)
+    try:
+        from skopt import gp_minimize  # type: ignore
+        from skopt.space import Real  # type: ignore
+
+        def _sharpe_like(conf: float, rois: List[float]) -> float:
+            import numpy as _np
+
+            arr = _np.asarray(rois, dtype=float)
+            if arr.size == 0:
+                return 0.0
+            mu = float(arr.mean()) * conf
+            sd = float(arr.std())
+            return 0.0 if sd == 0 else mu / sd
+
+        # Build objective from recent trades regardless of strategy
+        rois_all: List[float] = []
+        for t in recent_trades:
+            try:
+                rois_all.append(float(t.get("roi")))
+            except (TypeError, ValueError):
+                continue
+        if rois_all:
+
+            def objective(x):
+                conf = x[0]
+                return -_sharpe_like(conf, rois_all)
+
+            res = gp_minimize(objective, [Real(0.1, 1.0, name="confidence")], n_calls=20, random_state=0)
+            best_conf = float(res.x[0])
+            best_score = float(-res.fun)
+            out_rec = {
+                "timestamp": ts,
+                "strategy": "SimpleRSIStrategy",
+                "suggested_confidence": round(best_conf, 4),
+                "sharpe": round(best_score, 4),
+                "source": "bayesian_optimization",
+            }
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
+            print(f"[OPTIMIZER] Suggested confidence={best_conf:.4f} with Sharpe={best_score:.4f}")
+    except Exception as _e:  # pragma: no cover - optional dep fallback
+        logger.info("Bayesian optimizer unavailable or failed: %s", _e)
+
+    # Auto-apply suggestions based on shadow tests
+    try:
+        shadow_path = "logs/shadow_test_results.jsonl"
+        if os.path.exists(shadow_path):
+            by_strat: Dict[str, List[dict]] = {}
+            with open(shadow_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sname = rec.get("strategy") or "Unknown"
+                    by_strat.setdefault(sname, []).append(rec)
+            for sname, rows in by_strat.items():
+                if len(rows) >= 100:
+                    sr = float(rows[-1].get("success_rate", 0.0))
+                    if sr >= 0.70:
+                        # find latest suggestion for this strategy
+                        latest_conf = None
+                        try:
+                            with open(output_path, "r", encoding="utf-8") as lf:
+                                for line in lf:
+                                    try:
+                                        j = json.loads(line)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    if (j.get("strategy") == sname) and (
+                                        j.get("confidence_after") or j.get("suggested_confidence")
+                                    ):
+                                        latest_conf = j.get("confidence_after") or j.get("suggested_confidence")
+                        except FileNotFoundError:
+                            pass
+                        if latest_conf is not None:
+                            applied = {
+                                "timestamp": ts,
+                                "strategy": sname,
+                                "status": "applied",
+                                "applied_confidence": latest_conf,
+                                "source": "auto_apply_from_shadow_test",
+                            }
+                            with open(output_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(applied, separators=(",", ":")) + "\n")
+                            print(f"[LEARNING APPLY] {sname} updated with confidence={float(latest_conf):.3f}")
+    except Exception as _e:  # pragma: no cover - diagnostics only
+        logger.info("Auto-apply skipped: %s", _e)
     logger.info("Wrote %s suggestion(s) to %s", wrote, output_path)
     print(f"[LearningMachine] Wrote {wrote} suggestion(s) to {output_path}")
     return wrote

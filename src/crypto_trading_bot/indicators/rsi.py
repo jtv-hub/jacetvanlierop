@@ -34,6 +34,8 @@ def calculate_rsi(prices, period=14):
     if period is None or period <= 0:
         raise ValueError(f"RSI: invalid period {period}")
     if not hasattr(prices, "__len__") or len(prices) < period + 1:
+        got = len(prices) if hasattr(prices, "__len__") else 0
+        print(f"[RSI ERROR] Not enough candles for RSI: got {got}, need {period + 1}")
         msg = f"RSI: insufficient data len={len(prices) if hasattr(prices, '__len__') else 'n/a'}"
         raise ValueError(msg + f" < {period+1}")
     if any(p is None or p <= 0 for p in prices):
@@ -150,5 +152,10 @@ def calculate_rsi(prices, period=14):
         rsi_out = 50.0
 
     rsi_out = max(0.0, min(100.0, rsi_out))
+
+    # Defensive: surface if RSI ended up None for any reason
+    if rsi_out is None:  # pragma: no cover - defensive guard
+        print("[RSI ERROR] RSI calculation returned None — possible malformed prices")
+        return None
 
     return rsi_out

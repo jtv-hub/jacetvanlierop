@@ -137,8 +137,9 @@ def run_audit(trades_path: str = TRADES_PATH, initial_balance: float = 1000.0) -
             wins += 1
 
     total = len(entries)
-    avg_roi = (sum(roi_values) / total) if total else 0.0
-    win_rate = (wins / total) if total else 0.0
+    valid = len(roi_values)
+    avg_roi = (sum(roi_values) / valid) if valid else 0.0
+    win_rate = (wins / valid) if valid else 0.0
 
     # Top 5 by absolute ROI magnitude
     top5 = sorted(entries, key=lambda e: abs(e.roi), reverse=True)[:5]
@@ -146,7 +147,7 @@ def run_audit(trades_path: str = TRADES_PATH, initial_balance: float = 1000.0) -
         {
             "trade_id": e.trade_id,
             "timestamp": e.timestamp,
-            "roi": round(e.roi, 6),
+            "roi": round(e.roi, 4),
             "size": e.size,
             "cost_basis": e.cost_basis,
         }
@@ -163,13 +164,13 @@ def run_audit(trades_path: str = TRADES_PATH, initial_balance: float = 1000.0) -
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "initial_balance": initial_balance,
-        "final_balance": round(balance, 6),
+        "final_balance": round(balance, 4),
         "total_trades": total,
-        "avg_roi_per_trade": round(avg_roi, 6),
+        "avg_roi_per_trade": round(avg_roi, 4),
         "win_rate": round(win_rate, 4),
         "top5_by_abs_roi": top5_view,
         "warnings": warnings,
-        "balance_series": [round(x, 6) for x in balances],
+        "balance_series": [round(x, 4) for x in balances],
     }
 
     # Persist JSONL summary
@@ -192,14 +193,14 @@ def main() -> None:
     print(f"Initial balance: ${args.balance:,.2f}")
     print(f"Final balance:   ${result['final_balance']:,.2f}")
     print(f"Total trades:    {result['total_trades']}")
-    print(f"Avg ROI/trade:   {result['avg_roi_per_trade']:.6f}")
+    print(f"Avg ROI/trade:   {result['avg_roi_per_trade']:.4f}")
     print(f"Win rate:        {result['win_rate']*100:.2f}%")
     if result["top5_by_abs_roi"]:
         print("Top 5 trades by |ROI|:")
         for t in result["top5_by_abs_roi"]:
             msg = (
                 f"  - {t['trade_id']} | ts={t['timestamp']} | "
-                f"roi={t['roi']:.6f} | size={t['size']} | cb={t['cost_basis']}"
+                f"roi={t['roi']:.4f} | size={t['size']} | cb={t['cost_basis']}"
             )
             print(msg)
     if result["warnings"]:

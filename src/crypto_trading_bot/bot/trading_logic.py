@@ -34,10 +34,13 @@ except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
 
 from .strategies.advanced_strategies import (
+    ADXStrategy,
     BollingerBandStrategy,
+    CompositeStrategy,
     KeltnerBreakoutStrategy,
     MACDStrategy,
     StochRSIStrategy,
+    VWAPStrategy,
 )
 from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
@@ -88,6 +91,7 @@ class PositionManager:
         strategy,
         confidence,
         entry_adx: float | None = None,
+        entry_rsi: float | None = None,
         timestamp: str | None = None,
     ):
         """Opens a new position and writes it to the positions log.
@@ -105,6 +109,7 @@ class PositionManager:
             "confidence": confidence,
             "high_water_mark": entry_price,
             "entry_adx": entry_adx,
+            "entry_rsi": entry_rsi,
         }
         try:
             os.makedirs("logs", exist_ok=True)
@@ -149,7 +154,7 @@ class PositionManager:
                 history = [price_now] if price_now and price_now > 0 else []
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
                     if calculate_rsi is None:
-                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for " f"{trade_id}")
                     else:
                         rsi_val = calculate_rsi(
                             history,
@@ -159,7 +164,7 @@ class PositionManager:
                         if rsi_val is not None and rsi_val >= exit_upper:
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} rsi={rsi_val:.2f}")
+                            print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
@@ -377,104 +382,141 @@ def evaluate_signals_and_trade(
         executed_trades = 0
         print(f"[ASSETS] Scanning {len(pairs)} pairs: {pairs}")
         for pair in pairs:
-            # Derive asset symbol from pair (e.g., "BTC" from "BTC/USD")
-            asset = pair.split("/")[0]
-            # Fetch current price
-            current_price = current_prices.get(pair)
-            if current_price is None:
-                current_price = get_current_price(pair)
-            if current_price is None or current_price <= 0:
-                print(f"⚠️ Skipping {pair} — No valid current price")
-                continue
+            try:
+                # Derive asset symbol from pair (e.g., "BTC" from "BTC/USD")
+                asset = pair.split("/")[0]
+                # Fetch current price
+                current_price = current_prices.get(pair)
+                if current_price is None:
+                    current_price = get_current_price(pair)
+                if current_price is None or current_price <= 0:
+                    print(f"[SKIP] No valid current price for {pair}")
+                    continue
 
-            # Ensure seeded history is available, then append live price
-            rsi_period = CONFIG.get("rsi", {}).get("period", 21)
-            min_needed = max(int(rsi_period) + 1, 14)
-            _ = get_history_prices(pair, min_len=min_needed)
-            append_live_price(pair, float(current_price))
-            prices = get_history_prices(pair, min_len=min_needed)
-            # Compute ADX gate using recent prices
-            adx_val = context.get_adx(pair, prices)
-            if adx_val is not None:
-                print(f"[ADX] {pair} ADX={adx_val:.2f}")
-            volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
-            if volume < MIN_VOLUME:
-                print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
-                continue
-            # Reinitialize strategies per iteration to reset state
-            per_asset_params = CONFIG.get("strategy_params", {})
-            strategies = [
-                SimpleRSIStrategy(
-                    period=CONFIG.get("rsi", {}).get("period", 21),
-                    lower=CONFIG.get("rsi", {}).get("lower", 48),
-                    upper=CONFIG.get("rsi", {}).get("upper", 75),
-                    per_asset=per_asset_params.get("SimpleRSIStrategy", {}),
-                ),
-                DualThresholdStrategy(),
-                MACDStrategy(per_asset=per_asset_params.get("MACDStrategy", {})),
-                KeltnerBreakoutStrategy(per_asset=per_asset_params.get("KeltnerBreakoutStrategy", {})),
-                StochRSIStrategy(per_asset=per_asset_params.get("StochRSIStrategy", {})),
-                BollingerBandStrategy(per_asset=per_asset_params.get("BollingerBandStrategy", {})),
-            ]
-            # Per-asset stats
-            signals_count = 0
-            buy_count = 0
-            sell_count = 0
-            skipped_low_conf = 0
-            skipped_none = 0
-            for strategy in strategies:
+                # Ensure seeded history is available, then append live price
+                rsi_period = CONFIG.get("rsi", {}).get("period", 21)
+                # Ensure we always provide at least 30 points to RSI-based strategies
+                min_needed = max(int(rsi_period) + 1, 30)
+                _ = get_history_prices(pair, min_len=min_needed)
+                append_live_price(pair, float(current_price))
+                safe_prices = get_history_prices(pair, min_len=min_needed)
+                # Filter out None values before strategy evaluation
+                safe_prices = [p for p in safe_prices if p is not None]
+                # Pre-pair debug trace
+                print(f"[TEST] Generating signal for {pair} with {len(safe_prices)} valid candles")
                 try:
-                    # Pass asset hint where supported
+                    last5 = safe_prices[-5:]
+                except Exception:
+                    last5 = safe_prices
+                print(f"[DEBUG] {pair} prices: {last5} (last 5)")
+
+                # Pre-compute RSI for diagnostics/logging
+                rsi_val = None
+                try:
+                    if calculate_rsi is not None and len(safe_prices) >= int(rsi_period) + 1:
+                        rsi_val = float(calculate_rsi(safe_prices, int(rsi_period)))
+                except Exception:
+                    rsi_val = None
+                # Skip if insufficient history
+                if len(safe_prices) < min_needed:
+                    print(f"[SKIP] Not enough price history for {pair} " f"(only {len(safe_prices)} prices)")
+                    continue
+                # Compute ADX gate using recent prices
+                adx_val = context.get_adx(pair, safe_prices)
+                if adx_val is not None:
+                    print(f"[ADX] {pair} ADX={adx_val:.2f}")
+                volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
+                if volume < MIN_VOLUME:
+                    print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
+                    continue
+                # Reinitialize strategies per iteration to reset state
+                per_asset_params = CONFIG.get("strategy_params", {})
+                strategies = [
+                    SimpleRSIStrategy(
+                        period=CONFIG.get("rsi", {}).get("period", 21),
+                        lower=CONFIG.get("rsi", {}).get("lower", 48),
+                        upper=CONFIG.get("rsi", {}).get("upper", 75),
+                        per_asset=per_asset_params.get("SimpleRSIStrategy", {}),
+                    ),
+                    DualThresholdStrategy(),
+                    MACDStrategy(per_asset=per_asset_params.get("MACDStrategy", {})),
+                    KeltnerBreakoutStrategy(per_asset=per_asset_params.get("KeltnerBreakoutStrategy", {})),
+                    StochRSIStrategy(per_asset=per_asset_params.get("StochRSIStrategy", {})),
+                    BollingerBandStrategy(per_asset=per_asset_params.get("BollingerBandStrategy", {})),
+                    VWAPStrategy(per_asset=per_asset_params.get("VWAPStrategy", {})),
+                    ADXStrategy(per_asset=per_asset_params.get("ADXStrategy", {})),
+                    CompositeStrategy(per_asset=per_asset_params.get("CompositeStrategy", {})),
+                ]
+                # Per-asset stats
+                signals_count = 0
+                buy_count = 0
+                sell_count = 0
+                skipped_low_conf = 0
+                skipped_none = 0
+                for strategy in strategies:
                     try:
-                        signal_result = strategy.generate_signal(prices, volume=volume, asset=asset)
-                    except TypeError:
-                        signal_result = strategy.generate_signal(prices, volume=volume)
-                    print(
-                        f"[SCAN] {asset} strat={strategy.__class__.__name__} "
-                        f"price={current_price:.4f} vol={volume} -> {signal_result}"
-                    )
-                except (ValueError, RuntimeError) as e:
-                    log_path = "logs/anomalies.log"
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(
-                            json.dumps(
-                                {
-                                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                                    "type": "Signal Error",
-                                    "error": str(e),
-                                    "strategy": strategy.__class__.__name__,
-                                }
-                            )
-                            + "\n"
-                        )
+                        # Pass asset hint where supported
                         try:
-                            f.flush()
-                            os.fsync(f.fileno())
-                        except (OSError, IOError):
-                            pass
-                    continue
+                            signal_result = strategy.generate_signal(
+                                safe_prices, volume=volume, asset=asset, adx=adx_val
+                            )
+                        except TypeError:
+                            # Older strategies may not accept 'adx'
+                            signal_result = strategy.generate_signal(safe_prices, volume=volume)
+                        print(
+                            f"[SCAN] {asset} strat={strategy.__class__.__name__} "
+                            f"price={current_price:.4f} vol={volume} -> {signal_result}"
+                        )
+                    except (ValueError, RuntimeError) as e:
+                        log_path = "logs/anomalies.log"
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(
+                                json.dumps(
+                                    {
+                                        "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
+                                        "type": "Signal Error",
+                                        "error": str(e),
+                                        "strategy": strategy.__class__.__name__,
+                                    }
+                                )
+                                + "\n"
+                            )
+                            try:
+                                f.flush()
+                                os.fsync(f.fileno())
+                            except (OSError, IOError):
+                                pass
+                        continue
 
-                print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
-                signal = signal_result.get("signal") or signal_result.get("side")
-                confidence = float(signal_result.get("confidence", 0.0) or 0.0)
-                strategy_name = strategy.__class__.__name__
+                    print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
+                    signal = signal_result.get("signal") or signal_result.get("side")
+                    if not signal:
+                        print(f"[SKIP] No signal generated for {pair} — " f"strategy returned None or RSI failed")
+                    confidence = float(signal_result.get("confidence", 0.0) or 0.0)
+                    strategy_name = strategy.__class__.__name__
 
-                regime = context.get_regime()
-                buffer = context.get_buffer()
+                    regime = context.get_regime()
+                    buffer = context.get_buffer()
 
-                if signal not in ["buy", "sell"]:
-                    skipped_none += 1
-                    print(f"⚠️ Skipping {pair} — No actionable signal")
-                    continue
-                # ADX gating
-                if adx_val is not None and adx_val < 25.0:
-                    skipped_none += 1
-                    print(f"[ADX] Skipping {pair} — weak trend ADX={adx_val:.2f}")
-                    continue
-                if adx_val is not None and adx_val > 40.0:
-                    before = confidence
-                    confidence = min(1.0, confidence * 1.15)
-                    print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
+                    if signal in ["buy", "sell"]:
+                        print(f"[RSI DEBUG] Signal for {pair} -> {signal}")
+
+                    if signal not in ["buy", "sell"]:
+                        skipped_none += 1
+                        print(f"⚠️ Skipping {pair} — No actionable signal")
+                        continue
+                # ADX gating (regime filter)
+                if adx_val is not None:
+                    if adx_val < 20.0:
+                        skipped_none += 1
+                        print(f"[SKIP] {pair}: ADX too weak ({adx_val:.2f})")
+                        print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence=0.0")
+                        continue
+                    if adx_val > 40.0:
+                        before = confidence
+                        confidence = min(1.0, confidence * 1.2)
+                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
+                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence={confidence:.3f}")
                 if confidence < 0.4:
                     skipped_low_conf += 1
                     print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
@@ -613,7 +655,7 @@ def evaluate_signals_and_trade(
                 trade_id = str(uuid.uuid4())
                 print(f"[DEBUG] Using trade_id for both log_trade and open_position: {trade_id}")
 
-                entry_raw = prices[-1]
+                entry_raw = safe_prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
                 ledger.log_trade(
                     trading_pair=pair,
@@ -625,6 +667,8 @@ def evaluate_signals_and_trade(
                     entry_price=entry_raw,
                     regime=regime,
                     capital_buffer=buffer,
+                    rsi=rsi_val,
+                    adx=adx_val,
                 )
                 time.sleep(1)
                 # Use the exact entry_price and timestamp
@@ -646,6 +690,7 @@ def evaluate_signals_and_trade(
                     strategy=strategy_name,
                     confidence=confidence,
                     entry_adx=adx_val,
+                    entry_rsi=rsi_val,
                     timestamp=logged_ts,
                 )
                 executed_trades += 1
@@ -655,11 +700,15 @@ def evaluate_signals_and_trade(
                     print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
                     print(f"📝 Strategy: {strategy_name}")
 
-            # Summary per asset
-            print(
-                f"[SUMMARY] {asset}: signals={signals_count} (buy={buy_count}, sell={sell_count}), "
-                f"skipped_none={skipped_none}, skipped_low_conf={skipped_low_conf}"
-            )
+                # Summary per asset
+                print(
+                    f"[SUMMARY] {asset}: signals={signals_count} "
+                    + f"(buy={buy_count}, sell={sell_count}), "
+                    + f"skipped_none={skipped_none}, "
+                    + f"skipped_low_conf={skipped_low_conf}"
+                )
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"[ERROR] Exception while evaluating {pair}: {e}")
 
     # Ensure at least one trade is logged so validator can run
     if executed_trades == 0:

@@ -14,6 +14,7 @@ when high/low series are unavailable.
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import List, Optional
 
 
@@ -446,3 +447,113 @@ __all__ = [
     "StochRSIStrategy",
     "BollingerBandStrategy",
 ]
+
+
+class VWAPStrategy:
+    """Simple mean-reversion to a rolling VWAP using closes and synthetic volumes.
+
+    Falls back to SMA if volume is not provided.
+    """
+
+    def __init__(self, window: int = 20, per_asset: dict | None = None):
+        self.window = window
+        self.per_asset = per_asset or {}
+
+    def generate_signal(self, prices: List[float], volume, asset: str | None = None, **_):
+        del _
+        if not prices or len(prices) < max(self.window, 5) or any(p is None or p <= 0 for p in prices):
+            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "VWAPStrategy"}
+        if asset and asset in self.per_asset:
+            cfg = self.per_asset[asset]
+            self.window = int(cfg.get("window", self.window))
+        # Approximate VWAP using available volume or uniform weights
+        w = []
+        n = len(prices[-self.window :])
+        if volume is None:
+            w = [1.0] * n
+        else:
+            try:
+                w = [max(1.0, float(volume))] * n
+            except Exception:
+                w = [1.0] * n
+        px = prices[-self.window :]
+        vwap = sum(p * w[i] for i, p in enumerate(px)) / sum(w)
+        last = prices[-1]
+        band = max(1e-9, vwap * 0.004)
+        conf = min(1.0, abs(last - vwap) / (band * 2))
+        print(f"[STRATEGY DEBUG] VWAP vwap={vwap:.6f} last={last:.6f} conf={conf:.3f}")
+        if last < vwap - band:
+            return {"signal": "buy", "side": "buy", "confidence": float(conf), "strategy": "VWAPStrategy"}
+        if last > vwap + band:
+            return {"signal": "sell", "side": "sell", "confidence": float(conf), "strategy": "VWAPStrategy"}
+        return {"signal": None, "side": None, "confidence": 0.0, "strategy": "VWAPStrategy"}
+
+
+class ADXStrategy:
+    """Trend-strength breakout using ADX value.
+
+    Uses ADX to gate: if strong trend and recent momentum confirms, trigger.
+    Expects `adx` passed in generate_signal kwargs; otherwise returns hold.
+    """
+
+    def __init__(self, threshold: float = 25.0, per_asset: dict | None = None):
+        self.threshold = threshold
+        self.per_asset = per_asset or {}
+
+    def generate_signal(self, prices: List[float], volume, asset: str | None = None, adx: float | None = None, **_):
+        del _, volume
+        if not prices or any(p is None or p <= 0 for p in prices):
+            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+        if asset and asset in self.per_asset:
+            cfg = self.per_asset[asset]
+            self.threshold = float(cfg.get("threshold", self.threshold))
+        if adx is None or not isfinite(adx):
+            print("[STRATEGY DEBUG] ADXStrategy missing adx; holding")
+            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+        last = prices[-1]
+        prev = prices[-2] if len(prices) >= 2 else last
+        momentum = (last - prev) / max(prev, 1e-9)
+        conf = min(1.0, max(0.0, (abs(momentum) * max(0.0, adx - self.threshold)) * 10))
+        print(f"[STRATEGY DEBUG] ADXStrategy adx={adx:.2f} mom={momentum:.5f} conf={conf:.3f}")
+        if adx >= max(self.threshold, 25.0):
+            if momentum > 0:
+                return {"signal": "buy", "side": "buy", "confidence": float(conf), "strategy": "ADXStrategy"}
+            if momentum < 0:
+                return {"signal": "sell", "side": "sell", "confidence": float(conf), "strategy": "ADXStrategy"}
+        return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+
+
+class CompositeStrategy:
+    """Weighted composite of RSI (proxied), MACD, and ADX inputs.
+
+    This lightweight version reuses MACD and ADXStrategy signals and merges confidences.
+    """
+
+    def __init__(self, per_asset: dict | None = None):
+        self.per_asset = per_asset or {}
+        self.macd = MACDStrategy()
+        self.adxs = ADXStrategy()
+
+    def generate_signal(self, prices: List[float], volume, asset: str | None = None, adx: float | None = None, **_):
+        del _
+        m = self.macd.generate_signal(prices, volume=volume, asset=asset)
+        a = self.adxs.generate_signal(prices, volume=volume, asset=asset, adx=adx)
+        # Merge signals: prefer when they agree; otherwise hold with low confidence.
+        signal = None
+        conf = 0.0
+        if m.get("signal") and a.get("signal") and m["signal"] == a["signal"]:
+            signal = m["signal"]
+            conf = min(1.0, (m.get("confidence", 0.0) + a.get("confidence", 0.0)) / 2.0)
+        elif m.get("signal"):
+            signal = m["signal"]
+            conf = float(m.get("confidence", 0.0)) * 0.5
+        elif a.get("signal"):
+            signal = a["signal"]
+            conf = float(a.get("confidence", 0.0)) * 0.5
+        print(f"[STRATEGY DEBUG] Composite m={m.get('signal')} a={a.get('signal')} conf={conf:.3f}")
+        return {
+            "signal": signal,
+            "side": signal,
+            "confidence": float(conf),
+            "strategy": "CompositeStrategy",
+        }
