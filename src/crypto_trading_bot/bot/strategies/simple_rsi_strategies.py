@@ -4,9 +4,19 @@ simple_rsi_strategies.py
 Implements the SimpleRSIStrategy class using RSI thresholds.
 """
 
+import logging
+import math
 from typing import List
 
 from crypto_trading_bot.indicators.rsi import calculate_rsi
+
+logger = logging.getLogger("SimpleRSIStrategy")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.FileHandler("logs/full_debug.log")
+    formatter = logging.Formatter(r"\[%(levelname)s\] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 class SimpleRSIStrategy:
@@ -62,8 +72,14 @@ class SimpleRSIStrategy:
             dict: A dictionary containing the signal type and confidence level.
         """
         # Filter 1: Price validity and sufficiency
-        if not prices or len(prices) < max(self.period + 1, 5) or any(p is None or p <= 0 for p in prices):
-            print(f"[DEBUG] SimpleRSIStrategy invalid prices: len={len(prices) if prices else 0}")
+        if not prices:
+            logger.debug("[RSI DEBUG] Exit: prices is empty")
+            return {"signal": None, "confidence": 0.0}
+        if len(prices) < max(self.period + 1, 5):
+            logger.debug(f"[RSI DEBUG] Exit: not enough prices (len={len(prices)})")
+            return {"signal": None, "confidence": 0.0}
+        if any(p is None or p <= 0 for p in prices):
+            logger.debug("[RSI DEBUG] Exit: invalid price found")
             return {"signal": None, "confidence": 0.0}
 
         # Filter 2: Volume check
@@ -78,7 +94,10 @@ class SimpleRSIStrategy:
             self.upper = float(cfg.get("upper", self.upper))
 
         rsi = calculate_rsi(prices, self.period)
-        print(f"[DEBUG] RSI: {rsi}, Recent Prices: {prices[-5:]}")
+        try:
+            logger.debug(f"[RSI DEBUG] {asset} RSI={rsi:.2f} price={prices[-1]} volume={volume}")
+        except Exception:
+            logger.debug(f"[RSI DEBUG] {asset} RSI={rsi} price={prices[-1]} volume={volume}")
         print(f"[DEBUG] Thresholds: oversold={self.lower}, overbought={self.upper}")
 
         # Fallback if RSI missing/invalid
@@ -99,8 +118,6 @@ class SimpleRSIStrategy:
         if d <= 5.0:
             conf_nl = 0.0
         else:
-            import math
-
             d0 = 20.0  # distance to midpoint where conf ~= 0.5
             k = 5.0  # steepness of curve; lower -> steeper
             s = 1.0 / (1.0 + math.exp(-(d - d0) / k))

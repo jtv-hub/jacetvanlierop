@@ -1,15 +1,17 @@
-# src/crypto_trading_bot/main.py
-
 """
 Main entry point for the Crypto Trading Bot.
 Allows user to run a one-off trade or start the scheduler.
 """
 
 import argparse
+import logging
 
 from crypto_trading_bot.bot.scheduler import run_scheduler
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.config import CONFIG
+
+# Configure root logger for DEBUG output (ensures [RSI DEBUG] logs are visible)
+logging.basicConfig(level=logging.DEBUG)
 
 
 def main():
