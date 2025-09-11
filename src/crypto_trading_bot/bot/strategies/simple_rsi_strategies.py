@@ -60,7 +60,13 @@ class SimpleRSIStrategy:
             return False
         return True
 
-    def generate_signal(self, prices: List[float], volume, asset: str | None = None):
+    def generate_signal(
+        self,
+        prices: List[float],
+        volume,
+        asset: str | None = None,
+        adx: float | None = None,
+    ):
         """
         Generates a buy, sell, or hold signal based on RSI and volume filters.
 
@@ -76,7 +82,7 @@ class SimpleRSIStrategy:
             logger.debug("[RSI DEBUG] Exit: prices is empty")
             return {"signal": None, "confidence": 0.0}
         if len(prices) < max(self.period + 1, 5):
-            logger.debug(f"[RSI DEBUG] Exit: not enough prices (len={len(prices)})")
+            logger.debug("[RSI DEBUG] Exit: not enough prices (len=%s)", len(prices))
             return {"signal": None, "confidence": 0.0}
         if any(p is None or p <= 0 for p in prices):
             logger.debug("[RSI DEBUG] Exit: invalid price found")
@@ -94,10 +100,24 @@ class SimpleRSIStrategy:
             self.upper = float(cfg.get("upper", self.upper))
 
         rsi = calculate_rsi(prices, self.period)
+        # Explicit RSI debug prints per asset
+        if rsi is not None:
+            print(f"[RSI DEBUG] {asset}: RSI={rsi}")
+        else:
+            print(f"[RSI DEBUG] {asset}: RSI is None")
+        # Format RSI value safely without broad exception
         try:
-            logger.debug(f"[RSI DEBUG] {asset} RSI={rsi:.2f} price={prices[-1]} volume={volume}")
-        except Exception:
-            logger.debug(f"[RSI DEBUG] {asset} RSI={rsi} price={prices[-1]} volume={volume}")
+            rsi_num = float(rsi) if rsi is not None else None
+        except (TypeError, ValueError):
+            rsi_num = None
+        rsi_str = f"{rsi_num:.2f}" if rsi_num is not None else str(rsi)
+        logger.debug(
+            "[RSI DEBUG] %s RSI=%s price=%s volume=%s",
+            asset,
+            rsi_str,
+            prices[-1],
+            volume,
+        )
         print(f"[DEBUG] Thresholds: oversold={self.lower}, overbought={self.upper}")
 
         # Fallback if RSI missing/invalid
@@ -125,6 +145,20 @@ class SimpleRSIStrategy:
             # Rescale so s_neutral -> 0, and 1 remains 1
             conf_nl = (s - s_neutral) / max(1e-9, (1.0 - s_neutral))
             conf_nl = max(0.0, min(1.0, conf_nl))
+
+        # Apply ADX regime filter after RSI computed, before decisions
+        if adx is not None:
+            # Weak trend: skip trades
+            if adx < 20:
+                print(f"[SKIP] {asset or ''}: ADX too weak ({adx})")
+                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence=0.0")
+                return {"signal": None, "side": None, "strategy": "SimpleRSIStrategy", "confidence": 0.0}
+            # Strong trend: boost confidence
+            if adx > 40:
+                conf_nl = min(1.0, float(conf_nl) * 1.2)
+                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={conf_nl}")
+            else:
+                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={conf_nl}")
 
         # Signals: still trigger at thresholds, but confidence uses nonlinear curve
         if rsi_val < oversold:
