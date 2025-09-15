@@ -18,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
+from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
@@ -235,6 +236,63 @@ def calculate_total_risk(trades):
     return sum(trade.get("risk", 0.0) for trade in trades)
 
 
+def _committed_notional(trades) -> float:
+    """Total notional already allocated across pending trades."""
+    total = 0.0
+    for trade in trades or []:
+        try:
+            total += max(float(trade.get("notional", 0.0)), 0.0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _compute_position_sizing(
+    *,
+    total_capital: float,
+    remaining_capital: float,
+    current_price: float,
+    confidence: float,
+    base_risk_pct: float,
+    buffer: float,
+    reinvestment_rate: float | None,
+    liquidity_factor: float,
+    min_size: float,
+    max_size: float,
+) -> tuple[float, float, float]:
+    """Return (size, notional, risk_fraction) for the proposed trade."""
+    if total_capital <= 0 or remaining_capital <= 0 or current_price <= 0 or confidence <= 0 or base_risk_pct <= 0:
+        return 0.0, 0.0, 0.0
+
+    reinvestment_factor = float(reinvestment_rate) if reinvestment_rate is not None else 1.0
+    reinvestment_factor = min(max(reinvestment_factor, 0.0), 1.0)
+    liquidity_factor = min(max(liquidity_factor, 0.0), 1.0)
+    buffer = max(buffer, 0.0)
+
+    effective_pct = base_risk_pct * buffer * confidence * liquidity_factor * reinvestment_factor
+    effective_pct = min(effective_pct, base_risk_pct)
+
+    notional_target = remaining_capital * effective_pct
+    if notional_target <= 0:
+        return 0.0, 0.0, 0.0
+
+    raw_units = notional_target / current_price
+    if raw_units <= 0:
+        return 0.0, 0.0, 0.0
+
+    # Respect maximum size; if size falls below minimum, skip this trade
+    units = min(raw_units, max_size)
+    if units < min_size:
+        return 0.0, 0.0, 0.0
+
+    units = round(units, 6)
+    notional = units * current_price
+    risk_fraction = notional / total_capital if total_capital > 0 else 0.0
+    risk_fraction = min(risk_fraction, base_risk_pct)
+
+    return units, notional, risk_fraction
+
+
 def save_portfolio_state(ctx):
     """Saves the current trading context to portfolio_state.json."""
     os.makedirs("logs", exist_ok=True)
@@ -248,6 +306,10 @@ def save_portfolio_state(ctx):
 def evaluate_signals_and_trade(
     check_exits_only: bool = False,
     tradable_pairs: list[str] | None = None,
+    *,
+    available_capital: float | None = None,
+    risk_per_trade: float | None = None,
+    reinvestment_rate: float | None = None,
 ):
     """Evaluates trade signals and manages trade execution and exits."""
     # REFACTOR-HOOKS: harmless calls while we peel logic out
@@ -271,6 +333,26 @@ def evaluate_signals_and_trade(
     if not pairs:
         print("⚠️ No tradable_pairs configured; skipping evaluation.")
         return
+
+    state_snapshot = None
+    resolved_capital = None
+    if available_capital is not None:
+        try:
+            resolved_capital = float(available_capital)
+        except (TypeError, ValueError):
+            resolved_capital = None
+
+    if resolved_capital is None or resolved_capital <= 0:
+        state_snapshot = load_portfolio_state(refresh=False)
+        resolved_capital = float(state_snapshot.get("available_capital", ACCOUNT_SIZE))
+    resolved_capital = max(resolved_capital, 0.0)
+
+    if reinvestment_rate is None:
+        if state_snapshot is None:
+            state_snapshot = load_portfolio_state(refresh=False)
+        reinvestment_rate = float(state_snapshot.get("reinvestment_rate", 0.0))
+
+    trade_risk_pct = 0.02 if risk_per_trade is None else max(float(risk_per_trade), 0.0)
     # Build current price map using live feed for each pair
     current_prices: dict[str, float] = {}
     for pair in pairs:
@@ -376,6 +458,11 @@ def evaluate_signals_and_trade(
     if today_count >= current_daily_cap:
         print(f"[LIMIT] Daily trade limit reached ({today_count})")
         return
+
+    total_capital = resolved_capital
+    if not check_exits_only and total_capital <= 0:
+        print("⚠️ Available capital is zero — skipping new trade evaluation.")
+        check_exits_only = True
 
     if not check_exits_only:
         proposed_trades = []
@@ -531,31 +618,44 @@ def evaluate_signals_and_trade(
                 elif signal == "sell":
                     sell_count += 1
 
-                # Base position size sampled within configured bounds
+                committed_capital = _committed_notional(proposed_trades)
+                remaining_capital = max(total_capital - committed_capital, 0.0)
+                if remaining_capital <= 0:
+                    print("⚠️ Capital exhausted for new positions; stopping scans.")
+                    break
+
                 cfg_sz = CONFIG.get("trade_size", {})
                 min_sz = float(cfg_sz.get("min", 0.001))
                 max_sz = float(cfg_sz.get("max", 0.005))
-                raw_position_size = round(
-                    random.uniform(min_sz, max_sz),
-                    3,
-                )
                 dynamic_buffer = context.get_buffer()
-                volume_multiplier = min(volume / 1000, 1.0)
-                adjusted_size = round(
-                    raw_position_size * dynamic_buffer * volume_multiplier * confidence,
-                    3,
+                liquidity_factor = min(volume / 1000, 1.0)
+
+                adjusted_size, position_notional, trade_risk = _compute_position_sizing(
+                    total_capital=total_capital,
+                    remaining_capital=remaining_capital,
+                    current_price=current_price,
+                    confidence=confidence,
+                    base_risk_pct=trade_risk_pct,
+                    buffer=dynamic_buffer,
+                    reinvestment_rate=reinvestment_rate,
+                    liquidity_factor=liquidity_factor,
+                    min_size=min_sz,
+                    max_size=max_sz,
                 )
-                # Clamp final size to valid range and enforce minimum trade size
-                adjusted_size = max(min_sz, min(adjusted_size, max_sz))
+
+                if adjusted_size <= 0:
+                    print(f"⚠️ Skipping {pair} — Not enough capital for minimum position size")
+                    continue
 
                 trade_data = {
                     "asset": asset,
                     "size": adjusted_size,
-                    "risk": 0.02,
+                    "risk": trade_risk,
                     "strategy": strategy_name,
                     "confidence": confidence,
                     "signal_score": confidence,
                     "regime": regime,
+                    "notional": round(position_notional, 2),
                 }
 
                 proposed_trades.append(trade_data)
@@ -726,7 +826,25 @@ def evaluate_signals_and_trade(
             confidence = 0.5
             regime = context.get_regime()
             buffer = context.get_buffer()
-            adjusted_size = 0.001
+            cfg_sz = CONFIG.get("trade_size", {})
+            min_sz = float(cfg_sz.get("min", 0.001))
+            max_sz = float(cfg_sz.get("max", 0.005))
+            fallback_size, _, _ = _compute_position_sizing(
+                total_capital=total_capital if total_capital > 0 else ACCOUNT_SIZE,
+                remaining_capital=total_capital if total_capital > 0 else ACCOUNT_SIZE,
+                current_price=price,
+                confidence=confidence,
+                base_risk_pct=trade_risk_pct if trade_risk_pct > 0 else 0.02,
+                buffer=buffer,
+                reinvestment_rate=reinvestment_rate,
+                liquidity_factor=1.0,
+                min_size=min_sz,
+                max_size=max_sz,
+            )
+            if fallback_size <= 0:
+                print("[FALLBACK] Unable to compute a viable fallback position size; skipping")
+                return
+            adjusted_size = fallback_size
             trade_id = str(uuid.uuid4())
             entry_raw = price
             ledger.log_trade(

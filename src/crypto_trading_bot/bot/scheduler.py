@@ -11,6 +11,10 @@ import time
 import traceback
 from datetime import datetime, timezone
 
+from crypto_trading_bot.bot.state.portfolio_state import (
+    load_portfolio_state,
+    refresh_portfolio_state,
+)
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.config import CONFIG
@@ -128,9 +132,12 @@ def update_shadow_test_results():
         return
 
 
-def run_daily_pipeline():
+def run_daily_pipeline() -> None:
     """Run all daily tasks: heartbeat, optimization, shadow testing, learning."""
+    state = refresh_portfolio_state()
+    available = float(state.get("available_capital", 0.0) or 0.0)
     print("🧹 Rotating logs before running daily tasks...")
+    print(f"💰 Portfolio available capital: ${available:,.2f}")
     print("\n🌅 Running daily heartbeat tasks...")
     run_daily_tasks()
 
@@ -209,6 +216,8 @@ def run_scheduler():
     last_daily_run = None
     last_audit_run = None
 
+    portfolio_state = load_portfolio_state(refresh=True)
+
     # Kick off at least one suggestion write so dashboards have data on first run
     try:
         wrote_boot = run_learning_machine()
@@ -219,9 +228,21 @@ def run_scheduler():
 
     while True:
         try:
-            # Run trade evaluation
-            print("\n⏱️ Evaluating trades...")
-            evaluate_signals_and_trade(tradable_pairs=CONFIG.get("tradable_pairs", []))
+            # Refresh portfolio state and run trade evaluation
+            portfolio_state = load_portfolio_state(refresh=True)
+            available_capital = float(portfolio_state.get("available_capital", 0.0))
+            reinvestment_rate = float(portfolio_state.get("reinvestment_rate", 0.0))
+
+            if available_capital <= 0:
+                print("⚠️ Available capital is non-positive — skipping trade evaluation.")
+            else:
+                print("\n⏱️ Evaluating trades...")
+                evaluate_signals_and_trade(
+                    tradable_pairs=CONFIG.get("tradable_pairs", []),
+                    available_capital=available_capital,
+                    risk_per_trade=adjusted_risk,
+                    reinvestment_rate=reinvestment_rate,
+                )
 
             print("🔁 Checking exit conditions...")
             run_exit_checks()
