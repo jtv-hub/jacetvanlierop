@@ -25,3 +25,5 @@ src/logs/
 # OS/editor junk
 .DS_Store
 .vscode/
+logs/*.jsonl
+logs/*.log
