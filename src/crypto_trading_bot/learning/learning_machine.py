@@ -368,7 +368,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             # Inline debug for each suggestion with full record echo
             print(f"[LearningMachine] Writing suggestion #{wrote}: {rec}")
             logger.info(
-                "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s " "status=%s reason=%s",
+                ("[LearningMachine] Suggestion #%s: strategy=%s before=%s " "after=%s status=%s reason=%s"),
                 wrote,
                 rec.get("strategy"),
                 rec.get("confidence_before"),
@@ -462,7 +462,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             }
             with open(output_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
-            print(f"[OPTIMIZER] Suggested confidence={best_conf:.4f} with Sharpe={best_score:.4f}")
+            print(f"[OPTIMIZER] Suggested confidence={best_conf:.4f} " f"with Sharpe={best_score:.4f}")
     except (ImportError, ValueError, TypeError) as _e:  # pragma: no cover - optional dep fallback
         logger.info("Bayesian optimizer unavailable or failed: %s", _e)
 
@@ -492,10 +492,10 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                                         j = json.loads(line)
                                     except json.JSONDecodeError:
                                         continue
-                                    if (j.get("strategy") == sname) and (
-                                        j.get("confidence_after") or j.get("suggested_confidence")
-                                    ):
-                                        latest_conf = j.get("confidence_after") or j.get("suggested_confidence")
+                                    has_after = j.get("confidence_after")
+                                    has_suggested = j.get("suggested_confidence")
+                                    if (j.get("strategy") == sname) and (has_after or has_suggested):
+                                        latest_conf = has_after or has_suggested
                         except FileNotFoundError:
                             pass
                         if latest_conf is not None:
