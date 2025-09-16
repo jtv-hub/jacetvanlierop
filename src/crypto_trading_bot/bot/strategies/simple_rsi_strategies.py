@@ -147,6 +147,8 @@ class SimpleRSIStrategy:
             conf_nl = max(0.0, min(1.0, conf_nl))
 
         # Apply ADX regime filter after RSI computed, before decisions
+        baseline_conf = float(conf_nl if conf_nl > 0 else 0.0)
+
         if adx is not None:
             # Weak trend: skip trades
             if adx < 20:
@@ -155,24 +157,26 @@ class SimpleRSIStrategy:
                 return {"signal": None, "side": None, "strategy": "SimpleRSIStrategy", "confidence": 0.0}
             # Strong trend: boost confidence
             if adx > 40:
-                conf_nl = min(1.0, float(conf_nl) * 1.2)
-                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={conf_nl}")
+                baseline_conf = min(1.0, baseline_conf * 1.2)
+                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={baseline_conf}")
             else:
-                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={conf_nl}")
+                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, adjusted confidence={baseline_conf}")
 
         # Signals: still trigger at thresholds, but confidence uses nonlinear curve
-        if rsi_val < oversold:
+        if rsi_val < oversold and baseline_conf > 0.0:
             return {
                 "signal": "buy",
                 "side": "buy",
                 "strategy": "SimpleRSIStrategy",
-                "confidence": float(conf_nl if conf_nl > 0 else 0.0),
+                "confidence": 1.0,
+                "raw_confidence": round(baseline_conf, 4),
             }
-        if rsi_val > overbought:
+        if rsi_val > overbought and baseline_conf > 0.0:
             return {
                 "signal": "sell",
                 "side": "sell",
                 "strategy": "SimpleRSIStrategy",
-                "confidence": float(conf_nl if conf_nl > 0 else 0.0),
+                "confidence": 1.0,
+                "raw_confidence": round(baseline_conf, 4),
             }
         return {"signal": None, "side": None, "strategy": "SimpleRSIStrategy", "confidence": 0.0}

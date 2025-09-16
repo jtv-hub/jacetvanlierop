@@ -376,7 +376,9 @@ def evaluate_signals_and_trade(
 
     # Refresh current market regime and capital buffer before signal evaluation
     context.update_context()
-    print(f"[CONTEXT] Regime: {context.get_regime()} | Buffer: {context.get_buffer()}")
+    base_buffer = context.get_buffer()
+    composite_buffer = context.get_buffer_for_strategy("CompositeStrategy")
+    print(f"[CONTEXT] Regime: {context.get_regime()} | Buffer: {base_buffer} | " f"CompositeBuffer: {composite_buffer}")
     save_portfolio_state(context)
 
     # Daily trade limit (configurable; ENV override allowed)
@@ -583,7 +585,7 @@ def evaluate_signals_and_trade(
                     strategy_name = strategy.__class__.__name__
 
                     regime = context.get_regime()
-                    buffer = context.get_buffer()
+                    buffer = context.get_buffer_for_strategy(strategy_name)
 
                     if signal in ["buy", "sell"]:
                         print(f"[RSI DEBUG] Signal for {pair} -> {signal}")
@@ -627,7 +629,7 @@ def evaluate_signals_and_trade(
                 cfg_sz = CONFIG.get("trade_size", {})
                 min_sz = float(cfg_sz.get("min", 0.001))
                 max_sz = float(cfg_sz.get("max", 0.005))
-                dynamic_buffer = context.get_buffer()
+                dynamic_buffer = context.get_buffer_for_strategy(strategy_name)
                 liquidity_factor = min(volume / 1000, 1.0)
 
                 adjusted_size, position_notional, trade_risk = _compute_position_sizing(
@@ -823,9 +825,9 @@ def evaluate_signals_and_trade(
                 print("[FALLBACK] No real-time price available for fallback seeding; skipping")
                 return
             strategy_name = "SimpleRSIStrategy"
-            confidence = 0.5
+            confidence = 1.0
             regime = context.get_regime()
-            buffer = context.get_buffer()
+            buffer = context.get_buffer_for_strategy(strategy_name)
             cfg_sz = CONFIG.get("trade_size", {})
             min_sz = float(cfg_sz.get("min", 0.001))
             max_sz = float(cfg_sz.get("max", 0.005))

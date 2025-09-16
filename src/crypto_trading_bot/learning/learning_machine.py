@@ -188,6 +188,26 @@ def _evaluate_shadow_promotions(
             continue
         success_sum = stats[strategy]["success_sum"]
         average_success = success_sum / total_runs
+        if total_runs >= 10000 and average_success >= 0.99:
+            msg = (
+                f"[Promotion] Strategy '{strategy}' reached promotion threshold "
+                f"(runs={total_runs}, success_rate={average_success:.2%})."
+            )
+            print(msg)
+            logger.info(msg)
+            promotion_records.append(
+                {
+                    "timestamp": timestamp,
+                    "type": "promotion_decision",
+                    "strategy": strategy,
+                    "shadow_runs": int(total_runs),
+                    "shadow_success_rate": round(average_success, 6),
+                    "status": "promoted",
+                    "action": "manual_promotion_recorded",
+                    "approval": "manual",
+                }
+            )
+            continue
         if total_runs >= 100 and average_success > 0.7:
             msg = (
                 f"[Promotion] Strategy '{strategy}' qualifies as a promotion candidate "
