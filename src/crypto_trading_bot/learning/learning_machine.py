@@ -133,6 +133,7 @@ class LearningMachine:
     """Lightweight wrapper exposing a class interface used by some scripts."""
 
     def generate_report(self) -> Dict[str, float | int | str]:  # pragma: no cover - thin wrapper
+        """Return the latest learning cycle metrics."""
         return run_learning_cycle()
 
 
@@ -243,8 +244,9 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
     """
     try:
         # Imported lazily to avoid circulars and heavy deps at import time
+        # pylint: disable=import-outside-toplevel
         from .optimization import generate_suggestions  # type: ignore
-    except Exception:  # pragma: no cover - fallback path
+    except ImportError:  # pragma: no cover - fallback path
 
         def generate_suggestions(_report):  # type: ignore
             return [{"suggestion": "Monitor performance", "confidence": 0.5, "reason": "fallback"}]
@@ -336,7 +338,8 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
     with open(output_path, "a", encoding="utf-8") as f:
         for s in suggestions:
             # Normalize required fields for dashboard/report compatibility
-            strategy_name = s.get("strategy") or s.get("strategy_name") or s.get("category") or "Unknown"
+            primary_label = s.get("strategy") or s.get("strategy_name")
+            strategy_name = primary_label or s.get("category") or "Unknown"
             confidence_before = s.get("confidence_before") or s.get("current_confidence")
             confidence_after = (
                 s.get("confidence_after")
@@ -365,7 +368,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             # Inline debug for each suggestion with full record echo
             print(f"[LearningMachine] Writing suggestion #{wrote}: {rec}")
             logger.info(
-                "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s status=%s reason=%s",
+                "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s " "status=%s reason=%s",
                 wrote,
                 rec.get("strategy"),
                 rec.get("confidence_before"),
@@ -413,18 +416,16 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                     }
                     sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
                     print(f"[SHADOW TEST] {strat} -> {success_rate*100:.2f}%, ROI={avg_roi:.2f}")
-    except Exception as _e:  # pragma: no cover - diagnostics only
+    except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Shadow test logging skipped: %s", _e)
 
     # Bayesian optimization for confidence (optional dependency)
     try:
-        from skopt import gp_minimize  # type: ignore
-        from skopt.space import Real  # type: ignore
+        from skopt import gp_minimize  # type: ignore  # pylint: disable=import-outside-toplevel
+        from skopt.space import Real  # type: ignore  # pylint: disable=import-outside-toplevel
 
         def _sharpe_like(conf: float, rois: List[float]) -> float:
-            import numpy as _np
-
-            arr = _np.asarray(rois, dtype=float)
+            arr = np.asarray(rois, dtype=float)
             if arr.size == 0:
                 return 0.0
             mu = float(arr.mean()) * conf
@@ -444,7 +445,12 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                 conf = x[0]
                 return -_sharpe_like(conf, rois_all)
 
-            res = gp_minimize(objective, [Real(0.1, 1.0, name="confidence")], n_calls=20, random_state=0)
+            res = gp_minimize(
+                objective,
+                [Real(0.1, 1.0, name="confidence")],
+                n_calls=20,
+                random_state=0,
+            )
             best_conf = float(res.x[0])
             best_score = float(-res.fun)
             out_rec = {
@@ -457,7 +463,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             with open(output_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
             print(f"[OPTIMIZER] Suggested confidence={best_conf:.4f} with Sharpe={best_score:.4f}")
-    except Exception as _e:  # pragma: no cover - optional dep fallback
+    except (ImportError, ValueError, TypeError) as _e:  # pragma: no cover - optional dep fallback
         logger.info("Bayesian optimizer unavailable or failed: %s", _e)
 
     # Auto-apply suggestions based on shadow tests
@@ -502,8 +508,8 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                             }
                             with open(output_path, "a", encoding="utf-8") as f:
                                 f.write(json.dumps(applied, separators=(",", ":")) + "\n")
-                            print(f"[LEARNING APPLY] {sname} updated with confidence={float(latest_conf):.3f}")
-    except Exception as _e:  # pragma: no cover - diagnostics only
+                            print(f"[LEARNING APPLY] {sname} updated with " f"confidence={float(latest_conf):.3f}")
+    except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Auto-apply skipped: %s", _e)
     _evaluate_shadow_promotions(output_path=output_path, timestamp=ts)
 
@@ -512,12 +518,17 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
     return wrote
 
 
-if __name__ == "__main__":  # pragma: no cover
-    # Debug mode: run a single learning cycle, print metrics, and emit suggestions
+def _debug_main() -> None:  # pragma: no cover
+    """Run a single learning cycle and emit suggestions for manual inspection."""
+
     result = run_learning_cycle()
     print("📊 Learning Machine Metrics:", result)
     try:
-        n = run_learning_machine()
-        print(f"✍️  Wrote {n} suggestion(s) to logs/learning_feedback.jsonl")
-    except Exception as exc:  # safety for ad-hoc runs
+        suggestions_written = run_learning_machine()
+        print(f"✍️  Wrote {suggestions_written} suggestion(s) to logs/learning_feedback.jsonl")
+    except (OSError, RuntimeError, ValueError) as exc:  # safety for ad-hoc runs
         print(f"⚠️ Failed to write suggestions: {exc}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    _debug_main()

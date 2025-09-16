@@ -41,7 +41,10 @@ class TradingContext:
         self.regime = str(regime) if isinstance(regime, str) else "unknown"
 
         raw_profile = snapshot.get("regime_capital_buffers") or {}
-        self.buffer_profile = {key: float(val) for key, val in raw_profile.items() if isinstance(val, (int, float))}
+        self.buffer_profile = {}
+        for key, value in raw_profile.items():
+            if isinstance(value, (int, float)):
+                self.buffer_profile[key] = float(value)
 
         defaults = CONFIG.get("buffer_defaults", {})
         fallback_buffer = float(defaults.get(self.regime, defaults.get("unknown", 0.25)))
@@ -58,9 +61,10 @@ class TradingContext:
         for strategy, data in raw_strategy_buffers.items():
             if not isinstance(data, dict):
                 continue
-            parsed[strategy] = {
-                regime_key: float(val) for regime_key, val in data.items() if isinstance(val, (int, float))
-            }
+            parsed[strategy] = {}
+            for regime_key, value in data.items():
+                if isinstance(value, (int, float)):
+                    parsed[strategy][regime_key] = float(value)
         self.strategy_buffers = parsed
 
         self.last_updated = datetime.now(timezone.utc)

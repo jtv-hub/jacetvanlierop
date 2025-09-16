@@ -5,6 +5,8 @@ Evaluates signals using predefined strategies, executes mock trades,
 manages open positions, and checks exit conditions.
 """
 
+# pylint: disable=too-many-lines
+
 import datetime
 import json
 import os
@@ -155,17 +157,18 @@ class PositionManager:
                 history = [price_now] if price_now and price_now > 0 else []
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
                     if calculate_rsi is None:
-                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for " f"{trade_id}")
+                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
                     else:
                         rsi_val = calculate_rsi(
                             history,
                             CONFIG["rsi"]["period"],
                         )  # type: ignore[misc]
-                        exit_upper = CONFIG["rsi"].get("exit_upper", CONFIG["rsi"].get("upper", 70))
+                        rsi_cfg = CONFIG["rsi"]
+                        exit_upper = rsi_cfg.get("exit_upper", rsi_cfg.get("upper", 70))
                         if rsi_val is not None and rsi_val >= exit_upper:
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} " f"pair={pos['pair']} rsi={rsi_val:.2f}")
+                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} " f"rsi={rsi_val:.2f}")
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
@@ -493,10 +496,7 @@ def evaluate_signals_and_trade(
                 safe_prices = [p for p in safe_prices if p is not None]
                 # Pre-pair debug trace
                 print(f"[TEST] Generating signal for {pair} with {len(safe_prices)} valid candles")
-                try:
-                    last5 = safe_prices[-5:]
-                except Exception:
-                    last5 = safe_prices
+                last5 = safe_prices[-5:]
                 print(f"[DEBUG] {pair} prices: {last5} (last 5)")
 
                 # Pre-compute RSI for diagnostics/logging
@@ -504,7 +504,7 @@ def evaluate_signals_and_trade(
                 try:
                     if calculate_rsi is not None and len(safe_prices) >= int(rsi_period) + 1:
                         rsi_val = float(calculate_rsi(safe_prices, int(rsi_period)))
-                except Exception:
+                except (TypeError, ValueError):
                     rsi_val = None
                 # Skip if insufficient history
                 if len(safe_prices) < min_needed:
@@ -558,11 +558,12 @@ def evaluate_signals_and_trade(
                         )
                     except (ValueError, RuntimeError) as e:
                         log_path = "logs/anomalies.log"
+                        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
                         with open(log_path, "a", encoding="utf-8") as f:
                             f.write(
                                 json.dumps(
                                     {
-                                        "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
+                                        "timestamp": timestamp,
                                         "type": "Signal Error",
                                         "error": str(e),
                                         "strategy": strategy.__class__.__name__,
@@ -580,7 +581,7 @@ def evaluate_signals_and_trade(
                     print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
                     signal = signal_result.get("signal") or signal_result.get("side")
                     if not signal:
-                        print(f"[SKIP] No signal generated for {pair} — " f"strategy returned None or RSI failed")
+                        print(f"[SKIP] No signal generated for {pair} — " "strategy returned None or RSI failed")
                     confidence = float(signal_result.get("confidence", 0.0) or 0.0)
                     strategy_name = strategy.__class__.__name__
 
@@ -604,8 +605,8 @@ def evaluate_signals_and_trade(
                     if adx_val > 40.0:
                         before = confidence
                         confidence = min(1.0, confidence * 1.2)
-                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
-                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence={confidence:.3f}")
+                        print(f"[ADX] Boosted confidence {before:.3f} → " f"{confidence:.3f} (strong trend)")
+                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted " f"confidence={confidence:.3f}")
                 if confidence < 0.4:
                     skipped_low_conf += 1
                     print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
@@ -700,10 +701,11 @@ def evaluate_signals_and_trade(
                                     "a",
                                     encoding="utf-8",
                                 ) as f:
+                                    corr_timestamp = datetime.datetime.now(datetime.UTC).isoformat()
                                     f.write(
                                         json.dumps(
                                             {
-                                                "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
+                                                "timestamp": corr_timestamp,
                                                 "type": "correlation_block",
                                                 "asset": asset,
                                                 "other": other,
@@ -724,10 +726,11 @@ def evaluate_signals_and_trade(
                             encoding="utf-8",
                         ) as f:
                             for row in corr_rows:
+                                corr_timestamp = datetime.datetime.now(datetime.UTC).isoformat()
                                 f.write(
                                     json.dumps(
                                         {
-                                            "timestamp": (datetime.datetime.now(datetime.UTC).isoformat()),
+                                            "timestamp": corr_timestamp,
                                             "type": "correlation",
                                             **row,
                                         }

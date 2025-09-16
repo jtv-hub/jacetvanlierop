@@ -108,7 +108,10 @@ def _build_regime_buffer_profile(base_buffer: float, reinvestment_rate: float) -
     return profile
 
 
-def _build_composite_buffer_profile(regime_profile: Dict[str, float], reinvestment_rate: float) -> Dict[str, float]:
+def _build_composite_buffer_profile(
+    regime_profile: Dict[str, float],
+    reinvestment_rate: float,
+) -> Dict[str, float]:
     """Special-case buffer targets for the CompositeStrategy."""
 
     composite_profile: Dict[str, float] = {}
@@ -147,7 +150,7 @@ def save_state(state: Dict[str, Any]) -> None:
 
 def get_current_market_regime() -> str:
     """Placeholder hook for regime detection integration."""
-    # TODO: replace with real regime detection once available
+    # NOTE: replace with real regime detection once available
     return "trending"
 
 
@@ -170,12 +173,19 @@ def refresh_portfolio_state(
 
     inferred_regime = _infer_regime_from_trades(closed_trades)
 
+    dynamic_buffer = 0.35
     try:
-        from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer  # pylint: disable=import-outside-toplevel
+        # Imported lazily to avoid circular dependency during module import.
+        from crypto_trading_bot.risk import risk_manager  # pylint: disable=import-outside-toplevel
 
-        dynamic_buffer = float(get_dynamic_buffer())
-    except Exception:  # pragma: no cover - diagnostics only
-        dynamic_buffer = 0.35
+        candidate = risk_manager.get_dynamic_buffer()
+    except ImportError:  # pragma: no cover - diagnostics only
+        candidate = None
+    else:
+        try:
+            dynamic_buffer = float(candidate)
+        except (TypeError, ValueError):
+            dynamic_buffer = 0.35
 
     regime = inferred_regime if inferred_regime != "unknown" else get_current_market_regime()
     reinvestment_rate = calculate_reinvestment_rate(available_capital, regime)
@@ -186,12 +196,15 @@ def refresh_portfolio_state(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "available_capital": round(float(available_capital), 2),
         "reinvestment_rate": float(reinvestment_rate),
-        "last_close_date": most_recent_close.date().isoformat() if most_recent_close else None,
+        "last_close_date": (most_recent_close.date().isoformat() if most_recent_close else None),
         "market_regime": regime,
         "capital_buffer": dynamic_buffer,
         "regime_capital_buffers": regime_buffers,
         "strategy_buffers": {"CompositeStrategy": composite_buffers},
-        "active_composite_buffer": composite_buffers.get(regime, regime_buffers.get(regime, dynamic_buffer)),
+        "active_composite_buffer": composite_buffers.get(
+            regime,
+            regime_buffers.get(regime, dynamic_buffer),
+        ),
         "starting_balance": float(starting_balance),
         "closed_trade_count": len(closed_trades),
     }
