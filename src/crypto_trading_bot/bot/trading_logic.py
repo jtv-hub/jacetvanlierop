@@ -9,10 +9,12 @@ manages open positions, and checks exit conditions.
 
 import datetime
 import json
+import logging
 import os
 import random
 import time
 import uuid
+from typing import Any
 
 # Optional dependency for correlation checks
 try:
@@ -21,7 +23,7 @@ except ImportError:  # pragma: no cover - optional dependency
     np = None
 
 from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
-from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.utils.price_feed import get_current_price
@@ -49,13 +51,17 @@ from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
+logger = logging.getLogger(__name__)
+_live_block_logged = False
+_last_mode_label: str | None = None
+_auto_paused_reason: str | None = None
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
 
 TRADE_INTERVAL = 300
 MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
-ACCOUNT_SIZE = 100000
+PAPER_STARTING_BALANCE = float(CONFIG.get("paper_mode", {}).get("starting_balance", 100_000.0))
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
 # Real-time price feed imported above per lint ordering
@@ -65,6 +71,151 @@ SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
 
 # Removed hardcoded ASSETS list. Pairs are now centralized in CONFIG["tradable_pairs"].
+
+
+_last_capital_log: tuple[float | None, str | None] = (None, None)
+
+
+def _consecutive_losses(limit: int) -> int:
+    """Return the number of trailing consecutive losing trades."""
+
+    if limit <= 0:
+        return 0
+    if not os.path.exists(TRADES_LOG_PATH):
+        return 0
+
+    count = 0
+    try:
+        with open(TRADES_LOG_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return 0
+
+    for line in reversed(lines):
+        if count >= limit:
+            break
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (rec.get("status") or "").lower() != "closed":
+            continue
+        roi = rec.get("roi")
+        try:
+            roi_val = float(roi)
+        except (TypeError, ValueError):
+            continue
+        if roi_val < 0:
+            count += 1
+        else:
+            break
+
+    return count
+
+
+def _evaluate_auto_pause(state_snapshot: dict[str, Any] | None) -> tuple[bool, str | None]:
+    """Inspect configured auto-pause thresholds and return status."""
+
+    cfg = CONFIG.get("auto_pause", {})
+    drawdown_limit = float(cfg.get("max_drawdown_pct", 0.10) or 0.0)
+    roi_limit = float(cfg.get("max_total_roi_pct", -0.15) or 0.0)
+    loss_limit = int(cfg.get("max_consecutive_losses", 5) or 0)
+
+    state = state_snapshot or {}
+
+    try:
+        drawdown = float(state.get("drawdown_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        drawdown = 0.0
+
+    if drawdown_limit > 0 and drawdown >= drawdown_limit:
+        return True, f"Max drawdown {drawdown:.2%} ≥ limit {drawdown_limit:.2%}"
+
+    try:
+        total_roi = float(state.get("total_roi", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        total_roi = 0.0
+
+    if roi_limit < 0 and total_roi <= roi_limit:
+        return True, f"Total ROI {total_roi:.2%} ≤ limit {roi_limit:.2%}"
+
+    if loss_limit > 0:
+        streak = _consecutive_losses(loss_limit)
+        if streak >= loss_limit:
+            return True, f"{streak} consecutive losses ≥ limit {loss_limit}"
+
+    return False, None
+
+
+def _submit_live_trade(
+    *,
+    pair: str,
+    side: str,
+    size: float,
+    price: float,
+    strategy: str,
+    confidence: float,
+) -> bool:
+    """Submit an order to the live exchange when live trading is enabled.
+
+    Returns ``True`` if the attempt should proceed, ``False`` when blocked.
+    """
+
+    global _live_block_logged  # noqa: PLW0603  # module-level guard allows once-per-run warning
+
+    if not is_live:
+        if not _live_block_logged:
+            logger.warning(
+                "🚫 Live trade blocked — is_live=False | pair=%s side=%s size=%.6f"
+                " price=%.4f strategy=%s confidence=%.3f",
+                pair,
+                side,
+                size,
+                price,
+                strategy,
+                confidence,
+            )
+            _live_block_logged = True
+        else:
+            logger.debug(
+                "Live trade attempt blocked (paper mode) | pair=%s side=%s size=%.6f",
+                pair,
+                side,
+                size,
+            )
+        return False
+
+    logger.info(
+        "Submitting live trade | pair=%s side=%s size=%.6f price=%.4f strategy=%s confidence=%.3f",
+        pair,
+        side,
+        size,
+        price,
+        strategy,
+        confidence,
+    )
+
+    # TODO: Integrate with the exchange client here when ready for live mode.
+    return True
+
+
+def _log_capital(amount: float, source: str) -> None:
+    global _last_capital_log  # noqa: PLW0603
+
+    last_amount, last_source = _last_capital_log
+    if last_amount == amount and last_source == source:
+        return
+
+    logger.info(
+        "Active capital (%s): %s (source=%s)",
+        get_mode_label(),
+        f"${amount:,.2f}",
+        source,
+    )
+    _last_capital_log = (amount, source)
+
 
 mock_volume_data = {
     "BTC": [1500 for _ in range(100)],
@@ -328,6 +479,8 @@ def evaluate_signals_and_trade(
     except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
 
+    global _last_mode_label, _auto_paused_reason
+
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
     # Resolve the list of tradable pairs centrally (config-driven)
@@ -337,8 +490,14 @@ def evaluate_signals_and_trade(
         print("⚠️ No tradable_pairs configured; skipping evaluation.")
         return
 
-    state_snapshot = None
-    resolved_capital = None
+    mode_label = get_mode_label()
+    if mode_label != _last_mode_label:
+        logger.info("Trading mode: %s (is_live=%s)", mode_label, is_live)
+        _last_mode_label = mode_label
+
+    state_snapshot: dict | None = None
+    resolved_capital: float | None = None
+    capital_source = "manual_override"
     if available_capital is not None:
         try:
             resolved_capital = float(available_capital)
@@ -346,13 +505,40 @@ def evaluate_signals_and_trade(
             resolved_capital = None
 
     if resolved_capital is None or resolved_capital <= 0:
-        state_snapshot = load_portfolio_state(refresh=False)
-        resolved_capital = float(state_snapshot.get("available_capital", ACCOUNT_SIZE))
-    resolved_capital = max(resolved_capital, 0.0)
+        state_snapshot = load_portfolio_state(
+            refresh=is_live,
+            starting_balance=PAPER_STARTING_BALANCE,
+        )
+        resolved_capital = float(state_snapshot.get("available_capital", PAPER_STARTING_BALANCE))
+        capital_source = state_snapshot.get("capital_source", "portfolio_state")
+
+    if state_snapshot is None:
+        state_snapshot = load_portfolio_state(
+            refresh=is_live,
+            starting_balance=PAPER_STARTING_BALANCE,
+        )
+        capital_source = state_snapshot.get("capital_source", capital_source)
+        if resolved_capital is None or resolved_capital <= 0:
+            resolved_capital = float(state_snapshot.get("available_capital", PAPER_STARTING_BALANCE))
+
+    resolved_capital = max(resolved_capital or 0.0, 0.0)
+    _log_capital(resolved_capital, capital_source)
+
+    if not check_exits_only:
+        paused, reason = _evaluate_auto_pause(state_snapshot)
+        if paused:
+            if _auto_paused_reason != reason:
+                logger.error("[AUTO-PAUSE] %s", reason)
+                print(f"[AUTO-PAUSE] {reason}")
+            else:
+                logger.debug("Auto-pause active: %s", reason)
+            _auto_paused_reason = reason
+            return
+        if _auto_paused_reason is not None:
+            logger.info("Auto-pause cleared; resuming trade evaluation.")
+            _auto_paused_reason = None
 
     if reinvestment_rate is None:
-        if state_snapshot is None:
-            state_snapshot = load_portfolio_state(refresh=False)
         reinvestment_rate = float(state_snapshot.get("reinvestment_rate", 0.0))
 
     trade_risk_pct = 0.02 if risk_per_trade is None else max(float(risk_per_trade), 0.0)
@@ -749,6 +935,31 @@ def evaluate_signals_and_trade(
                 print("✅ Trades to execute:")
                 print(trade_data)
 
+                trade_side = signal
+                submitted_live = _submit_live_trade(
+                    pair=pair,
+                    side=trade_side,
+                    size=adjusted_size,
+                    price=float(current_price),
+                    strategy=strategy_name,
+                    confidence=confidence,
+                )
+
+                if is_live and not submitted_live:
+                    print(f"🚫 Live trade suppressed for {pair} — toggle is_live=False")
+                    continue
+
+                if not is_live:
+                    logger.debug(
+                        "Paper trade simulated | pair=%s side=%s size=%.6f price=%.4f strategy=%s confidence=%.3f",
+                        pair,
+                        trade_side,
+                        adjusted_size,
+                        float(current_price),
+                        strategy_name,
+                        confidence,
+                    )
+
                 # Daily trade limit check (re-evaluate per attempt)
                 if current_daily_cap > 0:
                     today_count = _today_trade_count()
@@ -835,8 +1046,8 @@ def evaluate_signals_and_trade(
             min_sz = float(cfg_sz.get("min", 0.001))
             max_sz = float(cfg_sz.get("max", 0.005))
             fallback_size, _, _ = _compute_position_sizing(
-                total_capital=total_capital if total_capital > 0 else ACCOUNT_SIZE,
-                remaining_capital=total_capital if total_capital > 0 else ACCOUNT_SIZE,
+                total_capital=total_capital if total_capital > 0 else PAPER_STARTING_BALANCE,
+                remaining_capital=total_capital if total_capital > 0 else PAPER_STARTING_BALANCE,
                 current_price=price,
                 confidence=confidence,
                 base_risk_pct=trade_risk_pct if trade_risk_pct > 0 else 0.02,

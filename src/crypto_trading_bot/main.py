@@ -8,6 +8,7 @@ import logging
 
 from crypto_trading_bot.bot.scheduler import run_scheduler
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
+from crypto_trading_bot.config import get_mode_label, is_live
 
 # Configure root logger for DEBUG output (ensures [RSI DEBUG] logs are visible)
 logging.basicConfig(level=logging.DEBUG)
@@ -35,6 +36,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    logging.info("Current trading mode: %s (is_live=%s)", get_mode_label(), is_live)
+    if not is_live:
+        logging.info("Paper mode active — live orders will be blocked.")
+    else:
+        logging.warning("🚨 Live trading enabled — orders will execute against real funds.")
 
     if args.mode == "once":
         print("⚡ Running one-off evaluation...")

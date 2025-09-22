@@ -9,17 +9,63 @@ pull a consistent view of capital.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from statistics import mean, pstdev
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from crypto_trading_bot.analytics.roi_calculator import compute_running_balance
+from crypto_trading_bot.bot.market_data import get_account_balance
 from crypto_trading_bot.bot.utils.reinvestment import calculate_reinvestment_rate
+from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
+
+logger = logging.getLogger(__name__)
 
 STATE_FILE = "data/portfolio_state.json"
 TRADES_LOG_PATH = "logs/trades.log"
-DEFAULT_STARTING_BALANCE = 100_000.0
+DEFAULT_STARTING_BALANCE = float(CONFIG.get("paper_mode", {}).get("starting_balance", 100_000.0))
+_last_logged_balance: Tuple[Optional[float], Optional[str]] = (None, None)
+
+
+def _format_currency(amount: float) -> str:
+    return f"${amount:,.2f}"
+
+
+def _log_detected_balance(amount: float, source: str) -> None:
+    global _last_logged_balance  # noqa: PLW0603 - track to avoid spam
+
+    last_amount, last_source = _last_logged_balance
+    if last_amount == amount and last_source == source:
+        return
+
+    logger.info(
+        "Detected capital (%s): %s (source=%s)",
+        get_mode_label(),
+        _format_currency(amount),
+        source,
+    )
+    _last_logged_balance = (amount, source)
+
+
+def _resolve_live_balance() -> Tuple[Optional[float], str]:
+    """Fetch live account balance if available."""
+
+    balance = get_account_balance(use_mock_for_paper=False)
+    if balance is None:
+        return None, "simulated"
+
+    try:
+        value = float(balance)
+    except (TypeError, ValueError):
+        logger.warning("Received non-numeric balance from get_account_balance: %s", balance)
+        return None, "simulated"
+
+    if value <= 0:
+        logger.warning("Live balance %.2f is non-positive; ignoring.", value)
+        return None, "simulated"
+
+    return value, "live_account"
 
 
 def _parse_timestamp(ts: str | None) -> datetime | None:
@@ -157,11 +203,54 @@ def get_current_market_regime() -> str:
 def refresh_portfolio_state(
     *,
     log_path: str = TRADES_LOG_PATH,
-    starting_balance: float = DEFAULT_STARTING_BALANCE,
+    starting_balance: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Recompute and persist the latest portfolio snapshot."""
+    prev_state = load_state()
     closed_trades = load_closed_trades(log_path)
-    available_capital = compute_running_balance(closed_trades, starting_balance)
+    effective_start = float(starting_balance) if starting_balance is not None else DEFAULT_STARTING_BALANCE
+    available_capital = compute_running_balance(closed_trades, effective_start)
+    capital_source = "paper_simulation"
+
+    if is_live:
+        live_balance, source = _resolve_live_balance()
+        if live_balance is not None:
+            available_capital = live_balance
+            capital_source = source
+        else:
+            logger.debug("Live balance unavailable; falling back to simulated capital.")
+
+    _log_detected_balance(available_capital, capital_source)
+
+    prev_peak = 0.0
+    prev_baseline = 0.0
+    if prev_state:
+        try:
+            prev_peak = float(prev_state.get("peak_capital", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            prev_peak = 0.0
+        try:
+            prev_baseline = float(prev_state.get("baseline_capital", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            prev_baseline = 0.0
+
+    peak_capital = max(prev_peak, available_capital)
+
+    if capital_source == "live_account":
+        if prev_state.get("capital_source") != "live_account" or prev_baseline <= 0:
+            baseline_capital = available_capital
+        else:
+            baseline_capital = prev_baseline
+    else:
+        baseline_capital = prev_baseline if prev_baseline > 0 else effective_start
+
+    drawdown_pct = 0.0
+    if peak_capital > 0:
+        drawdown_pct = max(0.0, (peak_capital - available_capital) / peak_capital)
+
+    total_roi = 0.0
+    if baseline_capital > 0:
+        total_roi = (available_capital / baseline_capital) - 1.0
 
     most_recent_close: datetime | None = None
     for trade in closed_trades:
@@ -205,8 +294,13 @@ def refresh_portfolio_state(
             regime,
             regime_buffers.get(regime, dynamic_buffer),
         ),
-        "starting_balance": float(starting_balance),
+        "starting_balance": float(baseline_capital if baseline_capital > 0 else effective_start),
         "closed_trade_count": len(closed_trades),
+        "capital_source": capital_source,
+        "peak_capital": peak_capital,
+        "baseline_capital": baseline_capital if baseline_capital > 0 else effective_start,
+        "drawdown_pct": round(drawdown_pct, 6),
+        "total_roi": round(total_roi, 6),
     }
     save_state(snapshot)
     return snapshot
@@ -216,7 +310,7 @@ def load_portfolio_state(
     *,
     refresh: bool = False,
     log_path: str = TRADES_LOG_PATH,
-    starting_balance: float = DEFAULT_STARTING_BALANCE,
+    starting_balance: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Load the portfolio state, recomputing it if requested or missing."""
     if refresh:
@@ -232,7 +326,7 @@ def get_reinvestment_rate(
     *,
     refresh: bool = False,
     log_path: str = TRADES_LOG_PATH,
-    starting_balance: float = DEFAULT_STARTING_BALANCE,
+    starting_balance: Optional[float] = None,
 ) -> float:
     """Convenience accessor for the current reinvestment rate."""
     state = load_portfolio_state(
