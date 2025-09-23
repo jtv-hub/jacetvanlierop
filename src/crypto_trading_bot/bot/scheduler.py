@@ -16,7 +16,10 @@ from crypto_trading_bot.bot.state.portfolio_state import (
     refresh_portfolio_state,
 )
 from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.bot.utils.log_rotation import (
+    get_anomalies_logger,
+    get_rotating_handler,
+)
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
@@ -39,6 +42,8 @@ DAILY_TASK_HOUR = 0  # Midnight UTC
 DAILY_TASK_MINUTE = 5  # Buffer to ensure market data is updated
 ANOMALY_AUDIT_INTERVAL = 6 * 60 * 60  # 6 hours in seconds
 ALERTS_LOG_PATH = "logs/alerts.log"
+
+anomalies_logger = get_anomalies_logger()
 
 
 def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
@@ -149,8 +154,19 @@ def run_daily_pipeline() -> None:
         print("✅ Optimization suggestions complete.")
 
         print("🧪 Running shadow test evaluation...")
-        run_shadow_tests()
-        print("📄 Shadow test results saved to shadow_test_results.jsonl.")
+        try:
+            run_shadow_tests(output_file="logs/shadow_test_results.jsonl")
+            print("📄 Shadow test results saved to logs/shadow_test_results.jsonl.")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            error_payload = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "module": "scheduler.run_daily_pipeline",
+                "action": "run_shadow_tests",
+                "message": "Shadow tests execution failed",
+                "error": str(exc),
+            }
+            anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
+            print(f"[Scheduler] run_shadow_tests failed: {exc}")
     else:
         print("⚠️ No top configurations found for suggestion. Skipping shadow tests.")
 
@@ -158,8 +174,16 @@ def run_daily_pipeline() -> None:
     try:
         wrote = run_learning_machine()
         print(f"✍️  Learning suggestions written: {wrote}")
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        print(f"[Scheduler] run_learning_machine failed: {e}")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        error_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "module": "scheduler.run_daily_pipeline",
+            "action": "run_learning_machine",
+            "message": "Learning machine execution failed",
+            "error": str(exc),
+        }
+        anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
+        print(f"[Scheduler] run_learning_machine failed: {exc}")
 
     metrics = run_learning_cycle()
     print("📊 Learning Summary:", metrics)
@@ -223,8 +247,16 @@ def run_scheduler():
         wrote_boot = run_learning_machine()
         if wrote_boot:
             print(f"✍️  Boot suggestions written: {wrote_boot}")
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        print(f"[Scheduler] Initial run_learning_machine failed: {e}")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        error_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "module": "scheduler.run_scheduler",
+            "action": "run_learning_machine_initial",
+            "message": "Initial learning machine execution failed",
+            "error": str(exc),
+        }
+        anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
+        print(f"[Scheduler] Initial run_learning_machine failed: {exc}")
 
     while True:
         try:
