@@ -4,7 +4,7 @@ from __future__ import annotations
 
 is_live: bool = False  # Set to True ONLY when ready for live trading
 
-LIVE_MODE_LABEL = "\U0001F6A8 LIVE MODE \U0001F6A8"
+LIVE_MODE_LABEL = "\U0001f6a8 LIVE MODE \U0001f6a8"
 PAPER_MODE_LABEL = "PAPER MODE"
 
 

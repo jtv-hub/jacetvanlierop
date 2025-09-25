@@ -19,12 +19,16 @@ logger = logging.getLogger("post_wiring_check")
 
 
 def mask(value: str) -> str:
+    """Return a masked preview of a sensitive string."""
+
     if not value:
         return "***"
     return value[:6] + "***"
 
 
 def main() -> int:
+    """Run a lightweight credential and order validation workflow."""
+
     key_origin = CONFIG.get("_kraken_key_origin", "unknown")
     secret_origin = CONFIG.get("_kraken_secret_origin", "unknown")
     logger.info(

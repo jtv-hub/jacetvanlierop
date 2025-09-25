@@ -14,6 +14,7 @@ import os
 import random
 import time
 import uuid
+from decimal import ROUND_DOWN, Decimal, getcontext
 from typing import Any
 
 # Optional dependency for correlation checks
@@ -29,6 +30,7 @@ from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
     KrakenAuthError,
+    kraken_get_asset_pair_meta,
     kraken_place_order,
 )
 from crypto_trading_bot.utils.price_feed import get_current_price
@@ -81,6 +83,8 @@ SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 _last_capital_log: tuple[float | None, str | None] = (None, None)
 _KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
 _KRAKEN_FAILURE_PAUSE_SECONDS = 60.0
+
+getcontext().prec = 18
 
 
 def _consecutive_losses(limit: int) -> int:
@@ -218,22 +222,60 @@ def _submit_live_trade(
     tif = kraken_cfg.get("time_in_force") or None
     validate_flag = bool(kraken_cfg.get("validate_orders", False))
 
-    attempted_cost: float | None = None
-    if isinstance(price, (int, float)):
-        attempted_cost = float(price) * float(size)
-
     min_cost_default = float(CONFIG.get("kraken_min_cost_threshold", kraken_cfg.get("min_cost_threshold", 0.5)))
     min_cost_by_pair = kraken_cfg.get("pair_cost_minimums", {}) or {}
-    pair_threshold = float(min_cost_by_pair.get(pair, min_cost_default))
-    if attempted_cost is not None and attempted_cost < pair_threshold:
-        logger.warning(
-            "Skipping live order: cost below minimum | pair=%s side=%s attempted_cost=%.6f threshold=%.6f",
+    config_cost_threshold = float(min_cost_by_pair.get(pair, min_cost_default))
+
+    try:
+        pair_meta = kraken_get_asset_pair_meta(pair)
+    except KrakenAPIError as exc:
+        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        logger.error(
+            "Failed to fetch Kraken pair metadata; pausing live trading for %.0fs | pair=%s error=%s",
+            _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
-            side,
-            attempted_cost,
-            pair_threshold,
+            exc,
         )
         return False
+
+    min_volume = float(pair_meta.get("ordermin", 0.0) or 0.0)
+    metadata_cost_threshold = float(pair_meta.get("costmin", 0.0) or 0.0)
+    price_decimals = int(pair_meta.get("pair_decimals", 5) or 5)
+    volume_decimals = int(pair_meta.get("lot_decimals", 8) or 8)
+
+    price_step = Decimal("1").scaleb(-price_decimals)
+    volume_step = Decimal("1").scaleb(-volume_decimals)
+
+    price_dec = Decimal(str(price)).quantize(price_step, rounding=ROUND_DOWN)
+    size_dec = Decimal(str(size)).quantize(volume_step, rounding=ROUND_DOWN)
+
+    min_volume_dec = Decimal(str(min_volume)) if min_volume else Decimal("0")
+    if min_volume and size_dec < min_volume_dec:
+        logger.warning(
+            "Skipping live order: volume below minimum | pair=%s side=%s size=%.10f min_volume=%.10f",
+            pair,
+            side,
+            float(size_dec),
+            min_volume,
+        )
+        return False
+
+    attempted_cost_dec = price_dec * size_dec
+    effective_cost_threshold = max(metadata_cost_threshold, config_cost_threshold)
+    min_cost_dec = Decimal(str(effective_cost_threshold)) if effective_cost_threshold else Decimal("0")
+    if effective_cost_threshold and attempted_cost_dec < min_cost_dec:
+        logger.warning(
+            "Skipping live order: cost below minimum | pair=%s side=%s attempted_cost=%.10f threshold=%.10f",
+            pair,
+            side,
+            float(attempted_cost_dec),
+            effective_cost_threshold,
+        )
+        return False
+
+    price = float(price_dec)
+    size = float(size_dec)
+    attempted_cost = float(attempted_cost_dec)
 
     try:
         response = kraken_place_order(
@@ -243,7 +285,7 @@ def _submit_live_trade(
             price,
             time_in_force=tif,
             validate=validate_flag,
-            min_cost_threshold=pair_threshold,
+            min_cost_threshold=effective_cost_threshold,
         )
     except (KrakenAuthError, KrakenAPIError) as exc:
         _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
@@ -280,16 +322,38 @@ def _submit_live_trade(
         response_code = response.get("code")
         response_error = response.get("error")
         response_cost = response.get("attempted_cost", attempted_cost)
-        response_threshold = response.get("threshold", pair_threshold)
+        response_threshold = response.get("threshold", effective_cost_threshold)
         if response_code == "cost_minimum_not_met":
             _KRAKEN_FAILURE_PAUSE_UNTIL = None
             logger.warning(
-                "Kraken cost minimum not met; skipping trade | pair=%s side=%s attempted_cost=%.6f threshold=%.6f error=%s",
+                "Kraken cost minimum not met; skipping trade | pair=%s side=%s "
+                "attempted_cost=%.6f threshold=%.6f error=%s",
                 pair,
                 side,
                 float(response_cost or 0.0),
-                float(response_threshold or pair_threshold),
+                float(response_threshold or effective_cost_threshold),
                 response_error,
+            )
+            return False
+
+        if response_code == "volume_minimum_not_met":
+            _KRAKEN_FAILURE_PAUSE_UNTIL = None
+            logger.warning(
+                "Kraken volume minimum not met; skipping trade | pair=%s side=%s size=%.6f min_volume=%.6f error=%s",
+                pair,
+                side,
+                size,
+                float(pair_meta.get("ordermin", min_volume)),
+                response_error,
+            )
+            return False
+
+        if response_code == "rate_limit":
+            _KRAKEN_FAILURE_PAUSE_UNTIL = now + 90.0
+            logger.error(
+                "Kraken rate limit encountered; pausing live trading for 90s | pair=%s side=%s",
+                pair,
+                side,
             )
             return False
 

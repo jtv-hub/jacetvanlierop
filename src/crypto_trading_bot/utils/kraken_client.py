@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - optional dependency
     _HAVE_REQUESTS = False
 
 try:  # pragma: no cover - optional dependency
-    import httpx
+    import httpx  # type: ignore[import-not-found]
 
     _HAVE_HTTPX = True
 except ImportError:  # pragma: no cover - optional dependency
@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 _API_BASE = "https://api.kraken.com"
 _PRIVATE_PREFIX = "/0/private/"
+_PUBLIC_PREFIX = "/0/public/"
 _USER_AGENT = "crypto-trading-bot/1.0 (Kraken private client)"
 
 # Kraken sometimes prefixes assets with X/Z on the private balance endpoint.
@@ -57,6 +58,14 @@ _ASSET_HINTS: Dict[str, Iterable[str]] = {
     "LINK": ("LINK",),
     "XRP": ("XXRP", "XRP"),
 }
+
+
+_PAIR_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_PAIR_CACHE_TTL = 300.0
+
+
+def _invalidate_pair_cache() -> None:
+    _PAIR_CACHE.clear()
 
 
 class KrakenAPIError(RuntimeError):
@@ -78,7 +87,7 @@ def _get_credentials() -> tuple[str, str]:
     key_origin = CONFIG.get("_kraken_key_origin", "unknown")
     secret_origin = CONFIG.get("_kraken_secret_origin", "unknown")
     logger.debug(
-        "Kraken credentials sanitised | key_prefix=%s key_length=%d key_origin=%s secret_length=%d secret_origin=%s",
+        "Kraken credentials sanitised | key_prefix=%s key_length=%d key_origin=%s " "secret_length=%d secret_origin=%s",
         (key[:6] + "***") if len(key) >= 6 else "***",
         len(key),
         key_origin,
@@ -97,7 +106,12 @@ def _get_credentials() -> tuple[str, str]:
 def _decode_secret(secret: str) -> bytes:
     """Decode the Kraken secret, adding padding and validating base64."""
 
-    normalized = _sanitize_base64_secret(secret or "")
+    try:
+        normalized = _sanitize_base64_secret(secret or "", strict=True)
+    except ValueError as exc:
+        logger.error("Kraken secret sanitization failed: %s", exc)
+        raise KrakenAuthError("Invalid Kraken API secret / malformed base64") from exc
+
     if not normalized:
         raise KrakenAuthError("Kraken API secret missing.")
 
@@ -193,6 +207,44 @@ def _http_post(url: str, data: str, headers: Dict[str, str], timeout: float) -> 
     raise KrakenAPIError("No HTTP client available. Install 'requests' or 'httpx'.")
 
 
+def _http_public(
+    endpoint: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Perform an HTTP GET against Kraken's public REST API."""
+
+    url = f"{_API_BASE}{_PUBLIC_PREFIX}{endpoint}"
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    if _HAVE_REQUESTS and requests is not None:
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except (  # type: ignore[attr-defined]
+            requests.exceptions.RequestException,
+            ValueError,
+            TypeError,
+        ) as exc:
+            raise KrakenAPIError(f"HTTP GET failed: {exc}") from exc
+
+    if _HAVE_HTTPX and httpx is not None:
+        try:
+            with httpx.Client(timeout=timeout, headers=headers) as client:
+                response = client.get(url, params=params)
+                response.raise_for_status()
+                return response.json()
+        except (httpx.HTTPError, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+            raise KrakenAPIError(f"HTTP GET failed: {exc}") from exc
+
+    raise KrakenAPIError("No HTTP client available for public requests. Install 'requests' or 'httpx'.")
+
+
 def _standard_response(
     base: Dict[str, Any],
     *,
@@ -237,7 +289,7 @@ def _private_request(
         }
 
     try:
-        secret_for_log = _decode_secret(api_secret)
+        secret_bytes = _decode_secret(api_secret)
     except KrakenAuthError as exc:
         logger.error("Kraken secret validation error: %s", exc)
         return {
@@ -294,7 +346,7 @@ def _private_request(
                 url_path,
                 _redact_nonce(postdata),
                 attempt,
-                len(secret_for_log),
+                len(secret_bytes),
             )
             http_response = _http_post(url, postdata, headers, timeout)
         except KrakenAPIError as exc:
@@ -335,8 +387,14 @@ def _private_request(
             error_list = errors if isinstance(errors, list) else [str(errors)]
             combined_error = "; ".join(error_list)
             code = "api"
-            if any("EOrder:Cost minimum not met" in err for err in error_list):
+            normalized_errors = [err.lower() for err in error_list]
+            if any("cost minimum not met" in err for err in normalized_errors):
                 code = "cost_minimum_not_met"
+            elif any("order minimum not met" in err or "invalid arguments:volume" in err for err in normalized_errors):
+                code = "volume_minimum_not_met"
+            elif any("rate limit" in err for err in normalized_errors):
+                code = "rate_limit"
+                _invalidate_pair_cache()
             logger.error(
                 "Kraken API error payload on %s: %s (code=%s)",
                 endpoint,
@@ -429,6 +487,55 @@ def kraken_get_balance(asset: str = "USDC") -> Dict[str, Any]:
     return response
 
 
+def kraken_get_asset_pair_meta(pair: str) -> Dict[str, Any]:
+    """Return Kraken asset pair metadata including order and cost minimums."""
+
+    normalized = _normalize_pair(pair)
+    now = time.monotonic()
+    cached = _PAIR_CACHE.get(normalized)
+    if cached and now - cached[0] < _PAIR_CACHE_TTL:
+        return dict(cached[1])
+
+    payload = _http_public("AssetPairs", {"pair": normalized})
+    errors = payload.get("error")
+    if errors:
+        raise KrakenAPIError(f"AssetPairs error for {pair}: {errors}")
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise KrakenAPIError(f"Invalid AssetPairs payload for {pair}")
+
+    meta = result.get(normalized)
+    if not isinstance(meta, dict):
+        raise KrakenAPIError(f"Asset metadata missing for pair {pair}")
+
+    try:
+        ordermin = float(meta.get("ordermin", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ordermin = 0.0
+    try:
+        costmin = float(meta.get("costmin", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        costmin = 0.0
+    try:
+        price_decimals = int(meta.get("pair_decimals", 5) or 5)
+    except (TypeError, ValueError):
+        price_decimals = 5
+    try:
+        lot_decimals = int(meta.get("lot_decimals", 8) or 8)
+    except (TypeError, ValueError):
+        lot_decimals = 8
+
+    meta_payload = {
+        "ordermin": ordermin,
+        "costmin": costmin,
+        "pair_decimals": price_decimals,
+        "lot_decimals": lot_decimals,
+    }
+    _PAIR_CACHE[normalized] = (now, meta_payload)
+    return dict(meta_payload)
+
+
 def kraken_place_order(
     pair: str,
     side: str,
@@ -464,6 +571,46 @@ def kraken_place_order(
             attempted_cost = round(float(price) * float(size), 8)
         except (TypeError, ValueError):  # defensive only
             attempted_cost = None
+
+    threshold_value = float(min_cost_threshold) if min_cost_threshold is not None else None
+
+    def _auth_failure(message: str) -> Dict[str, Any]:
+        response: Dict[str, Any] = {
+            "ok": False,
+            "code": "auth",
+            "error": message,
+            "pair": pair,
+            "side": order_side,
+            "endpoint": "AddOrder",
+            "txid": None,
+            "descr": None,
+            "attempted_cost": attempted_cost,
+            "threshold": threshold_value,
+            "raw": None,
+            "errors": None,
+        }
+        return response
+
+    try:
+        _, candidate_secret = _get_credentials()
+    except KrakenAuthError as exc:
+        logger.error(
+            "Kraken order credential error | pair=%s side=%s error=%s",
+            pair,
+            order_side,
+            exc,
+        )
+        return _auth_failure(str(exc))
+
+    try:
+        _decode_secret(candidate_secret)
+    except KrakenAuthError:
+        logger.error(
+            "Kraken order secret decode failed | pair=%s side=%s",
+            pair,
+            order_side,
+        )
+        return _auth_failure("Invalid Kraken API secret / malformed base64")
 
     if resolved_ordertype != "market":
         if price is None:
@@ -506,8 +653,7 @@ def kraken_place_order(
         response["side"] = order_side
         if attempted_cost is not None:
             response.setdefault("attempted_cost", attempted_cost)
-        if min_cost_threshold is not None:
-            response.setdefault("threshold", float(min_cost_threshold))
+        response.setdefault("threshold", threshold_value)
         if response.get("code") == "cost_minimum_not_met" and attempted_cost is not None:
             logger.warning(
                 "Kraken cost minimum not met | pair=%s side=%s attempted_cost=%.8f",
@@ -532,8 +678,7 @@ def kraken_place_order(
     response["txid"] = txid
     response["descr"] = order_descr
     response.setdefault("attempted_cost", attempted_cost)
-    if min_cost_threshold is not None:
-        response.setdefault("threshold", float(min_cost_threshold))
+    response.setdefault("threshold", threshold_value)
     response["pair"] = pair
     response["side"] = order_side
     response["error"] = None
@@ -589,6 +734,7 @@ __all__ = [
     "KrakenAPIError",
     "KrakenAuthError",
     "kraken_get_balance",
+    "kraken_get_asset_pair_meta",
     "kraken_place_order",
     "kraken_cancel_order",
     "kraken_open_orders",

@@ -10,7 +10,6 @@ import base64
 import binascii
 import logging
 import os
-import re
 from typing import Tuple
 
 from dotenv import dotenv_values, load_dotenv
@@ -44,15 +43,53 @@ def _read_env_trimmed(name: str) -> str:
     return _sanitize_value(os.getenv(name) or "")
 
 
-def _sanitize_base64_secret(secret: str) -> str:
-    """Sanitize and pad base64 secrets while preserving only valid characters."""
+_BASE64_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+
+
+def _sanitize_base64_secret(secret: str, *, strict: bool = False) -> str:
+    """Sanitize base64 secrets, optionally failing on invalid characters.
+
+    When ``strict`` is ``True`` any character outside the base64 alphabet is
+    treated as an error so callers can fail fast instead of attempting to
+    "repair" credentials. The non-strict mode keeps the previous behaviour of
+    stripping invalid characters (useful for diagnostics) and attempts to pad
+    the result so downstream code can emit clearer error messages.
+    """
 
     cleaned = _sanitize_value(secret)
-    cleaned = re.sub(r"[^A-Za-z0-9+/=]", "", cleaned)
-    padding = (-len(cleaned)) % 4
+    if not cleaned:
+        return ""
+
+    trimmed = cleaned.strip()
+    removed_any = False
+    # Count how many invalid characters were present at the end so we can
+    # optionally add visible padding in non-strict diagnostic mode.
+    trailing_invalid = 0
+    for ch in reversed(trimmed):
+        if ch in _BASE64_ALLOWED:
+            break
+        trailing_invalid += 1
+
+    sanitized_chars = []
+    for ch in trimmed:
+        if ch in _BASE64_ALLOWED:
+            sanitized_chars.append(ch)
+        else:
+            removed_any = True
+
+    sanitized = "".join(sanitized_chars)
+
+    if strict and removed_any:
+        raise ValueError("Invalid characters detected in Kraken API secret.")
+
+    padding = (-len(sanitized)) % 4
     if padding:
-        cleaned += "=" * padding
-    return cleaned
+        sanitized += "=" * padding
+
+    if not strict and removed_any and trailing_invalid and not sanitized.endswith("="):
+        sanitized += "=" * min(trailing_invalid, 2)
+
+    return sanitized.strip()
 
 
 def _validate_credentials() -> Tuple[str, str]:
@@ -74,17 +111,31 @@ def _validate_credentials() -> Tuple[str, str]:
     secret_raw = env_secret or file_secret or _sanitize_value(CONFIG.get("kraken_api_secret") or "")
 
     if not key:
-        raise ConfigurationError("Kraken API key must be provided for live mode.")
+        message = "Kraken API key/secret missing for live mode."
+        logger.error(message)
+        raise ConfigurationError(message)
 
-    secret = _sanitize_base64_secret(secret_raw)
+    try:
+        secret = _sanitize_base64_secret(secret_raw, strict=True)
+    except ValueError as exc:
+        logger.error(
+            "Kraken API secret is not valid base64 (failed base64 sanitization): %s",
+            exc,
+        )
+        raise ConfigurationError("Kraken API secret is not valid base64.") from exc
 
     if not secret:
-        raise ConfigurationError("Kraken API secret must be provided for live mode.")
+        message = "Kraken API secret must be provided for live mode."
+        logger.error(message)
+        raise ConfigurationError(message)
 
     try:
         base64.b64decode(secret, validate=True)
     except (binascii.Error, ValueError) as exc:
-        logger.error("Kraken API secret failed base64 validation: %s", exc)
+        logger.error(
+            "Kraken API secret is not valid base64 (failed base64 decode): %s",
+            exc,
+        )
         raise ConfigurationError("Kraken API secret is not valid base64.") from exc
 
     CONFIG["_kraken_key_origin"] = key_source
@@ -101,7 +152,8 @@ def _validate_credentials() -> Tuple[str, str]:
         logger.warning("Kraken API secret length unexpected: %d", len(secret))
 
     logger.debug(
-        "Kraken credentials validated | key_prefix=%s key_length=%d secret_prefix=%s secret_length=%d key_source=%s secret_source=%s",
+        "Kraken credentials validated | key_prefix=%s key_length=%d "
+        "secret_prefix=%s secret_length=%d key_source=%s secret_source=%s",
         key_preview,
         len(key),
         secret_preview,
@@ -115,10 +167,13 @@ def _validate_credentials() -> Tuple[str, str]:
 def set_live_mode(flag: bool) -> None:
     """Set the global live-trading toggle with credential validation."""
 
-    global is_live  # noqa: PLW0603 - intentional shared toggle
     if flag:
-        _validate_credentials()
-    is_live = bool(flag)
+        try:
+            _validate_credentials()
+        except ConfigurationError as exc:
+            logger.error("Kraken API key/secret validation failed: %s", exc)
+            raise
+    globals()["is_live"] = bool(flag)
 
 
 def get_mode_label() -> str:
@@ -241,8 +296,8 @@ if logger.isEnabledFor(logging.DEBUG):
 
 _env_live_flag = os.getenv("CRYPTO_TRADING_BOT_LIVE")
 if _env_live_flag is not None:
-    normalized = _env_live_flag.strip().lower()
-    set_live_mode(normalized in {"1", "true", "yes", "on"})
+    live_flag_normalized = _env_live_flag.strip().lower()
+    set_live_mode(live_flag_normalized in {"1", "true", "yes", "on"})
 
     if logger.isEnabledFor(logging.INFO):
         logger.info("Live trading mode overridden by env: %s -> %s", _env_live_flag, is_live)
