@@ -12,13 +12,18 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from importlib import import_module
-from typing import Optional
+from typing import Callable, Optional
 
 from crypto_trading_bot.config import CONFIG, is_live
 from crypto_trading_bot.ledger.trade_ledger import system_logger
+from crypto_trading_bot.utils.kraken_client import kraken_get_balance
 from crypto_trading_bot.utils.price_feed import get_current_price
 
 logger = system_logger.getChild("market_data")
+
+
+class BalanceFetchError(RuntimeError):
+    """Raised when no reliable balance source is available."""
 
 
 def get_market_snapshot(trading_pair: str) -> Optional[dict]:
@@ -38,7 +43,7 @@ def get_market_snapshot(trading_pair: str) -> Optional[dict]:
     }
 
 
-def _load_balance_provider() -> Optional[callable]:
+def _load_balance_provider() -> Optional[Callable[[], float]]:
     """Return a configured balance provider callable, if any."""
 
     provider_path = CONFIG.get("live_mode", {}).get("balance_provider")
@@ -78,7 +83,17 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
     paper_balance = float(CONFIG.get("paper_mode", {}).get("starting_balance", 100_000.0))
 
     if not is_live:
-        return paper_balance if use_mock_for_paper else None
+        if not use_mock_for_paper:
+            logger.warning(
+                "Balance branch=paper-mode override use_mock=False value=%.2f",
+                paper_balance,
+            )
+        else:
+            logger.info(
+                "Balance branch=paper-mode source=config value=%.2f",
+                paper_balance,
+            )
+        return paper_balance
 
     provider = _load_balance_provider()
     if provider is not None:
@@ -93,8 +108,36 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
                 logger.warning("Provider returned non-numeric balance: %s", balance)
             else:
                 if value >= 0:
-                    logger.debug("Live balance fetched via provider: %.2f", value)
+                    provider_name = getattr(provider, "__name__", provider.__class__.__name__)
+                    logger.info(
+                        "Balance branch=provider source=%s value=%.2f",
+                        provider_name,
+                        value,
+                    )
                     return value
+
+    kraken_asset = (CONFIG.get("kraken", {}) or {}).get("balance_asset", "USDC")
+    response = kraken_get_balance(kraken_asset)
+    if response.get("ok"):
+        value = float(response.get("balance", 0.0))
+        logger.info(
+            "Balance branch=kraken-live asset=%s value=%.8f",
+            kraken_asset,
+            value,
+        )
+        return value
+
+    error_detail = response.get("error") or "unknown kraken balance error"
+    if response.get("code") == "auth":
+        message = f"Kraken authentication error: {error_detail}"
+        logger.error("Balance branch=kraken-live auth-error=%s", message)
+        raise BalanceFetchError(message)
+
+    logger.error(
+        "Balance branch=kraken-live error=%s raw=%s",
+        error_detail,
+        response.get("raw"),
+    )
 
     env_var = CONFIG.get("live_mode", {}).get("balance_env_var") or "CRYPTO_TRADING_BOT_LIVE_BALANCE"
     env_value = os.getenv(env_var)
@@ -102,7 +145,11 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
         try:
             parsed = float(env_value)
             if parsed >= 0:
-                logger.debug("Live balance resolved from %s env var.", env_var)
+                logger.warning(
+                    "Balance branch=env source=%s value=%.2f (fallback)",
+                    env_var,
+                    parsed,
+                )
                 return parsed
         except ValueError:
             logger.warning("Environment balance value %s is not numeric.", env_value)
@@ -114,8 +161,12 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
         fallback_val = None
 
     if fallback_val is not None and fallback_val > 0:
-        logger.debug("Using configured live balance fallback: %.2f", fallback_val)
+        logger.warning(
+            "Balance branch=config-fallback value=%.2f",
+            fallback_val,
+        )
         return fallback_val
 
-    logger.warning("Live balance unavailable; returning None.")
-    return None
+    message = "Live balance unavailable after all fallbacks."
+    logger.error("Balance branch=error error=%s", message)
+    raise BalanceFetchError(message)

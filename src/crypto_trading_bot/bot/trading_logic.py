@@ -26,6 +26,11 @@ from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
 from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.kraken_client import (
+    KrakenAPIError,
+    KrakenAuthError,
+    kraken_place_order,
+)
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import (
     append_live_price,
@@ -74,6 +79,8 @@ SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 
 
 _last_capital_log: tuple[float | None, str | None] = (None, None)
+_KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
+_KRAKEN_FAILURE_PAUSE_SECONDS = 60.0
 
 
 def _consecutive_losses(limit: int) -> int:
@@ -163,7 +170,7 @@ def _submit_live_trade(
     Returns ``True`` if the attempt should proceed, ``False`` when blocked.
     """
 
-    global _live_block_logged  # noqa: PLW0603  # module-level guard allows once-per-run warning
+    global _live_block_logged, _KRAKEN_FAILURE_PAUSE_UNTIL  # noqa: PLW0603
 
     if not is_live:
         if not _live_block_logged:
@@ -187,6 +194,16 @@ def _submit_live_trade(
             )
         return False
 
+    now = time.monotonic()
+    if _KRAKEN_FAILURE_PAUSE_UNTIL is not None and now < _KRAKEN_FAILURE_PAUSE_UNTIL:
+        pause_remaining = _KRAKEN_FAILURE_PAUSE_UNTIL - now
+        logger.error(
+            "Kraken trading paused (%.1fs remaining) due to earlier error; skipping %s",
+            pause_remaining,
+            pair,
+        )
+        return False
+
     logger.info(
         "Submitting live trade | pair=%s side=%s size=%.6f price=%.4f strategy=%s confidence=%.3f",
         pair,
@@ -197,7 +214,114 @@ def _submit_live_trade(
         confidence,
     )
 
-    # TODO: Integrate with the exchange client here when ready for live mode.
+    kraken_cfg = CONFIG.get("kraken", {}) or {}
+    tif = kraken_cfg.get("time_in_force") or None
+    validate_flag = bool(kraken_cfg.get("validate_orders", False))
+
+    attempted_cost: float | None = None
+    if isinstance(price, (int, float)):
+        attempted_cost = float(price) * float(size)
+
+    min_cost_default = float(CONFIG.get("kraken_min_cost_threshold", kraken_cfg.get("min_cost_threshold", 0.5)))
+    min_cost_by_pair = kraken_cfg.get("pair_cost_minimums", {}) or {}
+    pair_threshold = float(min_cost_by_pair.get(pair, min_cost_default))
+    if attempted_cost is not None and attempted_cost < pair_threshold:
+        logger.warning(
+            "Skipping live order: cost below minimum | pair=%s side=%s attempted_cost=%.6f threshold=%.6f",
+            pair,
+            side,
+            attempted_cost,
+            pair_threshold,
+        )
+        return False
+
+    try:
+        response = kraken_place_order(
+            pair,
+            side,
+            size,
+            price,
+            time_in_force=tif,
+            validate=validate_flag,
+            min_cost_threshold=pair_threshold,
+        )
+    except (KrakenAuthError, KrakenAPIError) as exc:
+        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        logger.error(
+            "Kraken order submission exception; pausing live trading for %.0fs | pair=%s side=%s error=%s",
+            _KRAKEN_FAILURE_PAUSE_SECONDS,
+            pair,
+            side,
+            exc,
+        )
+        return False
+    except Exception:  # pylint: disable=broad-exception-caught
+        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        logger.exception(
+            "Unexpected Kraken order exception; pausing live trading for %.0fs | pair=%s side=%s",
+            _KRAKEN_FAILURE_PAUSE_SECONDS,
+            pair,
+            side,
+        )
+        return False
+
+    if not isinstance(response, dict):
+        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        logger.error(
+            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s error=%s",
+            _KRAKEN_FAILURE_PAUSE_SECONDS,
+            pair,
+            side,
+            response,
+        )
+        return False
+
+    if not response.get("ok"):
+        response_code = response.get("code")
+        response_error = response.get("error")
+        response_cost = response.get("attempted_cost", attempted_cost)
+        response_threshold = response.get("threshold", pair_threshold)
+        if response_code == "cost_minimum_not_met":
+            _KRAKEN_FAILURE_PAUSE_UNTIL = None
+            logger.warning(
+                "Kraken cost minimum not met; skipping trade | pair=%s side=%s attempted_cost=%.6f threshold=%.6f error=%s",
+                pair,
+                side,
+                float(response_cost or 0.0),
+                float(response_threshold or pair_threshold),
+                response_error,
+            )
+            return False
+
+        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        logger.error(
+            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s error=%s code=%s",
+            _KRAKEN_FAILURE_PAUSE_SECONDS,
+            pair,
+            side,
+            response_error,
+            response_code,
+        )
+        return False
+
+    _KRAKEN_FAILURE_PAUSE_UNTIL = None
+
+    txid = response.get("txid")
+    if isinstance(txid, list) and txid:
+        txid_repr = txid[0]
+    else:
+        txid_repr = txid
+    descr = response.get("descr")
+
+    logger.info(
+        "Kraken live order acknowledged | pair=%s side=%s size=%.6f price=%s txid=%s descr=%s",
+        pair,
+        side,
+        size,
+        f"{price:.4f}" if isinstance(price, (int, float)) else price,
+        txid_repr,
+        descr,
+    )
     return True
 
 
