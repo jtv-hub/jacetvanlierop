@@ -5,14 +5,17 @@ from __future__ import annotations
 from math import prod
 from typing import Iterable, List, Tuple
 
+try:
+    from crypto_trading_bot.bot.state.portfolio_state import load_closed_trades
+except ImportError:  # pragma: no cover - defensive fallback
+    load_closed_trades = None  # type: ignore[assignment]
+
 TRADES_LOG_PATH = "logs/trades.log"
 
 
 def _get_closed_trade_rois(max_trades: int = 250) -> List[Tuple[float, float]]:
     """Return a list of (roi, confidence) tuples for recent closed trades."""
-    try:
-        from crypto_trading_bot.bot.state.portfolio_state import load_closed_trades
-    except ImportError:  # pragma: no cover - defensive fallback
+    if load_closed_trades is None:
         return []
 
     trades = load_closed_trades(TRADES_LOG_PATH)

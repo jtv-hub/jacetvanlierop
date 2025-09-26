@@ -247,7 +247,10 @@ def audit_trades(trade_log_path, positions_file: str = "logs/positions.jsonl"):
         positions = validator.load_json_lines(positions_file, "positions.jsonl")
         pos_ids = {p.get("trade_id") for p in positions if p.get("trade_id")}
         for i, t in enumerate(trades_list):
-            if t.get("status") == "closed" and t.get("exit_price") is not None and t.get("trade_id") in pos_ids:
+            is_closed = t.get("status") == "closed"
+            has_exit = t.get("exit_price") is not None
+            in_positions = t.get("trade_id") in pos_ids
+            if is_closed and has_exit and in_positions:
                 anomaly = {
                     "index": i,
                     "type": "closed_trade_still_in_positions",
@@ -285,11 +288,12 @@ def print_audit_report(results):
 
     print("⚠️ Audit issues found:")
     for r in results:
-        print(
+        message = (
             f"- Index {r.get('index', 'N/A')} [{r.get('type', 'N/A')}]: "
             f"value={r.get('value', 'N/A')}, strategy={r.get('strategy')}, "
             f"pair={r.get('pair')}, time={r.get('timestamp')}"
         )
+        print(message)
 
 
 def cleanup_closed_positions(

@@ -14,6 +14,7 @@ import os
 import random
 import time
 import uuid
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, getcontext
 from typing import Any
 
@@ -59,9 +60,6 @@ from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
 logger = logging.getLogger(__name__)
-_live_block_logged = False
-_last_mode_label: str | None = None
-_auto_paused_reason: str | None = None
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
@@ -80,7 +78,18 @@ SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
 # Removed hardcoded ASSETS list. Pairs are now centralized in CONFIG["tradable_pairs"].
 
 
-_last_capital_log: tuple[float | None, str | None] = (None, None)
+@dataclass
+class _RuntimeState:
+    """Mutable runtime flags tracked across trading loop iterations."""
+
+    live_block_logged: bool = False
+    last_capital_log: tuple[float | None, str | None] = (None, None)
+    kraken_pause_until: float | None = None
+    last_mode_label: str | None = None
+    auto_paused_reason: str | None = None
+
+
+_STATE = _RuntimeState()
 _KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
 _KRAKEN_FAILURE_PAUSE_SECONDS = 60.0
 
@@ -174,10 +183,10 @@ def _submit_live_trade(
     Returns ``True`` if the attempt should proceed, ``False`` when blocked.
     """
 
-    global _live_block_logged, _KRAKEN_FAILURE_PAUSE_UNTIL  # noqa: PLW0603
+    global _KRAKEN_FAILURE_PAUSE_UNTIL
 
     if not is_live:
-        if not _live_block_logged:
+        if not _STATE.live_block_logged:
             logger.warning(
                 "🚫 Live trade blocked — is_live=False | pair=%s side=%s size=%.6f"
                 " price=%.4f strategy=%s confidence=%.3f",
@@ -188,7 +197,7 @@ def _submit_live_trade(
                 strategy,
                 confidence,
             )
-            _live_block_logged = True
+            _STATE.live_block_logged = True
         else:
             logger.debug(
                 "Live trade attempt blocked (paper mode) | pair=%s side=%s size=%.6f",
@@ -199,8 +208,9 @@ def _submit_live_trade(
         return False
 
     now = time.monotonic()
-    if _KRAKEN_FAILURE_PAUSE_UNTIL is not None and now < _KRAKEN_FAILURE_PAUSE_UNTIL:
-        pause_remaining = _KRAKEN_FAILURE_PAUSE_UNTIL - now
+    pause_deadline = _KRAKEN_FAILURE_PAUSE_UNTIL or _STATE.kraken_pause_until
+    if pause_deadline is not None and now < pause_deadline:
+        pause_remaining = pause_deadline - now
         logger.error(
             "Kraken trading paused (%.1fs remaining) due to earlier error; skipping %s",
             pause_remaining,
@@ -222,16 +232,23 @@ def _submit_live_trade(
     tif = kraken_cfg.get("time_in_force") or None
     validate_flag = bool(kraken_cfg.get("validate_orders", False))
 
-    min_cost_default = float(CONFIG.get("kraken_min_cost_threshold", kraken_cfg.get("min_cost_threshold", 0.5)))
+    min_cost_default = float(
+        CONFIG.get(
+            "kraken_min_cost_threshold",
+            kraken_cfg.get("min_cost_threshold", 0.5),
+        )
+    )
     min_cost_by_pair = kraken_cfg.get("pair_cost_minimums", {}) or {}
     config_cost_threshold = float(min_cost_by_pair.get(pair, min_cost_default))
 
     try:
         pair_meta = kraken_get_asset_pair_meta(pair)
     except KrakenAPIError as exc:
-        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+        _STATE.kraken_pause_until = pause_until
         logger.error(
-            "Failed to fetch Kraken pair metadata; pausing live trading for %.0fs | pair=%s error=%s",
+            "Failed to fetch Kraken pair metadata; pausing live trading for %.0fs | " "pair=%s error=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             exc,
@@ -252,7 +269,7 @@ def _submit_live_trade(
     min_volume_dec = Decimal(str(min_volume)) if min_volume else Decimal("0")
     if min_volume and size_dec < min_volume_dec:
         logger.warning(
-            "Skipping live order: volume below minimum | pair=%s side=%s size=%.10f min_volume=%.10f",
+            "Skipping live order: volume below minimum | pair=%s side=%s size=%.10f " "min_volume=%.10f",
             pair,
             side,
             float(size_dec),
@@ -265,7 +282,7 @@ def _submit_live_trade(
     min_cost_dec = Decimal(str(effective_cost_threshold)) if effective_cost_threshold else Decimal("0")
     if effective_cost_threshold and attempted_cost_dec < min_cost_dec:
         logger.warning(
-            "Skipping live order: cost below minimum | pair=%s side=%s attempted_cost=%.10f threshold=%.10f",
+            "Skipping live order: cost below minimum | pair=%s side=%s " "attempted_cost=%.10f threshold=%.10f",
             pair,
             side,
             float(attempted_cost_dec),
@@ -288,9 +305,11 @@ def _submit_live_trade(
             min_cost_threshold=effective_cost_threshold,
         )
     except (KrakenAuthError, KrakenAPIError) as exc:
-        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+        _STATE.kraken_pause_until = pause_until
         logger.error(
-            "Kraken order submission exception; pausing live trading for %.0fs | pair=%s side=%s error=%s",
+            "Kraken order submission exception; pausing live trading for %.0fs | " "pair=%s side=%s error=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -298,9 +317,11 @@ def _submit_live_trade(
         )
         return False
     except Exception:  # pylint: disable=broad-exception-caught
-        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+        _STATE.kraken_pause_until = pause_until
         logger.exception(
-            "Unexpected Kraken order exception; pausing live trading for %.0fs | pair=%s side=%s",
+            "Unexpected Kraken order exception; pausing live trading for %.0fs | " "pair=%s side=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -308,9 +329,11 @@ def _submit_live_trade(
         return False
 
     if not isinstance(response, dict):
-        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+        _STATE.kraken_pause_until = pause_until
         logger.error(
-            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s error=%s",
+            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s " "error=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -325,6 +348,7 @@ def _submit_live_trade(
         response_threshold = response.get("threshold", effective_cost_threshold)
         if response_code == "cost_minimum_not_met":
             _KRAKEN_FAILURE_PAUSE_UNTIL = None
+            _STATE.kraken_pause_until = None
             logger.warning(
                 "Kraken cost minimum not met; skipping trade | pair=%s side=%s "
                 "attempted_cost=%.6f threshold=%.6f error=%s",
@@ -338,8 +362,9 @@ def _submit_live_trade(
 
         if response_code == "volume_minimum_not_met":
             _KRAKEN_FAILURE_PAUSE_UNTIL = None
+            _STATE.kraken_pause_until = None
             logger.warning(
-                "Kraken volume minimum not met; skipping trade | pair=%s side=%s size=%.6f min_volume=%.6f error=%s",
+                "Kraken volume minimum not met; skipping trade | pair=%s side=%s " "size=%.6f min_volume=%.6f error=%s",
                 pair,
                 side,
                 size,
@@ -349,7 +374,9 @@ def _submit_live_trade(
             return False
 
         if response_code == "rate_limit":
-            _KRAKEN_FAILURE_PAUSE_UNTIL = now + 90.0
+            pause_until = time.monotonic() + 90.0
+            _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+            _STATE.kraken_pause_until = pause_until
             logger.error(
                 "Kraken rate limit encountered; pausing live trading for 90s | pair=%s side=%s",
                 pair,
@@ -357,9 +384,11 @@ def _submit_live_trade(
             )
             return False
 
-        _KRAKEN_FAILURE_PAUSE_UNTIL = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+        _STATE.kraken_pause_until = pause_until
         logger.error(
-            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s error=%s code=%s",
+            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s " "error=%s code=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -369,6 +398,7 @@ def _submit_live_trade(
         return False
 
     _KRAKEN_FAILURE_PAUSE_UNTIL = None
+    _STATE.kraken_pause_until = None
 
     txid = response.get("txid")
     if isinstance(txid, list) and txid:
@@ -390,9 +420,7 @@ def _submit_live_trade(
 
 
 def _log_capital(amount: float, source: str) -> None:
-    global _last_capital_log  # noqa: PLW0603
-
-    last_amount, last_source = _last_capital_log
+    last_amount, last_source = _STATE.last_capital_log
     if last_amount == amount and last_source == source:
         return
 
@@ -402,7 +430,7 @@ def _log_capital(amount: float, source: str) -> None:
         f"${amount:,.2f}",
         source,
     )
-    _last_capital_log = (amount, source)
+    _STATE.last_capital_log = (amount, source)
 
 
 mock_volume_data = {
@@ -496,7 +524,8 @@ class PositionManager:
                 history = [price_now] if price_now and price_now > 0 else []
                 if history and len(history) >= CONFIG["rsi"]["period"] + 1:
                     if calculate_rsi is None:
-                        print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+                        msg = "⚠️ RSI calculator unavailable — skipping RSI exit " f"for {trade_id}"
+                        print(msg)
                     else:
                         rsi_val = calculate_rsi(
                             history,
@@ -667,8 +696,6 @@ def evaluate_signals_and_trade(
     except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
 
-    global _last_mode_label, _auto_paused_reason
-
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
     # Resolve the list of tradable pairs centrally (config-driven)
@@ -679,9 +706,9 @@ def evaluate_signals_and_trade(
         return
 
     mode_label = get_mode_label()
-    if mode_label != _last_mode_label:
+    if mode_label != _STATE.last_mode_label:
         logger.info("Trading mode: %s (is_live=%s)", mode_label, is_live)
-        _last_mode_label = mode_label
+        _STATE.last_mode_label = mode_label
 
     state_snapshot: dict | None = None
     resolved_capital: float | None = None
@@ -715,16 +742,16 @@ def evaluate_signals_and_trade(
     if not check_exits_only:
         paused, reason = _evaluate_auto_pause(state_snapshot)
         if paused:
-            if _auto_paused_reason != reason:
+            if _STATE.auto_paused_reason != reason:
                 logger.error("[AUTO-PAUSE] %s", reason)
                 print(f"[AUTO-PAUSE] {reason}")
             else:
                 logger.debug("Auto-pause active: %s", reason)
-            _auto_paused_reason = reason
+            _STATE.auto_paused_reason = reason
             return
-        if _auto_paused_reason is not None:
+        if _STATE.auto_paused_reason is not None:
             logger.info("Auto-pause cleared; resuming trade evaluation.")
-            _auto_paused_reason = None
+            _STATE.auto_paused_reason = None
 
     if reinvestment_rate is None:
         reinvestment_rate = float(state_snapshot.get("reinvestment_rate", 0.0))
@@ -921,15 +948,22 @@ def evaluate_signals_and_trade(
                         # Pass asset hint where supported
                         try:
                             signal_result = strategy.generate_signal(
-                                safe_prices, volume=volume, asset=asset, adx=adx_val
+                                safe_prices,
+                                volume=volume,
+                                asset=asset,
+                                adx=adx_val,
                             )
                         except TypeError:
                             # Older strategies may not accept 'adx'
-                            signal_result = strategy.generate_signal(safe_prices, volume=volume)
-                        print(
+                            signal_result = strategy.generate_signal(
+                                safe_prices,
+                                volume=volume,
+                            )
+                        scan_msg = (
                             f"[SCAN] {asset} strat={strategy.__class__.__name__} "
                             f"price={current_price:.4f} vol={volume} -> {signal_result}"
                         )
+                        print(scan_msg)
                     except (ValueError, RuntimeError) as e:
                         log_path = "logs/anomalies.log"
                         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1139,7 +1173,7 @@ def evaluate_signals_and_trade(
 
                 if not is_live:
                     logger.debug(
-                        "Paper trade simulated | pair=%s side=%s size=%.6f price=%.4f strategy=%s confidence=%.3f",
+                        "Paper trade simulated | pair=%s side=%s size=%.6f price=%.4f " "strategy=%s confidence=%.3f",
                         pair,
                         trade_side,
                         adjusted_size,

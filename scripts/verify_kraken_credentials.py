@@ -94,7 +94,7 @@ def verify() -> int:
         set_live_mode(False)
         return 1
     logger.info(
-        "Loaded key_prefix=%s key_origin=%s secret_origin=%s " "sanitized_secret_length=%d",
+        "Loaded key_prefix=%s key_origin=%s secret_origin=%s sanitized_secret_length=%d",
         _mask(api_key),
         CONFIG.get("_kraken_key_origin", "unknown"),
         CONFIG.get("_kraken_secret_origin", "unknown"),

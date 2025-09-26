@@ -460,9 +460,16 @@ class VWAPStrategy:
         self.per_asset = per_asset or {}
 
     def generate_signal(self, prices: List[float], volume, asset: str | None = None, **_):
+        """Return a mean-reversion signal based on a rolling VWAP band."""
+
         del _
         if not prices or len(prices) < max(self.window, 5) or any(p is None or p <= 0 for p in prices):
-            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "VWAPStrategy"}
+            return {
+                "signal": None,
+                "side": None,
+                "confidence": 0.0,
+                "strategy": "VWAPStrategy",
+            }
         if asset and asset in self.per_asset:
             cfg = self.per_asset[asset]
             self.window = int(cfg.get("window", self.window))
@@ -474,7 +481,7 @@ class VWAPStrategy:
         else:
             try:
                 w = [max(1.0, float(volume))] * n
-            except Exception:
+            except (TypeError, ValueError):
                 w = [1.0] * n
         px = prices[-self.window :]
         vwap = sum(p * w[i] for i, p in enumerate(px)) / sum(w)
@@ -483,10 +490,25 @@ class VWAPStrategy:
         conf = min(1.0, abs(last - vwap) / (band * 2))
         print(f"[STRATEGY DEBUG] VWAP vwap={vwap:.6f} last={last:.6f} conf={conf:.3f}")
         if last < vwap - band:
-            return {"signal": "buy", "side": "buy", "confidence": float(conf), "strategy": "VWAPStrategy"}
+            return {
+                "signal": "buy",
+                "side": "buy",
+                "confidence": float(conf),
+                "strategy": "VWAPStrategy",
+            }
         if last > vwap + band:
-            return {"signal": "sell", "side": "sell", "confidence": float(conf), "strategy": "VWAPStrategy"}
-        return {"signal": None, "side": None, "confidence": 0.0, "strategy": "VWAPStrategy"}
+            return {
+                "signal": "sell",
+                "side": "sell",
+                "confidence": float(conf),
+                "strategy": "VWAPStrategy",
+            }
+        return {
+            "signal": None,
+            "side": None,
+            "confidence": 0.0,
+            "strategy": "VWAPStrategy",
+        }
 
 
 class ADXStrategy:
@@ -500,16 +522,35 @@ class ADXStrategy:
         self.threshold = threshold
         self.per_asset = per_asset or {}
 
-    def generate_signal(self, prices: List[float], volume, asset: str | None = None, adx: float | None = None, **_):
+    def generate_signal(
+        self,
+        prices: List[float],
+        volume,
+        asset: str | None = None,
+        adx: float | None = None,
+        **_,
+    ):
+        """Generate signals gated on ADX trend strength and recent momentum."""
+
         del _, volume
         if not prices or any(p is None or p <= 0 for p in prices):
-            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+            return {
+                "signal": None,
+                "side": None,
+                "confidence": 0.0,
+                "strategy": "ADXStrategy",
+            }
         if asset and asset in self.per_asset:
             cfg = self.per_asset[asset]
             self.threshold = float(cfg.get("threshold", self.threshold))
         if adx is None or not isfinite(adx):
             print("[STRATEGY DEBUG] ADXStrategy missing adx; holding")
-            return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+            return {
+                "signal": None,
+                "side": None,
+                "confidence": 0.0,
+                "strategy": "ADXStrategy",
+            }
         last = prices[-1]
         prev = prices[-2] if len(prices) >= 2 else last
         momentum = (last - prev) / max(prev, 1e-9)
@@ -517,10 +558,25 @@ class ADXStrategy:
         print(f"[STRATEGY DEBUG] ADXStrategy adx={adx:.2f} mom={momentum:.5f} conf={conf:.3f}")
         if adx >= max(self.threshold, 25.0):
             if momentum > 0:
-                return {"signal": "buy", "side": "buy", "confidence": float(conf), "strategy": "ADXStrategy"}
+                return {
+                    "signal": "buy",
+                    "side": "buy",
+                    "confidence": float(conf),
+                    "strategy": "ADXStrategy",
+                }
             if momentum < 0:
-                return {"signal": "sell", "side": "sell", "confidence": float(conf), "strategy": "ADXStrategy"}
-        return {"signal": None, "side": None, "confidence": 0.0, "strategy": "ADXStrategy"}
+                return {
+                    "signal": "sell",
+                    "side": "sell",
+                    "confidence": float(conf),
+                    "strategy": "ADXStrategy",
+                }
+        return {
+            "signal": None,
+            "side": None,
+            "confidence": 0.0,
+            "strategy": "ADXStrategy",
+        }
 
 
 class CompositeStrategy:
@@ -534,7 +590,16 @@ class CompositeStrategy:
         self.macd = MACDStrategy()
         self.adxs = ADXStrategy()
 
-    def generate_signal(self, prices: List[float], volume, asset: str | None = None, adx: float | None = None, **_):
+    def generate_signal(
+        self,
+        prices: List[float],
+        volume,
+        asset: str | None = None,
+        adx: float | None = None,
+        **_,
+    ):
+        """Blend MACD and ADXStrategy signals into a single confident output."""
+
         del _
         m = self.macd.generate_signal(prices, volume=volume, asset=asset)
         a = self.adxs.generate_signal(prices, volume=volume, asset=asset, adx=adx)
@@ -550,7 +615,9 @@ class CompositeStrategy:
         elif a.get("signal"):
             signal = a["signal"]
             conf = float(a.get("confidence", 0.0)) * 0.5
-        print(f"[STRATEGY DEBUG] Composite m={m.get('signal')} a={a.get('signal')} conf={conf:.3f}")
+        m_signal = m.get("signal")
+        a_signal = a.get("signal")
+        print(f"[STRATEGY DEBUG] Composite m={m_signal} a={a_signal} conf={conf:.3f}")
         return {
             "signal": signal,
             "side": signal,

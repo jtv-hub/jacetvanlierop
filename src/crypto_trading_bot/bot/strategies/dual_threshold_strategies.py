@@ -36,7 +36,8 @@ class DualThresholdStrategy:
             or any(p is None or p <= 0 for p in price_data)
             or not self.validate_volume(volume)
         ):
-            print(f"[DEBUG] Invalid input: prices_len={len(price_data) if price_data else 0}, " f"volume={volume}")
+            prices_len = len(price_data) if price_data else 0
+            print(f"[DEBUG] Invalid input: prices_len={prices_len}, volume={volume}")
             return {"signal": "hold", "confidence": 0.0}
 
         print(f"[DEBUG] Price data: {price_data[-5:]}")
@@ -46,9 +47,10 @@ class DualThresholdStrategy:
 
         lower = avg * 0.98
         upper = avg * 1.02
-        print(
-            f"[DEBUG] Close: {close_price}, " f"RecentAvg: {avg:.4f}, " f"Bands: lower={lower:.4f}, upper={upper:.4f}"
+        debug_msg = (
+            f"[DEBUG] Close: {close_price}, RecentAvg: {avg:.4f}, " f"Bands: lower={lower:.4f}, upper={upper:.4f}"
         )
+        print(debug_msg)
 
         # Shared confidence scale 0.4..1.0 based on distance beyond band
         def scale(min_v: float, max_v: float, ratio: float) -> float:

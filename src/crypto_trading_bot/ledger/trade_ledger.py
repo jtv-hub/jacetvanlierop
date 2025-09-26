@@ -398,7 +398,9 @@ class TradeLedger:
             system_logger.error("Trade file not found: %s", TRADES_LOG_PATH)
             return
 
-        if not hasattr(self.position_manager, "positions") or self.position_manager.positions is None:
+        positions_missing = not hasattr(self.position_manager, "positions")
+        positions_none = getattr(self.position_manager, "positions", None) is None
+        if positions_missing or positions_none:
             system_logger.error("position_manager.positions unavailable for trade %s", trade_id)
             return
 
@@ -493,7 +495,9 @@ class TradeLedger:
                     )
                     exit_side = "buy" if norm_side == "short" else "sell"
                     exit_adj, exit_slippage_amount, slip_rate = _apply_slippage(
-                        t_obj.get("pair"), float(exit_price), exit_side
+                        t_obj.get("pair"),
+                        float(exit_price),
+                        exit_side,
                     )
                     # Compute ROI and clamp/flag extreme values (> 500%)
                     roi_val = round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0
@@ -639,7 +643,9 @@ class TradeLedger:
                         (t for t in trades if t.get("trade_id") == trade_id),
                         None,
                     )
-                    if existing and existing.get("exit_price") is not None and existing.get("status") == "closed":
+                    already_closed = existing and existing.get("exit_price") is not None
+                    status_closed = existing and existing.get("status") == "closed"
+                    if already_closed and status_closed:
                         system_logger.info(
                             "Idempotent update — trade %s already closed",
                             trade_id,

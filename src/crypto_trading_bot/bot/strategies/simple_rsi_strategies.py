@@ -150,10 +150,11 @@ class SimpleRSIStrategy:
         baseline_conf = float(conf_nl if conf_nl > 0 else 0.0)
 
         if adx is not None:
+            asset_label = asset or ""
             # Weak trend: skip trades
             if adx < 20:
-                print(f"[SKIP] {asset or ''}: ADX too weak ({adx})")
-                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, " "adjusted confidence=0.0")
+                print(f"[SKIP] {asset_label}: ADX too weak ({adx})")
+                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence=0.0")
                 return {
                     "signal": None,
                     "side": None,
@@ -163,9 +164,9 @@ class SimpleRSIStrategy:
             # Strong trend: boost confidence
             if adx > 40:
                 baseline_conf = min(1.0, baseline_conf * 1.2)
-                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, " f"adjusted confidence={baseline_conf}")
+                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence={baseline_conf}")
             else:
-                print(f"[ADX DEBUG] {asset or ''}: ADX={adx}, " f"adjusted confidence={baseline_conf}")
+                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence={baseline_conf}")
 
         # Signals: still trigger at thresholds, but confidence uses nonlinear curve
         if rsi_val < oversold and baseline_conf > 0.0:
