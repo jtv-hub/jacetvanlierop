@@ -15,7 +15,7 @@ def validate_signals(signals: dict, min_confirmations: int = 2) -> tuple[bool, f
             {
                 "RSI": {"signal": "buy", "confidence": 0.7},
                 "MACD": {"signal": "buy", "confidence": 0.6},
-                "VWAP": {"signal": "neutral", "confidence": 0.5}
+                "VWAP": {"signal": "neutral", "confidence": 0.0}
             }
         min_confirmations (int): Minimum number of aligned signals required.
 
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     test_signals = {
         "RSI": {"signal": "buy", "confidence": 0.7},
         "MACD": {"signal": "buy", "confidence": 0.65},
-        "VWAP": {"signal": "neutral", "confidence": 0.5},
+        "VWAP": {"signal": "neutral", "confidence": 0.0},
     }
     confirmed, avg_conf = validate_signals(test_signals, min_confirmations=2)
     print("Confirmed?", confirmed, "Confidence:", avg_conf)

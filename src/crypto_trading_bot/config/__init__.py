@@ -12,8 +12,20 @@ import logging
 import os
 from typing import Tuple
 
-from dotenv import dotenv_values, load_dotenv
+from crypto_trading_bot.utils.secrets_manager import SecretNotFound, get_secret
 
+try:  # pragma: no cover - optional dependency
+    from dotenv import dotenv_values
+except ImportError:  # pragma: no cover - fallback when python-dotenv unavailable
+
+    def dotenv_values(*_args, **_kwargs):
+        return {}
+
+
+try:  # pragma: no cover - handled in tests via monkeypatch
+    from crypto_trading_bot.utils.kraken_client import query_api_key_permissions
+except Exception:  # pragma: no cover - absence handled safely below
+    query_api_key_permissions = None  # type: ignore[assignment]
 logger = logging.getLogger(__name__)
 
 LIVE_MODE_LABEL = "\U0001f6a8 LIVE MODE \U0001f6a8"
@@ -24,6 +36,26 @@ CONFIG: dict = {}
 
 class ConfigurationError(RuntimeError):
     """Raised when mandatory configuration is missing or invalid."""
+
+
+def _assert_no_withdraw_rights() -> None:
+    if query_api_key_permissions is None:
+        logger.warning("Kraken client unavailable; unable to verify withdraw permissions before live mode.")
+        return
+
+    try:
+        permissions = query_api_key_permissions()
+    except Exception as exc:  # pragma: no cover - network issues
+        logger.warning("Failed to query Kraken API key permissions: %s", exc)
+        return
+
+    if permissions is None:
+        logger.warning("QueryKey permissions response was None; proceeding without withdraw check.")
+        return
+
+    rights = permissions.get("rights") or {}
+    if rights.get("can_withdraw"):
+        raise ConfigurationError("Cannot enable live mode: API key has withdraw permissions.")
 
 
 def _sanitize_value(value: str) -> str:
@@ -95,20 +127,52 @@ def _sanitize_base64_secret(secret: str, *, strict: bool = False) -> str:
 def _validate_credentials() -> Tuple[str, str]:
     """Ensure Kraken key/secret are present and secret is valid base64."""
 
-    load_dotenv(override=False)
-    file_values = dotenv_values() or {}
-
-    file_key = _sanitize_value(file_values.get("KRAKEN_API_KEY", ""))
-    file_secret = _sanitize_value(file_values.get("KRAKEN_API_SECRET", ""))
+    file_key = ""
+    file_secret = ""
 
     env_key = _read_env_trimmed("KRAKEN_API_KEY")
     env_secret = _read_env_trimmed("KRAKEN_API_SECRET")
 
-    key_source = "env" if env_key else "dotenv" if file_key else "config"
-    secret_source = "env" if env_secret else "dotenv" if file_secret else "config"
+    try:
+        sm_key = _sanitize_value(get_secret("KRAKEN_API_KEY"))
+        key_source = "secrets_manager"
+    except SecretNotFound:
+        sm_key = ""
+        key_source = "env" if env_key else "dotenv" if file_key else "config"
 
-    key = env_key or file_key or _sanitize_value(CONFIG.get("kraken_api_key") or "")
-    secret_raw = env_secret or file_secret or _sanitize_value(CONFIG.get("kraken_api_secret") or "")
+    try:
+        sm_secret = _sanitize_value(get_secret("KRAKEN_API_SECRET"))
+        secret_source = "secrets_manager"
+    except SecretNotFound:
+        sm_secret = ""
+        secret_source = "env" if env_secret else "dotenv" if file_secret else "config"
+
+    key_config = _sanitize_value(CONFIG.get("kraken_api_key") or "")
+    secret_config = _sanitize_value(CONFIG.get("kraken_api_secret") or "")
+
+    key_candidates = [sm_key, env_key, file_key, key_config]
+    secret_candidates = [sm_secret, env_secret, file_secret, secret_config]
+
+    key = next((candidate for candidate in key_candidates if candidate), "")
+    secret_raw = next((candidate for candidate in secret_candidates if candidate), "")
+
+    if key == sm_key and key:
+        key_source = "secrets_manager"
+    elif key == env_key and key:
+        key_source = "env"
+    elif key == file_key and key:
+        key_source = "dotenv"
+    elif key == key_config and key:
+        key_source = "config"
+
+    if secret_raw == sm_secret and secret_raw:
+        secret_source = "secrets_manager"
+    elif secret_raw == env_secret and secret_raw:
+        secret_source = "env"
+    elif secret_raw == file_secret and secret_raw:
+        secret_source = "dotenv"
+    elif secret_raw == secret_config and secret_raw:
+        secret_source = "config"
 
     if not key:
         message = "Kraken API key/secret missing for live mode."
@@ -173,6 +237,7 @@ def set_live_mode(flag: bool) -> None:
         except ConfigurationError as exc:
             logger.error("Kraken API key/secret validation failed: %s", exc)
             raise
+        _assert_no_withdraw_rights()
     globals()["is_live"] = bool(flag)
 
 
@@ -214,8 +279,6 @@ def _to_bool(value: str | None, default: bool) -> bool:
 
 
 # Load environment variables from a .env file in the project root
-load_dotenv()
-
 CONFIG: dict = {
     "tradable_pairs": [
         "BTC/USD",
@@ -296,14 +359,18 @@ if logger.isEnabledFor(logging.DEBUG):
 
 _env_live_flag = os.getenv("CRYPTO_TRADING_BOT_LIVE")
 if _env_live_flag is not None:
-    live_flag_normalized = _env_live_flag.strip().lower()
-    set_live_mode(live_flag_normalized in {"1", "true", "yes", "on"})
+    logger.warning(
+        "Environment variable CRYPTO_TRADING_BOT_LIVE is ignored. Use the CLI "
+        "--confirm-live-mode flag to enable live trading intentionally."
+    )
 
-    if logger.isEnabledFor(logging.INFO):
-        logger.info("Live trading mode overridden by env: %s -> %s", _env_live_flag, is_live)
-
-if is_live:
-    _validate_credentials()
+CONFIG.setdefault("prelaunch_guard", {})
+CONFIG["prelaunch_guard"].setdefault(
+    "alert_window_hours", int(os.getenv("CRYPTO_TRADING_BOT_ALERT_WINDOW_HOURS", "72"))
+)
+CONFIG["prelaunch_guard"].setdefault(
+    "max_recent_high_severity", int(os.getenv("CRYPTO_TRADING_BOT_MAX_RECENT_HIGH_SEVERITY", "50"))
+)
 
 
 __all__ = [

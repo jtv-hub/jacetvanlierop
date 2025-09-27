@@ -16,6 +16,31 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 ALERTS_LOG_PATH = "logs/alerts.log"
+MAX_ALERT_LOG_BYTES = int(os.getenv("CRYPTO_TRADING_BOT_ALERT_LOG_BYTES", str(5 * 1024 * 1024)))
+ALERT_LOG_BACKUPS = int(os.getenv("CRYPTO_TRADING_BOT_ALERT_LOG_BACKUPS", "3"))
+
+
+def _rotate_alert_log() -> None:
+    """Rotate alerts.log when it grows beyond MAX_ALERT_LOG_BYTES."""
+
+    try:
+        if MAX_ALERT_LOG_BYTES <= 0 or not os.path.exists(ALERTS_LOG_PATH):
+            return
+        if os.path.getsize(ALERTS_LOG_PATH) < MAX_ALERT_LOG_BYTES:
+            return
+        for idx in range(ALERT_LOG_BACKUPS, 0, -1):
+            if idx == 1:
+                src = ALERTS_LOG_PATH
+            else:
+                src = f"{ALERTS_LOG_PATH}.{idx - 1}"
+            dst = f"{ALERTS_LOG_PATH}.{idx}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        # Start a fresh log file after rotation
+        open(ALERTS_LOG_PATH, "w", encoding="utf-8").close()
+    except OSError:
+        # Best effort; ignore rotation failures in alert path
+        pass
 
 
 def _write_alert_line(payload: Dict[str, Any]) -> None:
@@ -31,6 +56,7 @@ def _write_alert_line(payload: Dict[str, Any]) -> None:
             except (OSError, IOError):
                 # Best effort
                 pass
+        _rotate_alert_log()
     except (OSError, IOError):
         # Avoid raising in production alert path
         pass

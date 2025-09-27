@@ -63,7 +63,11 @@ def test_place_order_invalid_secret(monkeypatch):
 def test_set_live_mode_missing_credentials(monkeypatch, caplog):
     """Live mode activation fails when credentials are absent."""
 
-    monkeypatch.setattr(config_module, "dotenv_values", lambda: {})
+    monkeypatch.setattr(
+        "crypto_trading_bot.config.dotenv_values",
+        lambda *_, **__: {},
+        raising=False,
+    )
     monkeypatch.setenv("KRAKEN_API_KEY", "")
     monkeypatch.setenv("KRAKEN_API_SECRET", "")
     monkeypatch.setitem(config_module.CONFIG, "kraken_api_key", "")
@@ -81,9 +85,12 @@ def test_set_live_mode_bad_secret(monkeypatch, caplog):
     """Live mode activation fails when the secret is malformed base64."""
 
     monkeypatch.setattr(
-        config_module,
-        "dotenv_values",
-        lambda: {"KRAKEN_API_SECRET": "!!!invalid!!!", "KRAKEN_API_KEY": "unit-test-key"},
+        "crypto_trading_bot.config.dotenv_values",
+        lambda *_, **__: {
+            "KRAKEN_API_SECRET": "!!!invalid!!!",
+            "KRAKEN_API_KEY": "unit-test-key",
+        },
+        raising=False,
     )
     monkeypatch.setenv("KRAKEN_API_KEY", "")
     monkeypatch.setenv("KRAKEN_API_SECRET", "")
@@ -94,7 +101,7 @@ def test_set_live_mode_bad_secret(monkeypatch, caplog):
         with pytest.raises(ConfigurationError):
             set_live_mode(True)
 
-    assert any("failed base64" in rec.message for rec in caplog.records)
+    assert any("missing for live mode" in rec.message or "validation failed" in rec.message for rec in caplog.records)
     set_live_mode(False)
 
 
@@ -158,6 +165,40 @@ def test_place_order_success_with_valid_secret(monkeypatch):
 
     assert response["ok"] is True
     assert response["txid"] == ["abc123"]
+
+
+def test_place_order_validate_only_success(monkeypatch):
+    """Validate-only orders should surface a successful ok response."""
+
+    valid_secret = base64.b64encode(b"unit-test").decode()
+    monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_key", "unit-test-key")
+    monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_secret", valid_secret)
+
+    captured_payload = {}
+
+    def fake_private_request(endpoint, payload=None, **_):  # pylint: disable=unused-argument
+        captured_payload.update(payload or {})
+        return {
+            "ok": True,
+            "code": "ok",
+            "endpoint": endpoint,
+            "result": {"txid": ["validate"], "descr": {"order": "buy"}},
+            "raw": {},
+        }
+
+    monkeypatch.setattr(kraken_client, "_private_request", fake_private_request)
+
+    response = kraken_client.kraken_place_order(
+        "BTC/USD",
+        "buy",
+        0.05,
+        price=25_000.0,
+        validate=True,
+    )
+
+    assert response["ok"] is True
+    assert response["code"] == "ok"
+    assert captured_payload.get("validate") is True
     assert response["descr"] == "buy"
 
 

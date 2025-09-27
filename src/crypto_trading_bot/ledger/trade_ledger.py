@@ -8,13 +8,16 @@ and trade syncing using a class-based approach.
 import fcntl
 import json
 import logging
+import math
 import os
 import random
 import time
 import uuid
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Any, Dict
 
+from crypto_trading_bot.bot.utils.alert import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG
@@ -59,6 +62,9 @@ if not trade_logger.hasHandlers():
 
 # Shared anomalies logger (compact JSONL)
 anomalies_logger = get_anomalies_logger()
+
+_MISSING_TRADE_ALERT_LIMIT = int(os.getenv("MISSING_TRADE_ALERT_LIMIT", "2"))
+_MISSING_TRADE_WINDOW_SECONDS = float(os.getenv("MISSING_TRADE_ALERT_WINDOW", "300"))
 
 
 def _slippage_rate_for_pair(pair: str) -> float:
@@ -194,7 +200,27 @@ class TradeLedger:
         self.trades = []
         self.trade_index: dict[str, dict] = {}
         self.position_manager = position_manager
+        self._missing_trade_alerted: set[str] = set()
+        self._missing_trade_window: Dict[str, Dict[str, Any]] = {}
+        self._pause_new_trades_once = False
+        self._pause_reason: str | None = None
         self.reload_trades()
+
+    def request_pause_new_trades(self, reason: str | None = None) -> None:
+        """Pause new trade execution for a single evaluation cycle."""
+
+        self._pause_new_trades_once = True
+        self._pause_reason = reason
+
+    def consume_pause_request(self) -> tuple[bool, str | None]:
+        """Return (should_pause, reason) and reset the one-shot pause flag."""
+
+        if self._pause_new_trades_once:
+            self._pause_new_trades_once = False
+            reason = self._pause_reason
+            self._pause_reason = None
+            return True, reason
+        return False, None
 
     def log_trade(self, trading_pair, trade_size, strategy_name, **kwargs):
         """
@@ -205,8 +231,16 @@ class TradeLedger:
         if not isinstance(strategy_name, str):
             raise ValueError(f"[Ledger] Invalid strategy_name: {strategy_name}")
         confidence = float(kwargs.get("confidence", 0.0) or 0.0)
+        if math.isclose(confidence, 0.5, abs_tol=1e-9):
+            raise ValueError(
+                "[Ledger] Confidence of 0.5 is no longer permitted — ensure strategies emit calibrated values."
+            )
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"[Ledger] Invalid confidence value: {confidence}")
+        if isinstance(strategy_name, str) and strategy_name.strip().upper() == "S":
+            raise ValueError(
+                "[Ledger] Strategy identifier 'S' is reserved for testing and cannot be logged in production."
+            )
         if not isinstance(trade_size, (int, float)) or trade_size <= 0:
             raise ValueError(f"[Ledger] Invalid trade size: {trade_size}")
         # Bound-check size based on CONFIG
@@ -284,9 +318,8 @@ class TradeLedger:
                 trade["side"] = "buy"
             elif s == "short":
                 trade["side"] = "sell"
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Non-fatal: leave as-is if side is malformed
-            pass
+        except (AttributeError, TypeError, ValueError):
+            system_logger.exception("Failed to normalize trade side for trade_id=%s", trade_id)
 
         # Validate schema; on failure, log anomaly for audit and re-raise.
         try:
@@ -313,6 +346,32 @@ class TradeLedger:
         self.trades.append(trade)
         self.trade_index[trade_id] = trade
         return trade_id
+
+    def _register_missing_trade(self, trade_id: str, pair: str | None) -> tuple[bool, Dict[str, Any]]:
+        """Track missing-trade alerts per symbol so we can suppress noisy repeats while capturing metrics."""
+        bucket = (pair or "unknown").upper()
+        now = time.monotonic()
+        state = self._missing_trade_window.get(bucket, {})
+        window_start = float(state.get("start", 0.0))
+        if not state or now - window_start > _MISSING_TRADE_WINDOW_SECONDS:
+            state = {"start": now, "count": 0, "suppressed": 0}
+
+        state["count"] = int(state.get("count", 0)) + 1
+        state["last_trade_id"] = trade_id
+        state["last_seen_iso"] = datetime.now(timezone.utc).isoformat()
+        self._missing_trade_window[bucket] = state
+
+        alert_limit = max(1, _MISSING_TRADE_ALERT_LIMIT)
+        should_alert = state["count"] <= alert_limit
+        if not should_alert:
+            state["suppressed"] = int(state.get("suppressed", 0)) + 1
+        return should_alert, state
+
+    def get_missing_trade_metrics(self, reset: bool = False) -> Dict[str, Dict[str, Any]]:
+        snapshot = {bucket: dict(state) for bucket, state in self._missing_trade_window.items()}
+        if reset:
+            self._missing_trade_window.clear()
+        return snapshot
 
     def open_position(self, trade_id, trade):
         """
@@ -412,7 +471,7 @@ class TradeLedger:
                 # Ensure we have latest trades in memory
                 trades = self.trades or []
                 if trade_id not in self.trade_index:
-                    trades = self.reload_trades()
+                    _ = self.reload_trades()
 
                 # If still not present, try reconstruct from positions
                 if trade_id not in self.trade_index:
@@ -449,11 +508,41 @@ class TradeLedger:
 
                 # If still not found, log a clear error and stop
                 if trade_id not in self.trade_index:
-                    system_logger.error(
-                        "Trade ID %s not found in memory or trades.log — aborting update",
-                        trade_id,
-                    )
-                    return
+                    trades = self.reload_trades()
+                    if trade_id in self.trade_index:
+                        system_logger.info(
+                            "Trade %s located after full reload; continuing update",
+                            trade_id,
+                        )
+                    else:
+                        message = "Trade ID %s not found in memory or trades.log — aborting update" % trade_id
+                        pos = self.position_manager.positions.get(trade_id)
+                        pair = (pos or {}).get("pair")
+                        should_alert, state = self._register_missing_trade(trade_id, pair)
+                        system_logger.error(message)
+                        context = {
+                            "trade_id": trade_id,
+                            "attempt": attempt + 1,
+                            "pair": pair,
+                            "count_in_window": state.get("count"),
+                            "suppressed": state.get("suppressed"),
+                            "position_keys": list(self.position_manager.positions.keys()),
+                        }
+                        if should_alert and trade_id not in self._missing_trade_alerted:
+                            self._missing_trade_alerted.add(trade_id)
+                            send_alert(message, context=context, level="CRITICAL")
+                            self.request_pause_new_trades(
+                                reason="Ledger consistency check — missing trade %s" % trade_id
+                            )
+                        else:
+                            payload = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "type": "Missing Trade Suppressed",
+                                "message": message,
+                                "context": context,
+                            }
+                            anomalies_logger.info(json.dumps(payload, separators=(",", ":")))
+                        return
 
                 # Apply update
                 updated = False

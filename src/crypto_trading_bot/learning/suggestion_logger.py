@@ -6,7 +6,7 @@ into a JSONL file for historical tracking and future evaluation.
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Explicit file path inside learning/
 SUGGESTIONS_FILE = os.path.join("learning", "suggestions.jsonl")
@@ -20,7 +20,7 @@ def log_suggestion(strategy_name, param_change, rationale, confidence, status="p
     Append a learning suggestion to suggestions.jsonl
     """
     suggestion_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "strategy_name": strategy_name,
         "param_change": param_change,
         "rationale": rationale,

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlencode
 
@@ -65,8 +67,51 @@ def _post(endpoint: str, postdata: str, headers: Dict[str, str]) -> Dict[str, An
     return base_response
 
 
+def _ensure_secret_files_present() -> bool:
+    """Verify that credential file environment variables are set and readable."""
+
+    key_path = os.getenv("KRAKEN_API_KEY_FILE")
+    secret_path = os.getenv("KRAKEN_API_SECRET_FILE")
+
+    missing = False
+
+    if not key_path:
+        logger.error(
+            "Environment variable %s is not set. Source scripts/set_env.sh before running this script.",
+            "KRAKEN_API_KEY_FILE",
+        )
+        missing = True
+    elif not Path(key_path).expanduser().is_file():
+        logger.error(
+            "KRAKEN_API_KEY_FILE points to %s but the file does not exist. Populate .secrets/kraken_key.txt and rerun.",
+            key_path,
+        )
+        missing = True
+
+    if not secret_path:
+        logger.error(
+            "Environment variable %s is not set. Source scripts/set_env.sh before running this script.",
+            "KRAKEN_API_SECRET_FILE",
+        )
+        missing = True
+    elif not Path(secret_path).expanduser().is_file():
+        logger.error(
+            "KRAKEN_API_SECRET_FILE points to %s but the file does not exist. "
+            "Populate .secrets/kraken_secret.txt and rerun.",
+            secret_path,
+        )
+        missing = True
+
+    if missing:
+        logger.info("Populate the credential files, then run: source scripts/set_env.sh")
+    return not missing
+
+
 def verify() -> int:
     """Validate live credentials, balance access, and AddOrder signing."""
+
+    if not _ensure_secret_files_present():
+        return 1
 
     try:
         set_live_mode(True)
@@ -112,8 +157,8 @@ def verify() -> int:
         logger.debug("Balance nonce=%s", nonce)
         _log_private_request("Balance", headers)
         _post("Balance", postdata, headers)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.error("Balance verification failed: %s", exc)
+    except (KrakenAPIError, TimeoutError, OSError, ValueError) as exc:
+        logger.exception("Balance verification failed: %s", exc)
     else:
         logger.info("Balance verification request completed.")
 
@@ -135,8 +180,8 @@ def verify() -> int:
         logger.debug("Order nonce=%s", nonce)
         _log_private_request("AddOrder", headers)
         _post("AddOrder", postdata, headers)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.error("Order validation failed: %s", exc)
+    except (KrakenAPIError, TimeoutError, OSError, ValueError) as exc:
+        logger.exception("Order validation failed: %s", exc)
         set_live_mode(False)
         return 1
 

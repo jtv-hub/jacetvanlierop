@@ -10,6 +10,8 @@ pip install -U pip
 pip install -e .  # or: pip install -r requirements.txt
 pytest -q
 pre-commit install && pre-commit run -a
+# Ruff 0.4+ requires an explicit subcommand
+ruff check .
 ```
 
 ## Autonomous Execution
@@ -21,3 +23,12 @@ To keep the trading pipeline running while VS Code is closed, load the provided 
 3. Run `launchctl load ~/Library/LaunchAgents/com.jace.crypto.watchdog.plist` to enable the 15-minute watchdog that restarts the pipeline if logs stop updating.
 
 Both agents use absolute paths and write logs to `logs/pipeline.launchd.{out,err}`.
+
+## Live Launch Procedure
+
+1. Ensure the environment is configured (API keys present, paper mode stable).
+2. Run the dry-run and safety guard wrapper: `./scripts/launch_live.sh` (the script auto-archives large `logs/alerts.log`; you can also run `python3 scripts/clear_alerts.py --archive-if-over 5000` manually).
+   - The script backs up logs, clears any kill-switch flag, performs a dry-run, executes the prelaunch guard, and then starts the scheduler with `CRYPTO_TRADING_BOT_LIVE=1`.
+3. Monitor `logs/system.log` and `logs/alerts.log` for the first cycle to confirm no emergency halts triggered the guard logic (disk space, missing trades, price fallbacks).
+
+To allow the guard to auto-archive the alerts log during startup, export `CRYPTO_TRADING_BOT_AUTO_ARCHIVE_ALERTS=1` and run `python3 -m src.crypto_trading_bot.safety.prelaunch_guard --auto-archive-alerts`.

@@ -66,6 +66,10 @@ def main() -> int:
         min_cost_threshold=usd_pair_threshold,
     )
     logger.info("Order response:\n%s", json.dumps(order_response, indent=2, default=str))
+    if order_response.get("ok"):
+        logger.info("Validate-only order reported ok=True")
+    else:
+        logger.warning("Validate-only order did not return ok=True")
 
     tiny_order_response = kraken_place_order(
         "USDC/USD",

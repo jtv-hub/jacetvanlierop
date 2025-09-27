@@ -603,18 +603,19 @@ class CompositeStrategy:
         del _
         m = self.macd.generate_signal(prices, volume=volume, asset=asset)
         a = self.adxs.generate_signal(prices, volume=volume, asset=asset, adx=adx)
-        # Merge signals: prefer when they agree; otherwise hold with low confidence.
+        # Merge signals: prefer when they agree; otherwise emit calibrated confidence.
         signal = None
         conf = 0.0
         if m.get("signal") and a.get("signal") and m["signal"] == a["signal"]:
             signal = m["signal"]
-            conf = min(1.0, (m.get("confidence", 0.0) + a.get("confidence", 0.0)) / 2.0)
+            consensus = (m.get("confidence", 0.0) + a.get("confidence", 0.0)) / 2.0
+            conf = max(0.6, min(1.0, float(consensus)))
         elif m.get("signal"):
             signal = m["signal"]
-            conf = float(m.get("confidence", 0.0)) * 0.5
+            conf = max(0.6, min(1.0, float(m.get("confidence", 0.0)) * 0.75))
         elif a.get("signal"):
             signal = a["signal"]
-            conf = float(a.get("confidence", 0.0)) * 0.5
+            conf = max(0.6, min(1.0, float(a.get("confidence", 0.0)) * 0.75))
         m_signal = m.get("signal")
         a_signal = a.get("signal")
         print(f"[STRATEGY DEBUG] Composite m={m_signal} a={a_signal} conf={conf:.3f}")

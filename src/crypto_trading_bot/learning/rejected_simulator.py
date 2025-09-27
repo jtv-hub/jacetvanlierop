@@ -5,7 +5,7 @@ Simulates the performance of rejected strategy suggestions using historical
 price data to evaluate how they would have performed if accepted.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from crypto_trading_bot.learning.shadow_test_logger import log_shadow_test_result
 
@@ -31,7 +31,7 @@ def simulate_rejected_strategy(
     """
     strategy = strategy_class(**parameters)
     trades = []
-    entry_time = datetime.utcnow()
+    entry_time = datetime.now(timezone.utc)
 
     for i in range(len(price_data)):
         window = price_data[: i + 1]
@@ -42,7 +42,7 @@ def simulate_rejected_strategy(
         if signal.get("signal") in ["buy", "sell"]:
             trades.append((i, signal["signal"]))
 
-    exit_time = datetime.utcnow()
+    exit_time = datetime.now(timezone.utc)
     trade_count = len(trades)
     wins = sum(1 for i, sig in trades if sig == "buy")  # Simulated "wins"
     win_rate = wins / trade_count if trade_count > 0 else 0

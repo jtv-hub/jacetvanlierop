@@ -49,8 +49,9 @@ PAIR_MAP: Dict[str, str] = {
     "LINK/USD": "LINKUSD",
 }
 
-# Public ticker endpoint (no auth required)
+# Public endpoints (no auth required)
 _TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 
 
 def _normalize_pair(pair: str) -> str:
@@ -160,6 +161,116 @@ def _extract_last_price(payload: Dict[str, Any]) -> float:
     raise ValueError("Ticker payload missing price fields (c/a/b)")
 
 
+def _extract_ohlc_rows(payload: Dict[str, Any], pair: str) -> list[dict[str, float]]:
+    """Normalize OHLC rows from Kraken payload."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("OHLC payload is not a dict")
+
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken error(s): {payload['error']}")
+
+    result = payload.get("result")
+    if not isinstance(result, dict) or not result:
+        raise ValueError("OHLC payload missing 'result'")
+
+    raw_rows = result.get(pair)
+    if raw_rows is None:
+        for key, value in result.items():
+            if key != "last":
+                raw_rows = value
+                break
+    if raw_rows is None:
+        raise ValueError(f"OHLC payload missing rows for {pair}")
+    if not isinstance(raw_rows, list):
+        raise ValueError("OHLC rows are not a list")
+
+    normalized: list[dict[str, float]] = []
+    for row in raw_rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        try:
+            ts = int(row[0])
+        except (TypeError, ValueError):
+            continue
+        try:
+            open_px = float(row[1])
+            high_px = float(row[2])
+            low_px = float(row[3])
+            close_px = float(row[4])
+            volume = float(row[6]) if len(row) > 6 else 0.0
+        except (TypeError, ValueError):
+            continue
+        normalized.append(
+            {
+                "time": ts,
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
+                "close": close_px,
+                "volume": volume,
+            }
+        )
+    return normalized
+
+
+def get_ohlc_data(
+    pair: str,
+    *,
+    interval: int = 1,
+    since: int | None = None,
+    limit: int = 120,
+    timeout: float = 10.0,
+    retries: int = 3,
+    backoff: float = 0.5,
+) -> list[dict[str, float]]:
+    """Fetch OHLC candles for ``pair`` from Kraken public API."""
+
+    kpair = _normalize_pair(pair)
+    params: Dict[str, Any] = {"pair": kpair, "interval": max(1, int(interval))}
+    if since is not None:
+        params["since"] = int(since)
+
+    attempt = 0
+    while True:
+        try:
+            logger.debug(
+                "Kraken GET %s params=%s attempt=%d",
+                _OHLC_URL,
+                params,
+                attempt + 1,
+            )
+            payload = _http_get(_OHLC_URL, params, timeout)
+            rows = _extract_ohlc_rows(payload, kpair)
+            if not rows:
+                raise ValueError("OHLC response empty")
+            if limit > 0:
+                rows = rows[-min(len(rows), limit) :]
+            logger.info(
+                "Kraken OHLC fetched %d candles for %s (interval=%s)",
+                len(rows),
+                pair,
+                params["interval"],
+            )
+            return rows
+        except (RuntimeError, ValueError) as exc:
+            if attempt >= max(0, retries - 1):
+                logger.error("Kraken OHLC failed for %s (%s): %s", pair, kpair, exc)
+                raise
+            sleep_for = backoff * (2**attempt) + random.uniform(0.0, 0.25)
+            logger.warning(
+                "Kraken OHLC error (attempt %d/%d) for %s (%s): %s; retrying in %.2fs",
+                attempt + 1,
+                retries,
+                pair,
+                kpair,
+                exc,
+                sleep_for,
+            )
+            time.sleep(max(0.05, sleep_for))
+            attempt += 1
+
+
 def get_ticker_price(
     pair: str,
     *,
@@ -203,4 +314,4 @@ def get_ticker_price(
             attempt += 1
 
 
-__all__ = ["get_ticker_price", "PAIR_MAP"]
+__all__ = ["get_ticker_price", "get_ohlc_data", "PAIR_MAP"]

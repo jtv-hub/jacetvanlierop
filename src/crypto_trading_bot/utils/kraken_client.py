@@ -487,6 +487,42 @@ def kraken_get_balance(asset: str = "USDC") -> Dict[str, Any]:
     return response
 
 
+def query_api_key_permissions() -> Optional[Dict[str, Any]]:
+    """Return the rights/permissions associated with the current API key.
+
+    Uses Kraken's private ``QueryKey`` endpoint. If the call fails or the
+    response cannot be parsed, returns ``None`` instead of raising so callers
+    can decide how strictly to enforce the check.
+    """
+
+    response = _private_request("QueryKey", {})
+    normalized = _standard_response(response, endpoint="QueryKey")
+    if not normalized.get("ok"):
+        logger.warning(
+            "Unable to query Kraken API key permissions: %s",
+            normalized.get("error") or normalized.get("code"),
+        )
+        return None
+
+    result = normalized.get("result")
+    rights: Dict[str, Any] = {}
+    if isinstance(result, dict):
+        if "rights" in result:
+            rights = result.get("rights") or {}
+        else:
+            try:
+                first = next(iter(result.values()))
+            except StopIteration:
+                first = None
+            if isinstance(first, dict):
+                rights = first.get("rights", {}) or {}
+
+    if not rights:
+        logger.warning("Kraken API key permissions response missing rights payload: %s", result)
+
+    return {"rights": rights, "raw": result}
+
+
 def kraken_get_asset_pair_meta(pair: str) -> Dict[str, Any]:
     """Return Kraken asset pair metadata including order and cost minimums."""
 
@@ -738,4 +774,5 @@ __all__ = [
     "kraken_place_order",
     "kraken_cancel_order",
     "kraken_open_orders",
+    "query_api_key_permissions",
 ]

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,17 +26,20 @@ except ImportError:  # pragma: no cover - optional dependency
     np = None
 
 from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
-from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
+from crypto_trading_bot.bot.utils.alert import send_alert
+from crypto_trading_bot.config import CONFIG, get_mode_label, is_live, set_live_mode
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
     KrakenAuthError,
+    _invalidate_pair_cache,
     kraken_get_asset_pair_meta,
     kraken_place_order,
 )
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import (
+    HistoryUnavailable,
     append_live_price,
     get_history_prices,
 )
@@ -63,6 +67,10 @@ logger = logging.getLogger(__name__)
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
+KILL_SWITCH_FILE = os.getenv("CRYPTO_TRADING_BOT_KILL_SWITCH_FILE", "logs/kill_switch.flag")
+
+_DISK_GUARD_THRESHOLD_MB = float(os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_MB", "500"))
+_DISK_GUARD_PATH = os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_PATH", os.getcwd())
 
 TRADE_INTERVAL = 300
 MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
@@ -87,6 +95,10 @@ class _RuntimeState:
     kraken_pause_until: float | None = None
     last_mode_label: str | None = None
     auto_paused_reason: str | None = None
+    dry_run_logged: bool = False
+    emergency_stop_triggered: bool = False
+    kill_switch_auto_cleared: bool = False
+    disk_space_block_active: bool = False
 
 
 _STATE = _RuntimeState()
@@ -377,6 +389,7 @@ def _submit_live_trade(
             pause_until = time.monotonic() + 90.0
             _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
             _STATE.kraken_pause_until = pause_until
+            _invalidate_pair_cache()
             logger.error(
                 "Kraken rate limit encountered; pausing live trading for 90s | pair=%s side=%s",
                 pair,
@@ -431,6 +444,59 @@ def _log_capital(amount: float, source: str) -> None:
         source,
     )
     _STATE.last_capital_log = (amount, source)
+
+
+# NOTE: Clear any stale kill-switch flag once at startup so live flow is not permanently blocked.
+def _ensure_kill_switch_cleared() -> None:
+    if _STATE.kill_switch_auto_cleared:
+        return
+    if not os.path.exists(KILL_SWITCH_FILE):
+        _STATE.kill_switch_auto_cleared = True
+        return
+    try:
+        os.remove(KILL_SWITCH_FILE)
+        message = f"[EMERGENCY STOP] Kill-switch file {KILL_SWITCH_FILE} detected at startup — auto-cleared."
+        logger.warning(message)
+        send_alert(message, level="WARNING")
+        print(message)
+        _STATE.kill_switch_auto_cleared = True
+        _STATE.emergency_stop_triggered = False
+    except OSError as exc:
+        logger.error("Failed to auto-clear kill-switch file %s: %s", KILL_SWITCH_FILE, exc)
+        if not os.path.exists(KILL_SWITCH_FILE):
+            _STATE.kill_switch_auto_cleared = True
+
+
+# NOTE: Block new trades while disk space is critically low; resume automatically once capacity returns.
+def _guard_low_disk_space() -> bool:
+    try:
+        _, _, free = shutil.disk_usage(_DISK_GUARD_PATH)
+    except OSError as exc:
+        logger.error("Disk usage check failed for %s: %s", _DISK_GUARD_PATH, exc)
+        return False
+
+    free_mb = free / (1024 * 1024)
+    if free_mb < _DISK_GUARD_THRESHOLD_MB:
+        if not _STATE.disk_space_block_active:
+            message = (
+                "Disk space critically low ("
+                f"{free_mb:.1f} MB free < {_DISK_GUARD_THRESHOLD_MB:.1f} MB) — disabling new trade submissions."
+            )
+            logger.critical(message)
+            send_alert(
+                message,
+                context={"free_mb": round(free_mb, 2), "threshold_mb": _DISK_GUARD_THRESHOLD_MB},
+                level="CRITICAL",
+            )
+            print(message)
+        _STATE.disk_space_block_active = True
+        return True
+
+    if _STATE.disk_space_block_active:
+        logger.info("Disk space recovered (%.1f MB free); resuming trade evaluation.", free_mb)
+        print(f"[DISK] Space recovered: {free_mb:.1f} MB free")
+        _STATE.disk_space_block_active = False
+    return False
 
 
 mock_volume_data = {
@@ -543,25 +609,18 @@ class PositionManager:
             except (KeyError, ValueError, TypeError, IndexError) as e:
                 print(f"[EXIT] RSI check error for {trade_id}: {e}")
 
-            random_win = random.random() < 0.3
-            if random_win:
-                exit_price = pos["entry_price"] * (1 + random.uniform(0.01, 0.05))
-                reason = "TAKE_PROFIT"
-                exits.append((trade_id, exit_price, reason))
-                keys_to_delete.append(trade_id)
-                continue
             if ret <= -sl:
                 exit_price = price
                 reason = "STOP_LOSS"
-            elif ret >= tp:
-                exit_price = price
-                reason = "TAKE_PROFIT"
             elif price <= trailing_threshold:
                 exit_price = price
                 reason = "TRAILING_STOP"
             elif bars_held >= max_hold_bars:
                 exit_price = price
                 reason = "MAX_HOLD"
+            elif ret >= tp:
+                exit_price = price
+                reason = "TAKE_PROFIT"
             else:
                 continue
 
@@ -698,6 +757,33 @@ def evaluate_signals_and_trade(
 
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
+    _ensure_kill_switch_cleared()
+    disk_block = _guard_low_disk_space()
+    if disk_block and not check_exits_only:
+        check_exits_only = True
+    pause_new_trades, pause_reason = ledger.consume_pause_request()
+    if pause_new_trades:
+        pause_msg = pause_reason or ("[PAUSE] skipping new trades this cycle (ledger consistency check).")
+        logger.warning(pause_msg)
+        print(pause_msg)
+        if not check_exits_only:
+            check_exits_only = True
+    if CONFIG.get("live_mode", {}).get("dry_run") and not _STATE.dry_run_logged:
+        msg = "[DRY-RUN] Validate-only trades active — live orders will use validate=True."
+        logger.warning(msg)
+        print(msg)
+        _STATE.dry_run_logged = True
+
+    if os.path.exists(KILL_SWITCH_FILE):
+        if not _STATE.emergency_stop_triggered:
+            alert_message = f"EMERGENCY STOP enabled via kill-switch file ({KILL_SWITCH_FILE})."
+            send_alert(alert_message, level="CRITICAL")
+            logger.critical(alert_message)
+            print(alert_message)
+            _STATE.emergency_stop_triggered = True
+        if is_live:
+            set_live_mode(False)
+        check_exits_only = True
     # Resolve the list of tradable pairs centrally (config-driven)
     # Added to ensure the engine scans all requested assets with no hardcoding.
     pairs: list[str] = tradable_pairs or CONFIG.get("tradable_pairs", [])
@@ -890,9 +976,21 @@ def evaluate_signals_and_trade(
                 rsi_period = CONFIG.get("rsi", {}).get("period", 21)
                 # Ensure we always provide at least 30 points to RSI-based strategies
                 min_needed = max(int(rsi_period) + 1, 30)
-                _ = get_history_prices(pair, min_len=min_needed)
+                try:
+                    _ = get_history_prices(pair, min_len=min_needed)
+                except HistoryUnavailable as exc:
+                    logger.error("Skipping %s: %s", pair, exc)
+                    print(f"[SKIP] {pair}: {exc}")
+                    continue
+
                 append_live_price(pair, float(current_price))
-                safe_prices = get_history_prices(pair, min_len=min_needed)
+
+                try:
+                    safe_prices = get_history_prices(pair, min_len=min_needed)
+                except HistoryUnavailable as exc:
+                    logger.error("Skipping %s after live price append: %s", pair, exc)
+                    print(f"[SKIP] {pair}: {exc}")
+                    continue
                 # Filter out None values before strategy evaluation
                 safe_prices = [p for p in safe_prices if p is not None]
                 # Pre-pair debug trace
@@ -1317,11 +1415,7 @@ def evaluate_signals_and_trade(
             executed_trades = 1
         except (ValueError, RuntimeError) as e:
             print(f"[FALLBACK] Failed to seed trade: {e}")
-    # Inject mock TAKE_PROFIT prices before exit checks
-    for trade_id, pos in position_manager.positions.items():
-        if random.random() < 0.3:
-            current_prices[pos["pair"]] = pos["entry_price"] * (1 + random.uniform(0.01, 0.05))
-
+    # Exit evaluation now relies solely on observed market prices; no synthetic injections.
     exits = position_manager.check_exits(current_prices)
     for trade_id, exit_price, reason in exits:
         trade_position = position_manager.positions.get(trade_id)

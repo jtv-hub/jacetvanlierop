@@ -6,6 +6,8 @@ Handles file and console log formatting and routing.
 import logging
 import os
 
+from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+
 
 def setup_logging():
     """
@@ -13,8 +15,9 @@ def setup_logging():
     """
     os.makedirs("logs", exist_ok=True)
 
+    rotating_handler = get_rotating_handler("heartbeat.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler("logs/heartbeat.log"), logging.StreamHandler()],
+        handlers=[rotating_handler, logging.StreamHandler()],
     )

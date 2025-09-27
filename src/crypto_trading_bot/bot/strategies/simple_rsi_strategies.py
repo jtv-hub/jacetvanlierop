@@ -24,7 +24,7 @@ class SimpleRSIStrategy:
     RSI-based strategy with dynamic confidence scoring.
 
     Confidence is computed based on distance from the RSI band defined by
-    (oversold=lower, overbought=upper). Fallback to 0.5 only if RSI is missing.
+    (oversold=lower, overbought=upper). Missing RSI data yields a zero-confidence hold.
     """
 
     def __init__(
@@ -127,7 +127,7 @@ class SimpleRSIStrategy:
             rsi_val = None
 
         if rsi_val is None:
-            return {"signal": None, "confidence": 0.5}
+            return {"signal": None, "confidence": 0.0}
 
         # Nonlinear confidence centered at RSI midpoint (50)
         # Tunable curve: logistic with center at d0 (distance=20 -> ~0.5),
@@ -138,7 +138,7 @@ class SimpleRSIStrategy:
         if d <= 5.0:
             conf_nl = 0.0
         else:
-            d0 = 20.0  # distance to midpoint where conf ~= 0.5
+            d0 = 20.0  # distance to midpoint where confidence transitions meaningfully
             k = 5.0  # steepness of curve; lower -> steeper
             s = 1.0 / (1.0 + math.exp(-(d - d0) / k))
             s_neutral = 1.0 / (1.0 + math.exp(-((5.0) - d0) / k))

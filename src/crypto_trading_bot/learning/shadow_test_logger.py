@@ -7,7 +7,7 @@ comparison between user-accepted strategies and machine-suggested alternatives.
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 SHADOW_TEST_LOG_PATH = "logs/shadow_test_results.log"
 
@@ -38,7 +38,7 @@ def log_shadow_test_result(
         test_duration_minutes (int): Length of shadow test
     """
     entry = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "suggestion_id": suggestion_id,
         "strategy": strategy_name,
         "parameters": parameters,

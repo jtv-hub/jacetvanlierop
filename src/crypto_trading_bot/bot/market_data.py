@@ -10,7 +10,7 @@ price cannot be fetched, a warning is logged and None is returned.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module
 from typing import Callable, Optional
 
@@ -37,7 +37,7 @@ def get_market_snapshot(trading_pair: str) -> Optional[dict]:
         system_logger.warning("Live data unavailable for %s; returning None", trading_pair)
         return None
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "pair": trading_pair,
         "price": float(price),
     }
@@ -133,8 +133,17 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
         logger.error("Balance branch=kraken-live auth-error=%s", message)
         raise BalanceFetchError(message)
 
-    logger.error(
-        "Balance branch=kraken-live error=%s raw=%s",
+    allow_fallback = bool(CONFIG.get("live_mode", {}).get("allow_balance_fallback", False))
+    if not allow_fallback:
+        logger.error(
+            "Balance branch=kraken-live error=%s raw=%s fallback=disabled",
+            error_detail,
+            response.get("raw"),
+        )
+        raise BalanceFetchError("Live balance unavailable and fallback disabled.")
+
+    logger.warning(
+        "Balance branch=kraken-live error=%s raw=%s using fallback",
         error_detail,
         response.get("raw"),
     )
@@ -167,6 +176,6 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
         )
         return fallback_val
 
-    message = "Live balance unavailable after all fallbacks."
+    message = "Live balance unavailable after fallback attempts."
     logger.error("Balance branch=error error=%s", message)
     raise BalanceFetchError(message)

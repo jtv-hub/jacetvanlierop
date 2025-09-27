@@ -4,7 +4,7 @@ These tests validate shape and basic properties of the output from
 `gather_signals`, not the full end-to-end trading pipeline.
 """
 
-from datetime import datetime  # standard library first
+from datetime import datetime, timezone  # standard library first
 
 from crypto_trading_bot.bot.trading_logic import gather_signals
 
@@ -15,7 +15,7 @@ def test_gather_signals_rsi_valid():
     prices = [100 + i for i in range(30)]
     volumes = [1500] * 30
 
-    ctx = {"timestamp": datetime.utcnow()}  # optional context
+    ctx = {"timestamp": datetime.now(timezone.utc)}  # optional context
 
     out = gather_signals(prices, volumes, ctx=ctx)
 

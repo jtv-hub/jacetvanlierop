@@ -8,7 +8,7 @@ ad-hoc scripts. It must not be imported by production code paths.
 from __future__ import annotations
 
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def generate_mock_data(trading_pair: str) -> dict:
@@ -34,7 +34,7 @@ def generate_mock_data(trading_pair: str) -> dict:
     price = base_price * random.uniform(0.95, 1.05)
 
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "pair": trading_pair,
         "price": price,
         "rsi": random.uniform(20, 80),

@@ -11,8 +11,10 @@ like RSI. Live prices can be appended and will not be overwritten.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
@@ -23,11 +25,58 @@ try:
 except Exception:  # pragma: no cover - optional import
     generate_mock_data = None  # type: ignore
 
+from crypto_trading_bot.bot.utils.alert import send_alert
+from crypto_trading_bot.config import CONFIG, is_live
+from crypto_trading_bot.utils.kraken_api import get_ohlc_data
+
+logger = logging.getLogger(__name__)
+
 SEED_PATH = "data/seeded_prices.json"
 
 # pair -> list of (iso_timestamp, close)
 _history: Dict[str, List[Tuple[str, float]]] = {}
 _seed_cache: Dict[str, List[Tuple[str, float]]] = {}
+
+
+class HistoryUnavailable(RuntimeError):
+    """Raised when live trading cannot proceed due to missing price history."""
+
+
+_LIVE_HISTORY_ATTEMPTS = 3
+_LIVE_HISTORY_BACKOFF_SECONDS = 0.75
+_LIVE_HISTORY_LIMIT = 180
+
+_fallback_metrics: Dict[str, Dict[str, int] | float | None] = {
+    "mock": {},
+    "live_block": {},
+    "_last_event": None,
+}
+
+
+def _record_fallback_event(bucket: str, pair: str) -> None:
+    counters = _fallback_metrics.setdefault(bucket, {})
+    if isinstance(counters, dict):
+        counters[pair] = counters.get(pair, 0) + 1
+    _fallback_metrics["_last_event"] = time.time()
+
+
+def get_fallback_metrics(reset: bool = False) -> Dict[str, Dict[str, int] | float | None]:
+    """Return fallback usage counters (optionally resetting them)."""
+
+    snapshot = {
+        "mock": dict(_fallback_metrics.get("mock", {})) if isinstance(_fallback_metrics.get("mock"), dict) else {},
+        "live_block": (
+            dict(_fallback_metrics.get("live_block", {}))
+            if isinstance(_fallback_metrics.get("live_block"), dict)
+            else {}
+        ),
+        "last_event_ts": _fallback_metrics.get("_last_event"),
+    }
+    if reset:
+        _fallback_metrics["mock"] = {}
+        _fallback_metrics["live_block"] = {}
+        _fallback_metrics["_last_event"] = None
+    return snapshot
 
 
 def _now_iso() -> str:
@@ -56,6 +105,58 @@ def _load_seed_file() -> None:
     except (OSError, json.JSONDecodeError):
         # Fail-open: simply keep empty cache
         _seed_cache.clear()
+
+
+def _attempt_live_history(pair: str, min_len: int) -> List[Tuple[str, float]]:
+    """Retry Kraken OHLC before resorting to mock data so live mode only runs on real candles."""
+    key = pair.upper()
+    target = max(min_len, _LIVE_HISTORY_LIMIT)
+    for attempt in range(_LIVE_HISTORY_ATTEMPTS):
+        try:
+            rows = get_ohlc_data(pair, interval=1, limit=target)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning(
+                "Live history fetch attempt %d/%d failed for %s: %s",
+                attempt + 1,
+                _LIVE_HISTORY_ATTEMPTS,
+                pair,
+                exc,
+            )
+            if attempt < _LIVE_HISTORY_ATTEMPTS - 1:
+                time.sleep(_LIVE_HISTORY_BACKOFF_SECONDS * (attempt + 1))
+            continue
+
+        if not rows:
+            logger.debug("Kraken OHLC returned no rows for %s", pair)
+            continue
+
+        normalized: List[Tuple[str, float]] = []
+        for row in rows:
+            ts = row.get("time")
+            close_px = row.get("close")
+            if ts is None or close_px is None:
+                continue
+            try:
+                iso_ts = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+                normalized.append((iso_ts, float(close_px)))
+            except (TypeError, ValueError, OSError):
+                continue
+
+        if normalized:
+            # Keep most recent candles only to bound memory usage
+            normalized.sort(key=lambda item: item[0])
+            _history[key] = normalized[-target:]
+            logger.info(
+                "Loaded %d live candles for %s from Kraken OHLC",
+                len(_history[key]),
+                pair,
+            )
+            return _history[key]
+
+        if attempt < _LIVE_HISTORY_ATTEMPTS - 1:
+            time.sleep(_LIVE_HISTORY_BACKOFF_SECONDS * (attempt + 1))
+
+    return _history.get(key, [])
 
 
 def ensure_min_history(pair: str, min_len: int = 14) -> None:
@@ -126,28 +227,48 @@ def get_history_prices(pair: str, min_len: int = 14) -> List[float]:
     print(f"[DEBUG] Requested {req} candles for {pair}")
     print(f"[DEBUG] Fetched {len(valid_prices)} valid candles for {pair}")
 
-    # Optional safety: if still insufficient, attempt a mock backfill
+    live_real_mode = is_live and not bool(CONFIG.get("live_mode", {}).get("dry_run"))
+
+    if len(valid_prices) < req:
+        refreshed = _attempt_live_history(pair, req)
+        if refreshed:
+            prices = [px for _, px in refreshed]
+            valid_prices = [px for px in prices if px is not None]
+            print(f"[LIVE HISTORY] Pulled {len(valid_prices)} candles for {pair} after live retry")
+
+    if len(valid_prices) < req and live_real_mode:
+        _record_fallback_event("live_block", pair.upper())
+        message = f"Live trading blocked for {pair}: insufficient candles (need {req}, have {len(valid_prices)})."
+        context = {"pair": pair, "required": req, "available": len(valid_prices)}
+        send_alert(message, context=context, level="CRITICAL")
+        logger.critical(message)
+        raise HistoryUnavailable(message)
+
     if len(valid_prices) < 15:
         print(f"[ERROR] Insufficient candles fetched for {pair}: only {len(valid_prices)}")
-        # Only use mock if available; otherwise return what we have to allow graceful skip
         if generate_mock_data is not None:
             print(f"[MOCK DATA] Using mock prices for {pair} due to fetch failure")
-            # Translate pair format "BTC/USD" -> "BTC-USD" if needed
+            _record_fallback_event("mock", pair.upper())
             mock_pair = pair.replace("/", "-")
             try:
                 snap = generate_mock_data(mock_pair)
                 base_price = float(snap.get("price", 100.0))
             except Exception:
                 base_price = 100.0
-            # Create 30-step random walk around base price
             steps = max(req, 30)
             px = base_price
             series: List[Tuple[str, float]] = []
             for _ in range(steps):
-                drift = random.uniform(-0.005, 0.005)  # +/-0.5%
+                drift = random.uniform(-0.005, 0.005)
                 px = max(0.01, px * (1.0 + drift))
                 series.append((_now_iso(), round(px, 6)))
             _history[key] = series
+            logger.warning(
+                "Mock price series injected for %s (steps=%d base=%.4f)",
+                pair,
+                steps,
+                base_price,
+            )
             return [p for _, p in series]
 
     return valid_prices
@@ -157,4 +278,6 @@ __all__ = [
     "ensure_min_history",
     "append_live_price",
     "get_history_prices",
+    "HistoryUnavailable",
+    "get_fallback_metrics",
 ]

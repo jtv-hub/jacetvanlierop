@@ -7,7 +7,7 @@ suggestions, their ROI comparisons, and forward test plans for future analysis.
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 LEARNING_LOG_PATH = "logs/learning_feedback.log"
 
@@ -32,7 +32,7 @@ def log_learning_feedback(
         actual_roi (float): ROI from accepted strategy in live/paper trading
     """
     entry = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "suggestion_id": suggestion_id,
         "strategy": strategy_name,
         "parameters": parameters,
@@ -70,7 +70,7 @@ def log_forward_test_plan(
         timeframe (str): Timeframe being tested (e.g., 5m, 1h)
     """
     entry = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "suggestion_id": suggestion_id,
         "strategy": strategy_name,
         "parameters": parameters,

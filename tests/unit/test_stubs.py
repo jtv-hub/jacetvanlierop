@@ -20,7 +20,7 @@ def test_trading_logic_position_manager_check_exits_interface():
         "entry_price": 20000.0,
         "timestamp": "2024-01-01T00:00:00+00:00",
         "strategy": "SimpleRSIStrategy",
-        "confidence": 0.5,
+        "confidence": 0.65,
         "high_water_mark": 20000.0,
     }
     exits = pm.check_exits({"BTC/USD": 19980.0}, tp=0.02, sl=0.001, trailing_stop=0.05, max_hold_bars=0)
@@ -48,8 +48,8 @@ def test_trade_ledger_update_trade_idempotent(tmp_path, monkeypatch):
     tid = tl.log_trade(
         trading_pair="BTC/USD",
         trade_size=0.001,
-        strategy_name="S",
-        confidence=0.5,
+        strategy_name="TestStrategy",
+        confidence=0.7,
         entry_price=20000.0,
     )
     tl.update_trade(trade_id=tid, exit_price=20500.0, reason="TAKE_PROFIT")

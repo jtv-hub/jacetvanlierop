@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 from typing import Dict, List
 
@@ -30,6 +31,51 @@ if not logger.hasHandlers():
     # Dedicated debug/ops log for this module as requested
     logger.addHandler(get_rotating_handler("learning_machine.log"))
     logger.propagate = False
+
+
+def _is_valid_learning_trade(trade: dict) -> bool:
+    """Return True if the trade should influence learning decisions."""
+
+    confidence = trade.get("confidence")
+    try:
+        confidence_val = float(confidence)
+    except (TypeError, ValueError):
+        logger.warning("Skipping trade %s — confidence missing or invalid", trade.get("trade_id"))
+        return False
+
+    if confidence_val <= 0 or confidence_val > 1:
+        logger.warning(
+            "Skipping trade %s — confidence %.4f outside acceptable range",
+            trade.get("trade_id"),
+            confidence_val,
+        )
+        return False
+
+    if math.isclose(confidence_val, 0.5, abs_tol=1e-6):
+        logger.warning(
+            "Skipping trade %s — confidence %.4f flagged as deprecated placeholder",
+            trade.get("trade_id"),
+            confidence_val,
+        )
+        return False
+
+    roi = trade.get("roi")
+    try:
+        roi_val = float(roi)
+    except (TypeError, ValueError):
+        logger.warning("Skipping trade %s — ROI missing or invalid", trade.get("trade_id"))
+        return False
+
+    # Reject outliers that indicate synthetic or corrupted entries
+    if abs(roi_val) > 1.5:
+        logger.warning(
+            "Skipping trade %s — ROI %.4f outside learning bounds",
+            trade.get("trade_id"),
+            roi_val,
+        )
+        return False
+
+    return True
 
 
 def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
@@ -58,6 +104,7 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
                 and isinstance(roi, (int, float))
                 and isinstance(size, (int, float))
                 and float(size) > 0.0
+                and _is_valid_learning_trade(trade)
             ):
                 trades.append(trade)
     return trades
@@ -249,7 +296,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
     except ImportError:  # pragma: no cover - fallback path
 
         def generate_suggestions(_report):  # type: ignore
-            return [{"suggestion": "Monitor performance", "confidence": 0.5, "reason": "fallback"}]
+            return [{"suggestion": "Monitor performance", "confidence": 0.7, "reason": "fallback"}]
 
     # Load closed trades for diagnostics and diversity checks
     trades = load_trades()

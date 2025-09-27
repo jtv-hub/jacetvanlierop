@@ -77,7 +77,7 @@ def generate_suggestions(report: Dict) -> List[Dict]:
             {
                 "category": "general",
                 "suggestion": "No immediate changes required. Continue monitoring performance.",
-                "confidence": 0.5,
+                "confidence": 0.7,
                 "reason": "All metrics within acceptable thresholds.",
             }
         )

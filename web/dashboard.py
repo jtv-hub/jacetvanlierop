@@ -14,7 +14,7 @@ import json
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import streamlit as st  # type: ignore[import-not-found]  # pylint: disable=import-error
@@ -41,6 +41,7 @@ try:
 except ImportError:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
+from crypto_trading_bot.utils.price_feed import get_current_price
 
 # ------------------------------
 # Config and utilities
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover
 TRADES_LOG = os.path.join("logs", "trades.log")
 LEARN_FEEDBACK = os.path.join("logs", "learning_feedback.jsonl")
 SHADOW_RESULTS = os.path.join("logs", "shadow_test_results.jsonl")
+POSITIONS_LOG = os.path.join("logs", "positions.jsonl")
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -113,6 +115,118 @@ def _load_trades(path: str) -> List[Dict[str, Any]]:
             r["roi"] = float(roi)
         out.append(r)
     return out
+
+
+def _load_positions(path: str) -> List[Dict[str, Any]]:
+    raw = _read_jsonl(path)
+    latest: Dict[str, Dict[str, Any]] = {}
+    for idx, entry in enumerate(raw):
+        key = entry.get("trade_id")
+        if not isinstance(key, str) or not key.strip():
+            key = f"row-{idx}"
+        latest[key] = entry
+    return list(latest.values())
+
+
+def _safe_current_price(pair: str, cache: Dict[str, Optional[float]]) -> Optional[float]:
+    if pair in cache:
+        return cache[pair]
+    try:
+        price = get_current_price(pair)
+    except Exception:  # pragma: no cover - price feed backend can vary
+        cache[pair] = None
+        return None
+    if price is None:
+        cache[pair] = None
+        return None
+    try:
+        parsed = float(price)
+    except (TypeError, ValueError):
+        cache[pair] = None
+        return None
+    cache[pair] = parsed
+    return parsed
+
+
+def _summarize_open_positions(positions: List[Dict[str, Any]]) -> tuple[
+    List[Dict[str, Any]],
+    Dict[str, Optional[float]],
+    List[tuple[str, float]],
+]:
+    if not positions:
+        return (
+            [],
+            {
+                "entry_notional": None,
+                "current_notional": None,
+                "unrealized_pnl": None,
+                "net_roi": None,
+            },
+            [],
+        )
+
+    cache: Dict[str, Optional[float]] = {}
+    compiled: List[Dict[str, Any]] = []
+    exposures: Dict[str, float] = defaultdict(float)
+    total_entry = 0.0
+    total_mark = 0.0
+    total_unrealized = 0.0
+
+    for position in positions:
+        try:
+            size = float(position.get("size", 0.0) or 0.0)
+            entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if size <= 0 or entry_price <= 0:
+            continue
+
+        pair = str(position.get("pair") or "UNKNOWN")
+        base_asset = pair.split("/")[0] if "/" in pair else pair
+        entry_notional = entry_price * size
+        total_entry += entry_notional
+
+        current_price = _safe_current_price(pair, cache)
+        unrealized = None
+        roi = None
+        mark_notional = None
+        if current_price is not None:
+            mark_notional = current_price * size
+            total_mark += mark_notional
+            unrealized = (current_price - entry_price) * size
+            total_unrealized += unrealized
+            if entry_price:
+                roi = (current_price - entry_price) / entry_price
+            exposures[base_asset] += mark_notional
+
+        confidence = position.get("confidence")
+        try:
+            confidence_val = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence_val = None
+
+        compiled.append(
+            {
+                "pair": pair,
+                "size": size,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "unrealized_pnl": unrealized,
+                "roi": roi,
+                "confidence": confidence_val,
+            }
+        )
+
+    net_roi = (total_unrealized / total_entry) if total_entry else None
+    summary = {
+        "entry_notional": total_entry if total_entry else None,
+        "current_notional": total_mark if total_mark else None,
+        "unrealized_pnl": total_unrealized if compiled else None,
+        "net_roi": net_roi,
+    }
+
+    exposure_rows = sorted(exposures.items(), key=lambda item: item[1], reverse=True)
+    return compiled, summary, exposure_rows
 
 
 def trade_metrics(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -183,6 +297,27 @@ def trade_metrics(trade_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "weekly_series": weekly_series,
         "recent_24h": recent_any,
     }
+
+
+def _format_open_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    formatted: List[Dict[str, str]] = []
+    for row in rows:
+        current_price = row.get("current_price")
+        pnl = row.get("unrealized_pnl")
+        roi = row.get("roi")
+        confidence = row.get("confidence")
+        formatted.append(
+            {
+                "Pair": row.get("pair", "-"),
+                "Size": f"{row.get('size', 0.0):.6f}",
+                "Entry": f"{row.get('entry_price', 0.0):,.2f}",
+                "Last": "-" if current_price is None else f"{current_price:,.2f}",
+                "Unrealized PnL": "-" if pnl is None else f"{pnl:,.2f}",
+                "ROI": "-" if roi is None else f"{roi * 100:.2f}%",
+                "Confidence": "-" if confidence is None else f"{confidence:.2f}",
+            }
+        )
+    return formatted
 
 
 # ------------------------------
@@ -279,10 +414,13 @@ with st.sidebar:
 trades_data = _load_trades(TRADES_LOG)
 learn_entries = _read_jsonl(LEARN_FEEDBACK)
 shadow_entries = _read_jsonl(SHADOW_RESULTS)
+positions_data = _load_positions(POSITIONS_LOG)
 
 tm = trade_metrics(trades_data)
 ls = summarize_learning(learn_entries)
 ss = summarize_shadow(shadow_entries)
+open_rows_raw, open_summary, exposure_rows = _summarize_open_positions(positions_data)
+open_rows_formatted = _format_open_positions(open_rows_raw)
 
 # Alerts
 if not tm.get("recent_24h"):
@@ -296,6 +434,37 @@ col1.metric("Total Trades", _fmt_num(tm.get("total")))
 col2.metric("Win Rate", _fmt_pct(tm.get("win_rate")))
 col3.metric("Cumulative ROI", _fmt_pct(tm.get("cumulative_roi")))
 col4.metric("Avg ROI / Trade", _fmt_pct(tm.get("avg_roi")))
+
+with st.expander("Open Positions & Exposure", expanded=True):
+    if open_rows_formatted:
+        summary_cols = st.columns(3)
+        entry_notional = open_summary.get("entry_notional")
+        current_notional = open_summary.get("current_notional") or entry_notional
+        unrealized_pnl = open_summary.get("unrealized_pnl")
+        net_roi = open_summary.get("net_roi")
+
+        summary_cols[0].metric(
+            "Entry Exposure",
+            f"${(entry_notional or 0.0):,.2f}",
+        )
+        summary_cols[1].metric(
+            "Mark Exposure",
+            f"${(current_notional or 0.0):,.2f}",
+        )
+        summary_cols[2].metric(
+            "Unrealized PnL",
+            f"${(unrealized_pnl or 0.0):,.2f}",
+            None if net_roi is None else f"{net_roi * 100:.2f}%",
+        )
+
+        st.table(open_rows_formatted)
+
+        if exposure_rows:
+            st.subheader("Exposure by Asset")
+            exposure_table = [{"Asset": asset, "Exposure": f"${value:,.2f}"} for asset, value in exposure_rows]
+            st.table(exposure_table)
+    else:
+        st.info("No open positions logged.")
 
 # Trend charts
 with st.expander("Trend (Daily/Weekly)", expanded=True):

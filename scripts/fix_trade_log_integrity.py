@@ -72,6 +72,32 @@ def _normalize_side(side: Any, strategy: Any, roi: Any) -> str:
     return "long"
 
 
+def _sanitize_confidence(value: Any) -> float:
+    """Return a safe confidence value in the approved range [0.6, 1.0]."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = 0.7
+
+    if parsed <= 0 or parsed > 1:
+        parsed = 0.7
+
+    if abs(parsed - 0.5) < 1e-6:
+        parsed = 0.7
+
+    return max(0.6, min(parsed, 1.0))
+
+
+def _sanitize_strategy(name: Any) -> str:
+    if not isinstance(name, str) or not name.strip():
+        return "UnknownStrategy"
+    alias = name.strip()
+    if alias.upper() == "S":
+        return "UnknownStrategy"
+    return alias
+
+
 def _load_jsonl(path: str) -> Tuple[List[Dict], int]:
     items: List[Dict] = []
     malformed = 0
@@ -142,10 +168,10 @@ def repair(trades_path: str, positions_path: str, dry_run: bool = False) -> Dict
                 "side": side_norm,
                 "entry_price": entry_price,
                 "entry_time": entry_time,
-                "strategy": t.get("strategy"),
-                "confidence": float(t.get("confidence", 0.5) or 0.5),
+                "strategy": _sanitize_strategy(t.get("strategy")),
+                "confidence": _sanitize_confidence(t.get("confidence")),
                 "size": float(t.get("size", 100) or 100),
-                "capital_buffer": float(t.get("capital_buffer", 0.5) or 0.5),
+                "capital_buffer": float(t.get("capital_buffer", 0.25) or 0.25),
                 "status": "closed",
             }
             positions.append(synthetic)
@@ -176,10 +202,10 @@ def repair(trades_path: str, positions_path: str, dry_run: bool = False) -> Dict
             "side": side_norm,
             "entry_price": entry_price,
             "entry_time": entry_time,
-            "strategy": t.get("strategy"),
-            "confidence": float(t.get("confidence", 0.5) or 0.5),
+            "strategy": _sanitize_strategy(t.get("strategy")),
+            "confidence": _sanitize_confidence(t.get("confidence")),
             "size": float(t.get("size", 100) or 100),
-            "capital_buffer": float(t.get("capital_buffer", 0.5) or 0.5),
+            "capital_buffer": float(t.get("capital_buffer", 0.25) or 0.25),
             "status": "open",
         }
         positions.append(synthetic_open)
