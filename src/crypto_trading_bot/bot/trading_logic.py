@@ -10,8 +10,8 @@ manages open positions, and checks exit conditions.
 import datetime
 import json
 import logging
+import math
 import os
-import random
 import shutil
 import time
 import uuid
@@ -30,6 +30,7 @@ from crypto_trading_bot.bot.utils.alert import send_alert
 from crypto_trading_bot.config import CONFIG, get_mode_label, is_live, set_live_mode
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
     KrakenAuthError,
@@ -76,6 +77,24 @@ TRADE_INTERVAL = 300
 MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
 PAPER_STARTING_BALANCE = float(CONFIG.get("paper_mode", {}).get("starting_balance", 100_000.0))
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
+TEST_MODE = os.getenv("CRYPTO_TRADING_BOT_TEST_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+_VOLUME_CACHE: dict[str, tuple[float, float]] = {}
+_VOLUME_CACHE_TTL_SECONDS = 60.0
+
+
+def _resolve_trade_size_bounds(pair: str) -> tuple[float, float]:
+    """Return (min_volume, max_volume) for the given trading pair."""
+
+    trade_size_cfg = CONFIG.get("trade_size", {}) or {}
+    default_min = float(trade_size_cfg.get("default_min", 0.001) or 0.001)
+    default_max = float(trade_size_cfg.get("default_max", 0.005) or 0.005)
+    per_pair = trade_size_cfg.get("per_pair", {}) or {}
+    pair_cfg = per_pair.get(pair, {})
+    min_volume = float(pair_cfg.get("min_volume", default_min) or default_min)
+    max_volume = float(pair_cfg.get("max_volume", default_max) or default_max)
+    return max(min_volume, 0.0), max(max_volume, min_volume)
+
 
 # Real-time price feed imported above per lint ordering
 
@@ -161,6 +180,13 @@ def _evaluate_auto_pause(state_snapshot: dict[str, Any] | None) -> tuple[bool, s
         drawdown = float(state.get("drawdown_pct", 0.0) or 0.0)
     except (TypeError, ValueError):
         drawdown = 0.0
+
+    try:
+        state_drawdown_limit = float(state.get("drawdown_limit"))
+    except (TypeError, ValueError):
+        state_drawdown_limit = None
+    if state_drawdown_limit is not None and state_drawdown_limit > 0:
+        drawdown_limit = state_drawdown_limit
 
     if drawdown_limit > 0 and drawdown >= drawdown_limit:
         return True, f"Max drawdown {drawdown:.2%} ≥ limit {drawdown_limit:.2%}"
@@ -267,7 +293,8 @@ def _submit_live_trade(
         )
         return False
 
-    min_volume = float(pair_meta.get("ordermin", 0.0) or 0.0)
+    config_min_volume, _ = _resolve_trade_size_bounds(pair)
+    min_volume = max(float(pair_meta.get("ordermin", 0.0) or 0.0), config_min_volume)
     metadata_cost_threshold = float(pair_meta.get("costmin", 0.0) or 0.0)
     price_decimals = int(pair_meta.get("pair_decimals", 5) or 5)
     volume_decimals = int(pair_meta.get("lot_decimals", 8) or 8)
@@ -499,16 +526,118 @@ def _guard_low_disk_space() -> bool:
     return False
 
 
-mock_volume_data = {
-    "BTC": [1500 for _ in range(100)],
-    "ETH": [random.randint(300, 1000) for _ in range(100)],
-    "XRP": [random.randint(100, 300) for _ in range(100)],
-    "LINK": [random.randint(100, 300) for _ in range(100)],
-    "SOL": [random.randint(200, 600) for _ in range(100)],
-}
+def _fetch_recent_volume(pair: str, *, candles: int = 5, fallback: float = 0.0) -> float | None:
+    """Return an approximate recent volume for ``pair`` using Kraken OHLC data."""
+
+    now = time.monotonic()
+    cached = _VOLUME_CACHE.get(pair)
+    if cached and now - cached[0] <= _VOLUME_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        rows = get_ohlc_data(pair, interval=1, limit=max(1, candles))
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Volume fetch failed for %s: %s", pair, exc)
+        if TEST_MODE:
+            return fallback
+        return None
+
+    volumes = [float(row.get("volume", 0.0)) for row in rows if row.get("volume")]
+    if not volumes:
+        if TEST_MODE:
+            return fallback
+        logger.warning("No volume data returned for %s", pair)
+        return None
+
+    avg_volume = sum(volumes[-candles:]) / min(len(volumes), candles)
+    _VOLUME_CACHE[pair] = (now, avg_volume)
+    return avg_volume
+
 
 # Configurable minimum volume threshold (testing lower assets like XRP/LINK/SOL)
 MIN_VOLUME = CONFIG.get("min_volume", 100)
+
+
+def _load_history_series(
+    pair: str,
+    *,
+    window: int,
+    cache: dict[str, list[float]],
+) -> list[float]:
+    """Return cached price history for ``pair`` with a minimum window length."""
+
+    series = cache.get(pair)
+    if series is None:
+        try:
+            raw_history = get_history_prices(pair, min_len=window)
+            series = [p for p in raw_history if p is not None]
+        except HistoryUnavailable:
+            series = []
+        cache[pair] = series
+    return series
+
+
+def _compute_pair_correlation(
+    pair_a: str,
+    pair_b: str,
+    *,
+    window: int,
+    cache: dict[str, list[float]],
+) -> float | None:
+    """Return Pearson correlation for the trailing ``window`` prices of two pairs."""
+
+    if np is None:
+        raise ImportError("numpy not available")
+
+    series_a = _load_history_series(pair_a, window=window, cache=cache)
+    series_b = _load_history_series(pair_b, window=window, cache=cache)
+    if len(series_a) < window or len(series_b) < window:
+        return None
+
+    compare_len = min(len(series_a), len(series_b), window)
+    if compare_len < 2:
+        return None
+
+    segment_a = series_a[-compare_len:]
+    segment_b = series_b[-compare_len:]
+    corr_matrix = np.corrcoef(segment_a, segment_b)
+    value = float(corr_matrix[0, 1])
+    if math.isnan(value):
+        return None
+    return value
+
+
+def _evaluate_correlation_blocks(
+    asset: str,
+    proposed_trades: list[dict[str, Any]],
+    *,
+    cache: dict[str, list[float]],
+    window: int,
+    threshold: float,
+) -> tuple[bool, list[dict[str, float]]]:
+    """Return (should_skip, diagnostics) for correlation control."""
+
+    skip_due_to_corr = False
+    corr_rows: list[dict[str, float]] = []
+    for trade in proposed_trades:
+        other = trade.get("asset")
+        if other is None or other == asset:
+            continue
+        pair_a = f"{asset}/USD"
+        pair_b = f"{other}/USD"
+        corr_value = _compute_pair_correlation(
+            pair_a,
+            pair_b,
+            window=window,
+            cache=cache,
+        )
+        if corr_value is None:
+            continue
+        corr_rows.append({"pair": f"{asset}-{other}", "other": other, "corr": corr_value})
+        if corr_value >= threshold:
+            skip_due_to_corr = True
+            break
+    return skip_due_to_corr, corr_rows
 
 
 class PositionManager:
@@ -569,6 +698,7 @@ class PositionManager:
         exits = []
         current_time = datetime.datetime.now(datetime.UTC)
         keys_to_delete = []
+        history_cache: dict[str, list[float]] = {}
         for trade_id, pos in self.positions.items():
             # Current price (ledger applies exit slippage at write time)
             price = current_prices.get(pos["pair"], pos["entry_price"])
@@ -585,28 +715,34 @@ class PositionManager:
 
             # RSI-based exit check before other exits
             try:
-                # Without historical data, attempt RSI with minimal series (will likely skip)
-                price_now = price
-                history = [price_now] if price_now and price_now > 0 else []
-                if history and len(history) >= CONFIG["rsi"]["period"] + 1:
-                    if calculate_rsi is None:
-                        msg = "⚠️ RSI calculator unavailable — skipping RSI exit " f"for {trade_id}"
-                        print(msg)
-                    else:
-                        rsi_val = calculate_rsi(
-                            history,
-                            CONFIG["rsi"]["period"],
-                        )  # type: ignore[misc]
-                        rsi_cfg = CONFIG["rsi"]
+                if calculate_rsi is not None:
+                    pair = pos["pair"]
+                    rsi_period = int(CONFIG.get("rsi", {}).get("period", 14))
+                    history = history_cache.get(pair)
+                    if history is None:
+                        try:
+                            raw_history = get_history_prices(pair, min_len=rsi_period + 1)
+                            history = [p for p in raw_history if p is not None]
+                            history_cache[pair] = history
+                        except HistoryUnavailable:
+                            history = []
+                    if price and (not history or history[-1] != price):
+                        history = ((history or []) + [price])[-(rsi_period + 5) :]
+                        history_cache[pair] = history
+                    if history and len(history) >= rsi_period + 1:
+                        rsi_val = calculate_rsi(history[-(rsi_period + 1) :], rsi_period)  # type: ignore[misc]
+                        rsi_cfg = CONFIG.get("rsi", {})
                         exit_upper = rsi_cfg.get("exit_upper", rsi_cfg.get("upper", 70))
-                        if rsi_val is not None and rsi_val >= exit_upper:
+                        if rsi_val is not None and float(rsi_val) >= float(exit_upper):
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pos['pair']} " f"rsi={rsi_val:.2f}")
+                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pair} rsi={float(rsi_val):.2f}")
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
-            except (KeyError, ValueError, TypeError, IndexError) as e:
+                else:
+                    print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+            except (HistoryUnavailable, KeyError, ValueError, TypeError, IndexError) as e:
                 print(f"[EXIT] RSI check error for {trade_id}: {e}")
 
             if ret <= -sl:
@@ -711,9 +847,25 @@ def _compute_position_sizing(
         return 0.0, 0.0, 0.0
 
     # Respect maximum size; if size falls below minimum, skip this trade
+    max_size = max(max_size, min_size)
     units = min(raw_units, max_size)
-    if units < min_size:
-        return 0.0, 0.0, 0.0
+    min_units = float(min_size)
+    if units < min_units:
+        min_notional = min_units * current_price
+        if min_notional <= remaining_capital:
+            logger.debug(
+                "Adjusting position size to meet exchange minimum | target_units=%.6f min_units=%.6f",
+                units,
+                min_units,
+            )
+            units = min_units
+        else:
+            logger.warning(
+                "Insufficient capital to meet minimum position size | required_notional=%.4f available=%.4f",
+                min_notional,
+                remaining_capital,
+            )
+            return 0.0, 0.0, 0.0
 
     units = round(units, 6)
     notional = units * current_price
@@ -845,12 +997,20 @@ def evaluate_signals_and_trade(
     trade_risk_pct = 0.02 if risk_per_trade is None else max(float(risk_per_trade), 0.0)
     # Build current price map using live feed for each pair
     current_prices: dict[str, float] = {}
+    current_volumes: dict[str, float] = {}
+    historical_price_cache: dict[str, list[float]] = {}
     for pair in pairs:
         price_now = get_current_price(pair)
         asset = pair.split("/")[0]
         if price_now is not None and price_now > 0:
             current_prices[pair] = price_now
             print(f"[FEED] {asset} price OK: {price_now}")
+            volume_estimate = _fetch_recent_volume(pair, fallback=float(MIN_VOLUME))
+            if volume_estimate is not None and volume_estimate > 0:
+                current_volumes[pair] = volume_estimate
+            else:
+                logger.warning("No volume data available for %s; skipping in volume map", pair)
+                print(f"⚠️ No volume data for {pair}; skipping volume-driven checks")
         else:
             print(f"⚠️ No current price for {pair}; skipping in price map")
 
@@ -993,6 +1153,7 @@ def evaluate_signals_and_trade(
                     continue
                 # Filter out None values before strategy evaluation
                 safe_prices = [p for p in safe_prices if p is not None]
+                historical_price_cache[pair] = safe_prices
                 # Pre-pair debug trace
                 print(f"[TEST] Generating signal for {pair} with {len(safe_prices)} valid candles")
                 last5 = safe_prices[-5:]
@@ -1013,9 +1174,20 @@ def evaluate_signals_and_trade(
                 adx_val = context.get_adx(pair, safe_prices)
                 if adx_val is not None:
                     print(f"[ADX] {pair} ADX={adx_val:.2f}")
-                volume = mock_volume_data.get(asset, [MIN_VOLUME])[-1]
+                volume = current_volumes.get(pair)
+                if volume is None:
+                    volume = _fetch_recent_volume(pair, fallback=float(MIN_VOLUME))
+                    if volume is not None and volume > 0:
+                        current_volumes[pair] = volume
+                if volume is None or volume <= 0:
+                    if TEST_MODE:
+                        volume = float(MIN_VOLUME)
+                        print(f"[TEST MODE] Falling back to MIN_VOLUME for {pair}: {volume}")
+                    else:
+                        print(f"[SKIP] {asset}: volume unavailable; skipping")
+                        continue
                 if volume < MIN_VOLUME:
-                    print(f"[SKIP] {asset}: volume {volume} < MIN_VOLUME {MIN_VOLUME}")
+                    print(f"[SKIP] {asset}: volume {volume:.2f} < MIN_VOLUME {MIN_VOLUME}")
                     continue
                 # Reinitialize strategies per iteration to reset state
                 per_asset_params = CONFIG.get("strategy_params", {})
@@ -1035,15 +1207,16 @@ def evaluate_signals_and_trade(
                     ADXStrategy(per_asset=per_asset_params.get("ADXStrategy", {})),
                     CompositeStrategy(per_asset=per_asset_params.get("CompositeStrategy", {})),
                 ]
-                # Per-asset stats
+                regime = context.get_regime()
+                strategy_candidates: list[dict[str, Any]] = []
                 signals_count = 0
                 buy_count = 0
                 sell_count = 0
                 skipped_low_conf = 0
                 skipped_none = 0
+
                 for strategy in strategies:
                     try:
-                        # Pass asset hint where supported
                         try:
                             signal_result = strategy.generate_signal(
                                 safe_prices,
@@ -1052,7 +1225,6 @@ def evaluate_signals_and_trade(
                                 adx=adx_val,
                             )
                         except TypeError:
-                            # Older strategies may not accept 'adx'
                             signal_result = strategy.generate_signal(
                                 safe_prices,
                                 volume=volume,
@@ -1085,22 +1257,40 @@ def evaluate_signals_and_trade(
                         continue
 
                     print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
-                    signal = signal_result.get("signal") or signal_result.get("side")
-                    if not signal:
-                        print(f"[SKIP] No signal generated for {pair} — " "strategy returned None or RSI failed")
-                    confidence = float(signal_result.get("confidence", 0.0) or 0.0)
+                    candidate_signal = signal_result.get("signal") or signal_result.get("side")
+                    candidate_confidence = float(signal_result.get("confidence", 0.0) or 0.0)
                     strategy_name = strategy.__class__.__name__
 
-                    regime = context.get_regime()
-                    buffer = context.get_buffer_for_strategy(strategy_name)
-
-                    if signal in ["buy", "sell"]:
-                        print(f"[RSI DEBUG] Signal for {pair} -> {signal}")
-
-                    if signal not in ["buy", "sell"]:
+                    if candidate_signal in {"buy", "sell"}:
+                        print(f"[RSI DEBUG] Signal for {pair} -> {candidate_signal}")
+                        strategy_candidates.append(
+                            {
+                                "strategy": strategy_name,
+                                "signal": candidate_signal,
+                                "confidence": candidate_confidence,
+                                "raw": signal_result,
+                                "buffer": context.get_buffer_for_strategy(strategy_name),
+                            }
+                        )
+                        signals_count += 1
+                        if candidate_signal == "buy":
+                            buy_count += 1
+                        else:
+                            sell_count += 1
+                    else:
                         skipped_none += 1
                         print(f"⚠️ Skipping {pair} — No actionable signal")
-                        continue
+
+                actionable_candidates = [c for c in strategy_candidates if c["signal"] in {"buy", "sell"}]
+                if not actionable_candidates:
+                    continue
+
+                selected = max(actionable_candidates, key=lambda c: c["confidence"])
+                signal = selected["signal"]
+                confidence = selected["confidence"]
+                strategy_name = selected["strategy"]
+                buffer = selected["buffer"]
+
                 # ADX gating (regime filter)
                 if adx_val is not None:
                     if adx_val < 20.0:
@@ -1111,11 +1301,12 @@ def evaluate_signals_and_trade(
                     if adx_val > 40.0:
                         before = confidence
                         confidence = min(1.0, confidence * 1.2)
-                        print(f"[ADX] Boosted confidence {before:.3f} → " f"{confidence:.3f} (strong trend)")
-                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted " f"confidence={confidence:.3f}")
+                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
+                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence={confidence:.3f}")
+
                 if confidence < 0.4:
                     skipped_low_conf += 1
-                    print(f"⚠️ Skipping {pair} — Confidence too low: {confidence}")
+                    print(f"⚠️ Skipping {pair} — Confidence too low: {confidence:.3f}")
                     continue
                 if volume is None or volume < MIN_VOLUME:
                     print(f"[{pair}] Skipping due to low volume: {volume}")
@@ -1133,9 +1324,7 @@ def evaluate_signals_and_trade(
                     print("⚠️ Capital exhausted for new positions; stopping scans.")
                     break
 
-                cfg_sz = CONFIG.get("trade_size", {})
-                min_sz = float(cfg_sz.get("min", 0.001))
-                max_sz = float(cfg_sz.get("max", 0.005))
+                min_sz, max_sz = _resolve_trade_size_bounds(pair)
                 dynamic_buffer = context.get_buffer_for_strategy(strategy_name)
                 liquidity_factor = min(volume / 1000, 1.0)
 
@@ -1181,49 +1370,16 @@ def evaluate_signals_and_trade(
                     if np is None:
                         raise ImportError("numpy not available")
 
-                    corr_threshold = CONFIG.get("correlation", {}).get("threshold", 0.7)
-                    skip_due_to_corr = False
-                    corr_rows = []
-                    for t in proposed_trades:
-                        other = t["asset"]
-                        if other == asset:
-                            continue
-                        # Without historical series, correlation is not computed
-                        pair_a = f"{asset}/USD"
-                        pair_b = f"{other}/USD"
-                        a_price = current_prices.get(pair_a) or get_current_price(pair_a)
-                        b_price = current_prices.get(pair_b) or get_current_price(pair_b)
-                        a = [a_price] if a_price else []
-                        b = [b_price] if b_price else []
-                        if len(a) >= 2 and len(b) >= 2:
-                            c = float(np.corrcoef(a, b)[0, 1])
-                            corr_rows.append({"pair": f"{asset}-{other}", "corr": c})
-                            if c >= corr_threshold:
-                                skip_due_to_corr = True
-                                # Log block event
-                                os.makedirs("logs", exist_ok=True)
-                                with open(
-                                    "logs/portfolio_metrics.log",
-                                    "a",
-                                    encoding="utf-8",
-                                ) as f:
-                                    corr_timestamp = datetime.datetime.now(datetime.UTC).isoformat()
-                                    f.write(
-                                        json.dumps(
-                                            {
-                                                "timestamp": corr_timestamp,
-                                                "type": "correlation_block",
-                                                "asset": asset,
-                                                "other": other,
-                                                "corr": c,
-                                            }
-                                        )
-                                        + "\n"
-                                    )
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                                break
-                    # Log all evaluated correlations
+                    corr_cfg = CONFIG.get("correlation", {})
+                    corr_threshold = float(corr_cfg.get("threshold", 0.7))
+                    corr_window = max(int(corr_cfg.get("window", 30)), 5)
+                    skip_due_to_corr, corr_rows = _evaluate_correlation_blocks(
+                        asset,
+                        proposed_trades,
+                        cache=historical_price_cache,
+                        window=corr_window,
+                        threshold=corr_threshold,
+                    )
                     if corr_rows:
                         os.makedirs("logs", exist_ok=True)
                         with open(
@@ -1243,6 +1399,29 @@ def evaluate_signals_and_trade(
                                     )
                                     + "\n"
                                 )
+                            f.flush()
+                            os.fsync(f.fileno())
+                    if skip_due_to_corr and corr_rows:
+                        last_row = corr_rows[-1]
+                        os.makedirs("logs", exist_ok=True)
+                        with open(
+                            "logs/portfolio_metrics.log",
+                            "a",
+                            encoding="utf-8",
+                        ) as f:
+                            corr_timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+                            f.write(
+                                json.dumps(
+                                    {
+                                        "timestamp": corr_timestamp,
+                                        "type": "correlation_block",
+                                        "asset": asset,
+                                        "other": last_row.get("other"),
+                                        "corr": last_row["corr"],
+                                    }
+                                )
+                                + "\n"
+                            )
                             f.flush()
                             os.fsync(f.fileno())
                     if skip_due_to_corr:
@@ -1346,75 +1525,9 @@ def evaluate_signals_and_trade(
             except Exception as e:  # pylint: disable=broad-exception-caught
                 print(f"[ERROR] Exception while evaluating {pair}: {e}")
 
-    # Ensure at least one trade is logged so validator can run
     if executed_trades == 0:
-        if os.getenv("ENV") == "production":
-            print("[FALLBACK] Skipping fallback seeding — disabled in production mode")
-            return
-        try:
-            # Fix: remove hardcoded pair; use first configured pair if available
-            pair = pairs[0]
-            price = get_current_price(pair)
-            if price is None or price <= 0:
-                print("[FALLBACK] No real-time price available for fallback seeding; skipping")
-                return
-            strategy_name = "SimpleRSIStrategy"
-            confidence = 1.0
-            regime = context.get_regime()
-            buffer = context.get_buffer_for_strategy(strategy_name)
-            cfg_sz = CONFIG.get("trade_size", {})
-            min_sz = float(cfg_sz.get("min", 0.001))
-            max_sz = float(cfg_sz.get("max", 0.005))
-            fallback_size, _, _ = _compute_position_sizing(
-                total_capital=total_capital if total_capital > 0 else PAPER_STARTING_BALANCE,
-                remaining_capital=total_capital if total_capital > 0 else PAPER_STARTING_BALANCE,
-                current_price=price,
-                confidence=confidence,
-                base_risk_pct=trade_risk_pct if trade_risk_pct > 0 else 0.02,
-                buffer=buffer,
-                reinvestment_rate=reinvestment_rate,
-                liquidity_factor=1.0,
-                min_size=min_sz,
-                max_size=max_sz,
-            )
-            if fallback_size <= 0:
-                print("[FALLBACK] Unable to compute a viable fallback position size; skipping")
-                return
-            adjusted_size = fallback_size
-            trade_id = str(uuid.uuid4())
-            entry_raw = price
-            ledger.log_trade(
-                trading_pair=pair,
-                trade_size=adjusted_size,
-                strategy_name=strategy_name,
-                trade_id=trade_id,
-                confidence=confidence,
-                entry_price=entry_raw,
-                regime=regime,
-                capital_buffer=buffer,
-            )
-            # Use the exact entry_price and timestamp from the ledger
-            logged_trade = next(
-                (t for t in ledger.trades if t.get("trade_id") == trade_id),
-                None,
-            )
-            logged_price = logged_trade.get("entry_price") if logged_trade else None
-            logged_ts = logged_trade.get("timestamp") if logged_trade else None
-            if logged_price is None:
-                logged_price = round(entry_raw * (1 + 0.002), 4)
-            position_manager.open_position(
-                trade_id=trade_id,
-                pair=pair,
-                size=adjusted_size,
-                entry_price=logged_price,
-                strategy=strategy_name,
-                confidence=confidence,
-                timestamp=logged_ts,
-            )
-            print(f"[FALLBACK] Seeded one trade {trade_id} for {pair}")
-            executed_trades = 1
-        except (ValueError, RuntimeError) as e:
-            print(f"[FALLBACK] Failed to seed trade: {e}")
+        logger.info("No executable signals produced this cycle; no trades submitted.")
+        print("ℹ️ No executable signals produced this cycle; no trades submitted.")
     # Exit evaluation now relies solely on observed market prices; no synthetic injections.
     exits = position_manager.check_exits(current_prices)
     for trade_id, exit_price, reason in exits:

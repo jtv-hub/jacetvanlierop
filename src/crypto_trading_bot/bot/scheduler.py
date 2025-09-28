@@ -20,7 +20,7 @@ from crypto_trading_bot.bot.utils.log_rotation import (
     get_anomalies_logger,
     get_rotating_handler,
 )
-from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
@@ -216,6 +216,8 @@ def should_run_anomaly_audit(last_audit_time):
 def run_scheduler():
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
     print("📅 Scheduler started. Running bot tasks...")
+    mode_label = get_mode_label()
+    print(f"🛰️  Operating mode: {mode_label} (is_live={is_live})")
 
     get_rotating_handler("trades.log")
     get_rotating_handler("anomalies.log")

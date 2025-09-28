@@ -80,7 +80,11 @@ def main():
     if args.confirm_live_mode and args.dry_run:
         parser.error("--confirm-live-mode is incompatible with --dry-run")
 
-    if args.confirm_live_mode:
+    env_live_mode = os.getenv("LIVE_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if env_live_mode:
+        logging.warning("LIVE_MODE requested via environment variable.")
+
+    if args.confirm_live_mode or env_live_mode:
         try:
             set_live_mode(True)
         except ConfigurationError as exc:

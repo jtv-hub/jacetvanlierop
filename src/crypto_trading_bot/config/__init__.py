@@ -26,6 +26,11 @@ try:  # pragma: no cover - handled in tests via monkeypatch
     from crypto_trading_bot.utils.kraken_client import query_api_key_permissions
 except Exception:  # pragma: no cover - absence handled safely below
     query_api_key_permissions = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - metadata fetch optional during tests
+    from crypto_trading_bot.utils.kraken_client import kraken_get_asset_pair_meta
+except Exception:  # pragma: no cover
+    kraken_get_asset_pair_meta = None  # type: ignore[assignment]
 logger = logging.getLogger(__name__)
 
 LIVE_MODE_LABEL = "\U0001f6a8 LIVE MODE \U0001f6a8"
@@ -278,15 +283,99 @@ def _to_bool(value: str | None, default: bool) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
-# Load environment variables from a .env file in the project root
-CONFIG: dict = {
-    "tradable_pairs": [
+def _parse_pair_list(raw: str) -> list[str]:
+    pairs: list[str] = []
+    for token in raw.split(","):
+        cleaned = _sanitize_value(token).upper()
+        if cleaned and "/" in cleaned:
+            pairs.append(cleaned)
+    return pairs
+
+
+def _load_tradable_pairs() -> list[str]:
+    """Return a list of tradable pairs validated against Kraken metadata."""
+
+    env_pairs = _parse_pair_list(os.getenv("CRYPTO_TRADING_BOT_PAIRS", ""))
+    default_pairs = [
         "BTC/USD",
         "ETH/USD",
         "SOL/USD",
         "XRP/USD",
         "LINK/USD",
-    ],
+    ]
+
+    candidates = env_pairs or default_pairs
+    validated: list[str] = []
+
+    if not candidates:
+        return []
+
+    for pair in candidates:
+        if kraken_get_asset_pair_meta is None:
+            validated.append(pair)
+            continue
+        try:
+            meta = kraken_get_asset_pair_meta(pair)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("Failed to validate pair %s via Kraken metadata: %s", pair, exc)
+            continue
+        if meta:
+            validated.append(pair)
+
+    if validated:
+        return validated
+
+    logger.warning("No tradable pairs validated; falling back to defaults without metadata confirmation.")
+    return default_pairs
+
+
+def _build_trade_size_config(pairs: list[str]) -> dict:
+    """Return per-pair trade size constraints derived from Kraken metadata."""
+
+    default_min = float(os.getenv("CRYPTO_TRADING_BOT_DEFAULT_MIN_VOLUME", "0.001"))
+    default_max = float(os.getenv("CRYPTO_TRADING_BOT_DEFAULT_MAX_VOLUME", "0.005"))
+    per_pair: dict[str, dict[str, float]] = {}
+
+    if not pairs:
+        return {
+            "default_min": default_min,
+            "default_max": default_max,
+            "per_pair": per_pair,
+        }
+
+    for pair in pairs:
+        if kraken_get_asset_pair_meta is None:
+            logger.warning("Kraken metadata unavailable; using fallback trade sizes for %s", pair)
+            continue
+        try:
+            meta = kraken_get_asset_pair_meta(pair)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning(
+                "Failed to load trade size metadata for %s: %s — using defaults",
+                pair,
+                exc,
+            )
+            continue
+        min_volume = float(meta.get("ordermin", default_min) or default_min)
+        min_cost = float(meta.get("costmin", 0.0) or 0.0)
+        per_pair[pair] = {
+            "min_volume": min_volume,
+            "min_cost": min_cost,
+        }
+
+    return {
+        "default_min": default_min,
+        "default_max": default_max,
+        "per_pair": per_pair,
+    }
+
+
+_TRADABLE_PAIRS = _load_tradable_pairs()
+
+
+# Load environment variables from a .env file in the project root
+CONFIG: dict = {
+    "tradable_pairs": list(_TRADABLE_PAIRS),
     "rsi": {
         "period": 14,
         "lower": 48,
@@ -295,7 +384,7 @@ CONFIG: dict = {
     },
     "max_portfolio_risk": 0.10,
     "min_volume": 100,
-    "trade_size": {"min": 0.001, "max": 0.005},
+    "trade_size": _build_trade_size_config(_TRADABLE_PAIRS),
     "slippage": {
         "majors": 0.001,
         "alts_min": 0.005,
@@ -371,6 +460,19 @@ CONFIG["prelaunch_guard"].setdefault(
 CONFIG["prelaunch_guard"].setdefault(
     "max_recent_high_severity", int(os.getenv("CRYPTO_TRADING_BOT_MAX_RECENT_HIGH_SEVERITY", "50"))
 )
+
+CONFIG["test_mode"] = _to_bool(os.getenv("CRYPTO_TRADING_BOT_TEST_MODE"), False)
+
+_LIVE_MODE_ENV = _to_bool(os.getenv("LIVE_MODE"), False)
+CONFIG.setdefault("live_mode", {})["requested_via_env"] = _LIVE_MODE_ENV
+
+if _LIVE_MODE_ENV:
+    try:
+        set_live_mode(True)
+        logger.warning("LIVE_MODE enabled via environment variable.")
+    except ConfigurationError as exc:
+        logger.critical("Failed to enable LIVE_MODE from environment: %s", exc)
+        raise
 
 
 __all__ = [

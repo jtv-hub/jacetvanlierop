@@ -222,19 +222,23 @@ def refresh_portfolio_state(
 
     _log_detected_balance(available_capital, capital_source)
 
-    prev_peak = 0.0
     prev_baseline = 0.0
     if prev_state:
-        try:
-            prev_peak = float(prev_state.get("peak_capital", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            prev_peak = 0.0
         try:
             prev_baseline = float(prev_state.get("baseline_capital", 0.0) or 0.0)
         except (TypeError, ValueError):
             prev_baseline = 0.0
 
-    peak_capital = max(prev_peak, available_capital)
+    try:
+        prev_all_time_high = float(prev_state.get("all_time_high", prev_state.get("peak_capital", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        prev_all_time_high = 0.0
+
+    all_time_high = prev_all_time_high if prev_all_time_high > 0 else available_capital
+    if available_capital > all_time_high:
+        all_time_high = available_capital
+
+    peak_capital = all_time_high
 
     if capital_source == "live_account":
         if prev_state.get("capital_source") != "live_account" or prev_baseline <= 0:
@@ -244,9 +248,32 @@ def refresh_portfolio_state(
     else:
         baseline_capital = prev_baseline if prev_baseline > 0 else effective_start
 
-    drawdown_pct = 0.0
-    if peak_capital > 0:
-        drawdown_pct = max(0.0, (peak_capital - available_capital) / peak_capital)
+    raw_drawdown = 0.0
+    if all_time_high > 0:
+        raw_drawdown = (all_time_high - available_capital) / all_time_high
+    drawdown_pct = min(max(raw_drawdown, 0.0), 1.0)
+
+    raw_drawdown_limit = os.getenv("MAX_DRAWDOWN_LIMIT")
+    cfg_drawdown_limit = float(CONFIG.get("auto_pause", {}).get("max_drawdown_pct", 0.10) or 0.0)
+    drawdown_limit = cfg_drawdown_limit
+    if raw_drawdown_limit is not None:
+        try:
+            drawdown_limit = float(raw_drawdown_limit)
+        except ValueError:
+            logger.warning(
+                "Invalid MAX_DRAWDOWN_LIMIT env value %s; falling back to %.2f%%",
+                raw_drawdown_limit,
+                cfg_drawdown_limit * 100,
+            )
+    drawdown_limit = min(max(drawdown_limit, 0.0), 1.0)
+
+    logger.debug(
+        "[DRAWDOWN] Balance=%s | High=%s | Drawdown=%.2f%% | Limit=%.2f%%",
+        _format_currency(available_capital),
+        _format_currency(all_time_high),
+        drawdown_pct * 100,
+        drawdown_limit * 100,
+    )
 
     total_roi = 0.0
     if baseline_capital > 0:
@@ -298,8 +325,10 @@ def refresh_portfolio_state(
         "closed_trade_count": len(closed_trades),
         "capital_source": capital_source,
         "peak_capital": peak_capital,
+        "all_time_high": round(all_time_high, 2),
         "baseline_capital": baseline_capital if baseline_capital > 0 else effective_start,
         "drawdown_pct": round(drawdown_pct, 6),
+        "drawdown_limit": drawdown_limit,
         "total_roi": round(total_roi, 6),
     }
     save_state(snapshot)

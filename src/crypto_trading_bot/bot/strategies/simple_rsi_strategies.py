@@ -169,12 +169,17 @@ class SimpleRSIStrategy:
                 print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence={baseline_conf}")
 
         # Signals: still trigger at thresholds, but confidence uses nonlinear curve
+        def _scaled_conf(score: float) -> float:
+            return max(0.4, min(0.9, 0.4 + score * 0.5))
+
+        final_conf = _scaled_conf(baseline_conf)
+
         if rsi_val < oversold and baseline_conf > 0.0:
             return {
                 "signal": "buy",
                 "side": "buy",
                 "strategy": "SimpleRSIStrategy",
-                "confidence": 1.0,
+                "confidence": final_conf,
                 "raw_confidence": round(baseline_conf, 4),
             }
         if rsi_val > overbought and baseline_conf > 0.0:
@@ -182,7 +187,7 @@ class SimpleRSIStrategy:
                 "signal": "sell",
                 "side": "sell",
                 "strategy": "SimpleRSIStrategy",
-                "confidence": 1.0,
+                "confidence": final_conf,
                 "raw_confidence": round(baseline_conf, 4),
             }
         return {"signal": None, "side": None, "strategy": "SimpleRSIStrategy", "confidence": 0.0}

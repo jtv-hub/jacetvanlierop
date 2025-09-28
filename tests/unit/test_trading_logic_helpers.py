@@ -1,5 +1,10 @@
 """Unit tests for trading_logic helpers: gather_signals, risk_screen, execute_trade, and exits."""
 
+import math
+
+import pytest
+
+import crypto_trading_bot.bot.trading_logic as trading_logic
 from crypto_trading_bot.bot.trading_logic import (
     check_and_close_exits,
     execute_trade,
@@ -67,3 +72,71 @@ def test_risk_screen_returns_bool_for_various_inputs():
     for payload in ({}, {"unknown": 123}, {"pair": "BTC/USD", "size": 0}):
         result = risk_screen(payload, context=None)
         assert isinstance(result, bool)
+
+
+def test_compute_pair_correlation_detects_high_alignment(monkeypatch):
+    """High correlation inputs should exceed the configured threshold."""
+
+    pytest.importorskip("numpy")
+
+    base_series = [float(100 + i) for i in range(40)]
+    offset_series = [value * 1.02 for value in base_series]
+
+    def fake_history(pair, min_len):
+        assert min_len <= 40
+        if pair == "AAA/USD":
+            return base_series
+        return offset_series
+
+    cache: dict[str, list[float]] = {}
+    monkeypatch.setattr(trading_logic, "get_history_prices", fake_history)
+
+    corr = trading_logic._compute_pair_correlation(
+        "AAA/USD",
+        "BBB/USD",
+        window=30,
+        cache=cache,
+    )
+    assert corr is not None
+    assert corr > 0.99
+
+    skip, rows = trading_logic._evaluate_correlation_blocks(
+        "AAA",
+        [{"asset": "BBB"}],
+        cache=cache,
+        window=30,
+        threshold=0.9,
+    )
+    assert skip is True
+    assert rows and rows[-1]["corr"] >= 0.9
+
+
+def test_position_manager_rsi_exit_triggers(monkeypatch):
+    """RSI exit should close a position when RSI exceeds the configured threshold."""
+
+    manager = trading_logic.PositionManager()
+    trade_id = "t-123"
+    pair = "BTC/USD"
+    manager.positions[trade_id] = {
+        "trade_id": trade_id,
+        "pair": pair,
+        "size": 0.01,
+        "entry_price": 100.0,
+        "timestamp": "2023-01-01T00:00:00+00:00",
+        "strategy": "SimpleRSIStrategy",
+        "confidence": 0.6,
+    }
+
+    def fake_history(_pair, min_len):
+        assert _pair == pair
+        return [100 + i for i in range(min_len + 5)]
+
+    monkeypatch.setattr(trading_logic, "get_history_prices", fake_history)
+    monkeypatch.setattr(trading_logic, "calculate_rsi", lambda prices, period: float(75.0))
+
+    exits = manager.check_exits({pair: 150.0})
+    assert exits
+    exit_id, exit_price, reason = exits[0]
+    assert exit_id == trade_id
+    assert math.isclose(exit_price, 150.0)
+    assert reason == "RSI_EXIT"
