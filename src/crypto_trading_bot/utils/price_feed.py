@@ -31,7 +31,7 @@ def _now() -> float:
 
 
 def _kraken_to_app_pair(pair: str) -> str:
-    """Convert Kraken altname like 'XBTUSD' to app format 'BTC/USD'.
+    """Convert Kraken altname like 'XBTUSDC' to app format 'BTC/USDC'.
 
     Uses inverse mapping of kraken_api.PAIR_MAP when available; otherwise,
     applies a lightweight heuristic (assumes USD quote).
@@ -40,11 +40,11 @@ def _kraken_to_app_pair(pair: str) -> str:
     up = pair.upper()
     if up in inv:
         return inv[up]
-    if up.endswith("USD"):
-        base = up[:-3]
+    if up.endswith("USDC"):
+        base = up[:-4]
         if base == "XBT":
             base = "BTC"
-        return f"{base}/USD"
+        return f"{base}/USDC"
     # Fallback: return as-is if we can't confidently translate
     return up
 
@@ -62,7 +62,7 @@ def _get_with_cache(app_pair: str) -> float:
     return price
 
 
-def get_kraken_price(pair: str = "XBTUSD") -> float:
+def get_kraken_price(pair: str = "XBTUSDC") -> float:
     """
     Backward-compatible API: accepts a Kraken altname like 'XBTUSD' and returns
     the latest price by delegating to get_ticker_price() using app-format pairs.
@@ -71,9 +71,9 @@ def get_kraken_price(pair: str = "XBTUSD") -> float:
     return _get_with_cache(app_pair)
 
 
-def get_current_price(pair: str = "BTC/USD") -> float | None:
+def get_current_price(pair: str = "BTC/USDC") -> float | None:
     """
-    Convenience wrapper that accepts a human-friendly pair like "BTC/USD"
+    Convenience wrapper that accepts a human-friendly pair like "BTC/USDC"
     and returns the latest price via Kraken public API.
 
     Returns None if fetching fails so callers can skip gracefully.

@@ -297,35 +297,71 @@ def _load_tradable_pairs() -> list[str]:
 
     env_pairs = _parse_pair_list(os.getenv("CRYPTO_TRADING_BOT_PAIRS", ""))
     default_pairs = [
-        "BTC/USD",
-        "ETH/USD",
-        "SOL/USD",
-        "XRP/USD",
-        "LINK/USD",
+        "BTC/USDC",
+        "ETH/USDC",
+        "SOL/USDC",
+        "XRP/USDC",
+        "LINK/USDC",
     ]
 
     candidates = env_pairs or default_pairs
     validated: list[str] = []
+    rejected: list[str] = []
 
     if not candidates:
         return []
 
     for pair in candidates:
         if kraken_get_asset_pair_meta is None:
+            logger.warning(
+                "Kraken metadata unavailable; accepting pair %s without validation",
+                pair,
+            )
             validated.append(pair)
             continue
+
         try:
             meta = kraken_get_asset_pair_meta(pair)
         except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("Failed to validate pair %s via Kraken metadata: %s", pair, exc)
+            logger.warning(
+                "Failed to validate pair %s via Kraken metadata: %s",
+                pair,
+                exc,
+            )
+            rejected.append(pair)
             continue
-        if meta:
-            validated.append(pair)
 
+        if not meta:
+            logger.critical("Pair %s rejected: empty Kraken metadata payload", pair)
+            rejected.append(pair)
+            continue
+
+        quote = str(meta.get("quote", "")).upper()
+        altname = str(meta.get("altname", "")).upper()
+        if quote == "USDC" or altname.endswith("USDC"):
+            validated.append(pair)
+        else:
+            logger.critical(
+                "Pair %s rejected: Kraken metadata quote=%s altname=%s (expected USDC)",
+                pair,
+                quote,
+                altname,
+            )
+            rejected.append(pair)
+
+    if rejected:
+        logger.critical(
+            "Rejected USDC pairs: %s",
+            ", ".join(sorted(set(rejected))) or "<none>",
+        )
     if validated:
+        logger.info(
+            "Validated USDC pairs: %s",
+            ", ".join(sorted(set(validated))) or "<none>",
+        )
         return validated
 
-    logger.warning("No tradable pairs validated; falling back to defaults without metadata confirmation.")
+    logger.critical("No tradable pairs validated; falling back to defaults without metadata confirmation.")
     return default_pairs
 
 

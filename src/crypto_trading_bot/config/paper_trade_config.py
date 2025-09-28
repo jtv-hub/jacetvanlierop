@@ -3,7 +3,7 @@
 """Configuration module for paper trading simulations."""
 
 # Trading parameters
-TRADING_PAIR = "BTC/USD"
+TRADING_PAIR = "BTC/USDC"
 TRADE_SIZE = 50
 
 # Paper trading cycle settings

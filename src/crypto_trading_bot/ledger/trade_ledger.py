@@ -68,7 +68,7 @@ _MISSING_TRADE_WINDOW_SECONDS = float(os.getenv("MISSING_TRADE_ALERT_WINDOW", "3
 
 
 def _slippage_rate_for_pair(pair: str) -> float:
-    base = (pair or "BTC/USD").split("/")[0]
+    base = (pair or "BTC/USDC").split("/")[0]
     majors = {"BTC", "ETH"}
     if base in majors:
         return float(CONFIG.get("slippage", {}).get("majors", 0.001))
@@ -383,8 +383,8 @@ class TradeLedger:
         trade["trade_id"] = trade_id
         # Enforce basic required fields
         if not isinstance(trade.get("pair"), str) or not trade.get("pair").strip():
-            system_logger.warning("Position missing pair; defaulting to BTC/USD")
-            trade["pair"] = "BTC/USD"
+            system_logger.warning("Position missing pair; defaulting to BTC/USDC")
+            trade["pair"] = "BTC/USDC"
         if not isinstance(trade.get("strategy"), str) or not trade.get("strategy").strip():
             system_logger.warning("Position missing strategy; defaulting to Unknown")
             trade["strategy"] = "Unknown"
@@ -483,7 +483,7 @@ class TradeLedger:
                                 "timestamp",
                                 datetime.now(timezone.utc).isoformat(),
                             ),
-                            "pair": pos.get("pair", "BTC/USD"),
+                            "pair": pos.get("pair", "BTC/USDC"),
                             "size": pos.get("size", 0.001),
                             "strategy": pos.get("strategy", "Unknown"),
                             "confidence": float(pos.get("confidence", 0.0) or 0.0),

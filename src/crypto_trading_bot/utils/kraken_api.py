@@ -42,11 +42,11 @@ logger = logging.getLogger(__name__)
 # App format -> Kraken altname format. Include slash-based keys to be explicit.
 # Kraken uses "XBT" instead of "BTC". Others typically map 1:1.
 PAIR_MAP: Dict[str, str] = {
-    "BTC/USD": "XBTUSD",
-    "ETH/USD": "ETHUSD",
-    "SOL/USD": "SOLUSD",
-    "XRP/USD": "XRPUSD",
-    "LINK/USD": "LINKUSD",
+    "BTC/USDC": "XBTUSDC",
+    "ETH/USDC": "ETHUSDC",
+    "SOL/USDC": "SOLUSDC",
+    "XRP/USDC": "XRPUSDC",
+    "LINK/USDC": "LINKUSDC",
 }
 
 # Public endpoints (no auth required)
@@ -55,7 +55,7 @@ _OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 
 
 def _normalize_pair(pair: str) -> str:
-    """Return Kraken altname for a human pair like "BTC/USD".
+    """Return Kraken altname for a human pair like "BTC/USDC".
 
     - Uses PAIR_MAP if present; otherwise swaps BTC->XBT and removes slash.
     - Uppercases input defensively.
