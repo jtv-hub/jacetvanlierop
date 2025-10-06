@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
+from crypto_trading_bot import config as bot_config
 from crypto_trading_bot.bot.utils.alert import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
@@ -230,17 +231,49 @@ class TradeLedger:
         """
         if not isinstance(strategy_name, str):
             raise ValueError(f"[Ledger] Invalid strategy_name: {strategy_name}")
+        pair_token = str(trading_pair or "").strip().upper()
+        if not pair_token:
+            raise ValueError("[Ledger] Trading pair is required.")
+        live_mode = bool(getattr(bot_config, "is_live", False))
+        if live_mode:
+            if pair_token.endswith("/USD"):
+                message = (
+                    f"[Ledger] Trading pair {pair_token} uses USD quote. "
+                    "Switch configuration to USDC before logging trades."
+                )
+                system_logger.error(message)
+                raise ValueError(message)
+            if not pair_token.endswith("/USDC"):
+                message = f"[Ledger] Trading pair {pair_token} is not a USDC market."
+                system_logger.error(message)
+                raise ValueError(message)
+        else:
+            if pair_token.endswith("/USD"):
+                system_logger.warning(
+                    "[Ledger] USD-quoted trade %s logged outside live mode. "
+                    "Ensure conversion to USDC before enabling live trading.",
+                    pair_token,
+                )
+        trading_pair = pair_token
         confidence = float(kwargs.get("confidence", 0.0) or 0.0)
         if math.isclose(confidence, 0.5, abs_tol=1e-9):
-            raise ValueError(
-                "[Ledger] Confidence of 0.5 is no longer permitted — ensure strategies emit calibrated values."
+            message = " ".join(
+                [
+                    "[Ledger] Confidence of 0.5 is no longer permitted — ensure strategies emit",
+                    "calibrated values.",
+                ]
             )
+            raise ValueError(message)
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"[Ledger] Invalid confidence value: {confidence}")
         if isinstance(strategy_name, str) and strategy_name.strip().upper() == "S":
-            raise ValueError(
-                "[Ledger] Strategy identifier 'S' is reserved for testing and cannot be logged in production."
+            warning = " ".join(
+                [
+                    "[Ledger] Strategy identifier 'S' is reserved for testing and cannot be",
+                    "logged in production.",
+                ]
             )
+            raise ValueError(warning)
         if not isinstance(trade_size, (int, float)) or trade_size <= 0:
             raise ValueError(f"[Ledger] Invalid trade size: {trade_size}")
         # Bound-check size based on CONFIG
@@ -347,8 +380,12 @@ class TradeLedger:
         self.trade_index[trade_id] = trade
         return trade_id
 
-    def _register_missing_trade(self, trade_id: str, pair: str | None) -> tuple[bool, Dict[str, Any]]:
-        """Track missing-trade alerts per symbol so we can suppress noisy repeats while capturing metrics."""
+    def _register_missing_trade(
+        self,
+        trade_id: str,
+        pair: str | None,
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Track missing-trade alerts and suppress repeated notifications per symbol."""
         bucket = (pair or "unknown").upper()
         now = time.monotonic()
         state = self._missing_trade_window.get(bucket, {})
@@ -368,6 +405,7 @@ class TradeLedger:
         return should_alert, state
 
     def get_missing_trade_metrics(self, reset: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Return snapshot of missing-trade counters, optionally clearing the state."""
         snapshot = {bucket: dict(state) for bucket, state in self._missing_trade_window.items()}
         if reset:
             self._missing_trade_window.clear()
@@ -515,7 +553,12 @@ class TradeLedger:
                             trade_id,
                         )
                     else:
-                        message = "Trade ID %s not found in memory or trades.log — aborting update" % trade_id
+                        message = " ".join(
+                            [
+                                f"Trade ID {trade_id} not found in memory or trades.log —",
+                                "aborting update",
+                            ]
+                        )
                         pos = self.position_manager.positions.get(trade_id)
                         pair = (pos or {}).get("pair")
                         should_alert, state = self._register_missing_trade(trade_id, pair)
@@ -531,9 +574,8 @@ class TradeLedger:
                         if should_alert and trade_id not in self._missing_trade_alerted:
                             self._missing_trade_alerted.add(trade_id)
                             send_alert(message, context=context, level="CRITICAL")
-                            self.request_pause_new_trades(
-                                reason="Ledger consistency check — missing trade %s" % trade_id
-                            )
+                            pause_reason = f"Ledger consistency check — missing trade {trade_id}"
+                            self.request_pause_new_trades(reason=pause_reason)
                         else:
                             payload = {
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -589,7 +631,10 @@ class TradeLedger:
                         exit_side,
                     )
                     # Compute ROI and clamp/flag extreme values (> 500%)
-                    roi_val = round((exit_adj - entry_price) / entry_price, 6) if entry_price else 0.0
+                    if entry_price:
+                        roi_val = round((exit_adj - entry_price) / entry_price, 6)
+                    else:
+                        roi_val = 0.0
                     roi_final = roi_val
                     roi_clamped = False
                     if abs(roi_val) > 5.0:
@@ -690,7 +735,13 @@ class TradeLedger:
                         finally:
                             fcntl.flock(src, fcntl.LOCK_UN)
                     self.trades = trades
-                    self.trade_index = {t.get("trade_id"): t for t in trades if t and t.get("trade_id")}
+                    self.trade_index = {}
+                    for trade in trades:
+                        if not trade:
+                            continue
+                        tid = trade.get("trade_id")
+                        if tid:
+                            self.trade_index[tid] = trade
                     system_logger.debug("Successfully updated trade %s in trades.log", trade_id)
 
                     # Safely resync positions.jsonl by removing the closed position
@@ -776,7 +827,13 @@ class TradeLedger:
                             redacted,
                             e,
                         )
-            self.trade_index = {t.get("trade_id"): t for t in self.trades if t and t.get("trade_id")}
+            self.trade_index = {}
+            for trade in self.trades:
+                if not trade:
+                    continue
+                trade_id = trade.get("trade_id")
+                if trade_id:
+                    self.trade_index[trade_id] = trade
             system_logger.info("Reloaded %s trades from trades.log", len(self.trades))
         else:
             system_logger.info("No trades.log file found.")

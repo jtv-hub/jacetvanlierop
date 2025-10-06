@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, getcontext
-from typing import Any
+from typing import Any, Mapping
 
 # Optional dependency for correlation checks
 try:
@@ -77,7 +77,8 @@ TRADE_INTERVAL = 300
 MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
 PAPER_STARTING_BALANCE = float(CONFIG.get("paper_mode", {}).get("starting_balance", 100_000.0))
 SLIPPAGE = 0.0  # slippage handled per-asset in ledger; do not apply here
-TEST_MODE = os.getenv("CRYPTO_TRADING_BOT_TEST_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+_TEST_MODE_SENTINELS = {"1", "true", "yes", "on"}
+TEST_MODE = os.getenv("CRYPTO_TRADING_BOT_TEST_MODE", "0").strip().lower() in _TEST_MODE_SENTINELS
 
 _VOLUME_CACHE: dict[str, tuple[float, float]] = {}
 _VOLUME_CACHE_TTL_SECONDS = 60.0
@@ -112,6 +113,7 @@ class _RuntimeState:
     live_block_logged: bool = False
     last_capital_log: tuple[float | None, str | None] = (None, None)
     kraken_pause_until: float | None = None
+    kraken_failure_pause_until: float | None = None
     last_mode_label: str | None = None
     auto_paused_reason: str | None = None
     dry_run_logged: bool = False
@@ -121,10 +123,169 @@ class _RuntimeState:
 
 
 _STATE = _RuntimeState()
-_KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
 _KRAKEN_FAILURE_PAUSE_SECONDS = 60.0
+_KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
 
 getcontext().prec = 18
+
+
+strategy_context: dict[str, dict[str, list[Any]]] = {"live": {}, "paper": {}}
+
+
+def _monotonic_now() -> float:
+    """Return the current monotonic timestamp."""
+
+    return time.monotonic()
+
+
+def _set_kraken_failure_pause(pause_until: float) -> None:
+    """Record the Kraken failure pause deadline for tests and runtime guards."""
+
+    global _KRAKEN_FAILURE_PAUSE_UNTIL  # pylint: disable=global-statement
+    _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
+    _STATE.kraken_failure_pause_until = pause_until
+    _STATE.kraken_pause_until = pause_until
+
+
+def _clear_kraken_failure_pause(*, clear_runtime_pause: bool = True) -> None:
+    """Clear any Kraken failure pause deadline."""
+
+    global _KRAKEN_FAILURE_PAUSE_UNTIL  # pylint: disable=global-statement
+    _KRAKEN_FAILURE_PAUSE_UNTIL = None
+    _STATE.kraken_failure_pause_until = None
+    if clear_runtime_pause:
+        _STATE.kraken_pause_until = None
+
+
+def _normalise_mode_label(mode: str | None) -> str:
+    """Normalise free-form mode labels to canonical cache keys."""
+
+    if not mode:
+        return "paper"
+    lowered = mode.strip().lower()
+    if "live" in lowered:
+        return "live"
+    if "paper" in lowered or "demo" in lowered:
+        return "paper"
+    return lowered or "paper"
+
+
+def _build_strategy_pipeline(
+    *,
+    per_asset_params: Mapping[str, Mapping[str, Any]] | None = None,
+    mode: str | None = None,
+) -> list[Any]:
+    """Construct a fresh list of strategy instances for the requested mode."""
+
+    del mode  # Mode-specific adjustments may be added in the future.
+
+    per_asset_params = per_asset_params or {}
+
+    def _per_asset(name: str) -> dict[str, Any]:
+        raw = per_asset_params.get(name, {})
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        return dict(raw) if hasattr(raw, "items") else {}
+
+    rsi_cfg = CONFIG.get("rsi", {}) or {}
+    return [
+        SimpleRSIStrategy(
+            period=rsi_cfg.get("period", 21),
+            lower=rsi_cfg.get("lower", 48),
+            upper=rsi_cfg.get("upper", 75),
+            per_asset=_per_asset("SimpleRSIStrategy"),
+        ),
+        DualThresholdStrategy(),
+        MACDStrategy(per_asset=_per_asset("MACDStrategy")),
+        KeltnerBreakoutStrategy(per_asset=_per_asset("KeltnerBreakoutStrategy")),
+        StochRSIStrategy(per_asset=_per_asset("StochRSIStrategy")),
+        BollingerBandStrategy(per_asset=_per_asset("BollingerBandStrategy")),
+        VWAPStrategy(per_asset=_per_asset("VWAPStrategy")),
+        ADXStrategy(per_asset=_per_asset("ADXStrategy")),
+        CompositeStrategy(per_asset=_per_asset("CompositeStrategy")),
+    ]
+
+
+def _get_locked_strategy_pipeline(
+    pair: str,
+    mode: str | None,
+    per_asset_params: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[Any]:
+    """Return the cached strategy pipeline for ``pair`` and ``mode``."""
+
+    canonical_mode = _normalise_mode_label(mode)
+    cache = strategy_context.setdefault(canonical_mode, {})
+    if pair not in cache:
+        cache[pair] = _build_strategy_pipeline(
+            per_asset_params=per_asset_params,
+            mode=canonical_mode,
+        )
+    return cache[pair]
+
+
+def _coerce_strategy_param(value: Any, seen: set[int]) -> Any:
+    """Return a stable, serializable representation of strategy state values."""
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _coerce_strategy_param(val, seen) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_coerce_strategy_param(item, seen) for item in value]
+    if isinstance(value, (set, frozenset)):
+        coerced_items = [_coerce_strategy_param(item, seen) for item in value]
+        try:
+            return sorted(coerced_items, key=lambda item: repr(item))
+        except TypeError:
+            return coerced_items
+    if callable(getattr(value, "generate_signal", None)):
+        return _serialize_strategy(value, _seen=seen)
+    if hasattr(value, "__dict__"):
+        obj_id = id(value)
+        if obj_id in seen:
+            return f"<recursive:{value.__class__.__name__}>"
+        seen.add(obj_id)
+        try:
+            public_attrs = {
+                key: _coerce_strategy_param(val, seen) for key, val in value.__dict__.items() if not key.startswith("_")
+            }
+        finally:
+            seen.discard(obj_id)
+        return {
+            "class": value.__class__.__name__,
+            "attrs": public_attrs,
+        }
+    if callable(value):
+        return getattr(value, "__name__", repr(value))
+    return repr(value)
+
+
+def _serialize_strategy(strategy: Any, *, _seen: set[int] | None = None) -> dict[str, Any]:
+    """Represent ``strategy`` as a lightweight dictionary for parity tests."""
+
+    seen = _seen if _seen is not None else set()
+    obj_id = id(strategy)
+    if obj_id in seen:
+        return {"name": strategy.__class__.__name__, "params": {"_circular": True}}
+    seen.add(obj_id)
+    try:
+        spec: dict[str, Any] = {"name": strategy.__class__.__name__}
+        params: dict[str, Any] = {}
+        state = getattr(strategy, "__dict__", None)
+        if isinstance(state, dict):
+            for key, value in state.items():
+                if key.startswith("_"):
+                    continue
+                params[key] = _coerce_strategy_param(value, seen)
+        config = getattr(strategy, "config", None)
+        if isinstance(config, dict):
+            params.setdefault("config", _coerce_strategy_param(config, seen))
+        spec["params"] = params
+        return spec
+    finally:
+        seen.discard(obj_id)
 
 
 def _consecutive_losses(limit: int) -> int:
@@ -221,13 +382,10 @@ def _submit_live_trade(
     Returns ``True`` if the attempt should proceed, ``False`` when blocked.
     """
 
-    global _KRAKEN_FAILURE_PAUSE_UNTIL
-
     if not is_live:
         if not _STATE.live_block_logged:
             logger.warning(
-                "🚫 Live trade blocked — is_live=False | pair=%s side=%s size=%.6f"
-                " price=%.4f strategy=%s confidence=%.3f",
+                "🚫 Live trade blocked (paper) pair=%s side=%s size=%.6f price=%.4f " "strat=%s conf=%.3f",
                 pair,
                 side,
                 size,
@@ -245,8 +403,8 @@ def _submit_live_trade(
             )
         return False
 
-    now = time.monotonic()
-    pause_deadline = _KRAKEN_FAILURE_PAUSE_UNTIL or _STATE.kraken_pause_until
+    now = _monotonic_now()
+    pause_deadline = _STATE.kraken_failure_pause_until or _STATE.kraken_pause_until
     if pause_deadline is not None and now < pause_deadline:
         pause_remaining = pause_deadline - now
         logger.error(
@@ -283,10 +441,9 @@ def _submit_live_trade(
         pair_meta = kraken_get_asset_pair_meta(pair)
     except KrakenAPIError as exc:
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
-        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-        _STATE.kraken_pause_until = pause_until
+        _set_kraken_failure_pause(pause_until)
         logger.error(
-            "Failed to fetch Kraken pair metadata; pausing live trading for %.0fs | " "pair=%s error=%s",
+            "Kraken pair metadata failed; pause %.0fs for %s (%s)",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             exc,
@@ -308,7 +465,7 @@ def _submit_live_trade(
     min_volume_dec = Decimal(str(min_volume)) if min_volume else Decimal("0")
     if min_volume and size_dec < min_volume_dec:
         logger.warning(
-            "Skipping live order: volume below minimum | pair=%s side=%s size=%.10f " "min_volume=%.10f",
+            "Live order volume below min | pair=%s side=%s size=%.10f min=%.10f",
             pair,
             side,
             float(size_dec),
@@ -318,10 +475,13 @@ def _submit_live_trade(
 
     attempted_cost_dec = price_dec * size_dec
     effective_cost_threshold = max(metadata_cost_threshold, config_cost_threshold)
-    min_cost_dec = Decimal(str(effective_cost_threshold)) if effective_cost_threshold else Decimal("0")
+    if effective_cost_threshold:
+        min_cost_dec = Decimal(str(effective_cost_threshold))
+    else:
+        min_cost_dec = Decimal("0")
     if effective_cost_threshold and attempted_cost_dec < min_cost_dec:
         logger.warning(
-            "Skipping live order: cost below minimum | pair=%s side=%s " "attempted_cost=%.10f threshold=%.10f",
+            "Live order cost below min | pair=%s side=%s cost=%.10f min=%.10f",
             pair,
             side,
             float(attempted_cost_dec),
@@ -345,10 +505,9 @@ def _submit_live_trade(
         )
     except (KrakenAuthError, KrakenAPIError) as exc:
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
-        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-        _STATE.kraken_pause_until = pause_until
+        _set_kraken_failure_pause(pause_until)
         logger.error(
-            "Kraken order submission exception; pausing live trading for %.0fs | " "pair=%s side=%s error=%s",
+            "Kraken order error; pause %.0fs | pair=%s side=%s err=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -357,10 +516,9 @@ def _submit_live_trade(
         return False
     except Exception:  # pylint: disable=broad-exception-caught
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
-        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-        _STATE.kraken_pause_until = pause_until
+        _set_kraken_failure_pause(pause_until)
         logger.exception(
-            "Unexpected Kraken order exception; pausing live trading for %.0fs | " "pair=%s side=%s",
+            "Unexpected Kraken order issue; pause %.0fs | pair=%s side=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -369,10 +527,9 @@ def _submit_live_trade(
 
     if not isinstance(response, dict):
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
-        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-        _STATE.kraken_pause_until = pause_until
+        _set_kraken_failure_pause(pause_until)
         logger.error(
-            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s " "error=%s",
+            "Kraken order rejected; pause %.0fs | pair=%s side=%s err=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -386,11 +543,9 @@ def _submit_live_trade(
         response_cost = response.get("attempted_cost", attempted_cost)
         response_threshold = response.get("threshold", effective_cost_threshold)
         if response_code == "cost_minimum_not_met":
-            _KRAKEN_FAILURE_PAUSE_UNTIL = None
-            _STATE.kraken_pause_until = None
+            _clear_kraken_failure_pause()
             logger.warning(
-                "Kraken cost minimum not met; skipping trade | pair=%s side=%s "
-                "attempted_cost=%.6f threshold=%.6f error=%s",
+                "Kraken cost min not met | pair=%s side=%s cost=%.6f min=%.6f err=%s",
                 pair,
                 side,
                 float(response_cost or 0.0),
@@ -400,10 +555,9 @@ def _submit_live_trade(
             return False
 
         if response_code == "volume_minimum_not_met":
-            _KRAKEN_FAILURE_PAUSE_UNTIL = None
-            _STATE.kraken_pause_until = None
+            _clear_kraken_failure_pause()
             logger.warning(
-                "Kraken volume minimum not met; skipping trade | pair=%s side=%s " "size=%.6f min_volume=%.6f error=%s",
+                "Kraken volume min not met | pair=%s side=%s size=%.6f min=%.6f err=%s",
                 pair,
                 side,
                 size,
@@ -413,9 +567,8 @@ def _submit_live_trade(
             return False
 
         if response_code == "rate_limit":
-            pause_until = time.monotonic() + 90.0
-            _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-            _STATE.kraken_pause_until = pause_until
+            pause_until = _monotonic_now() + 90.0
+            _set_kraken_failure_pause(pause_until)
             _invalidate_pair_cache()
             logger.error(
                 "Kraken rate limit encountered; pausing live trading for 90s | pair=%s side=%s",
@@ -425,10 +578,9 @@ def _submit_live_trade(
             return False
 
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
-        _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
-        _STATE.kraken_pause_until = pause_until
+        _set_kraken_failure_pause(pause_until)
         logger.error(
-            "Kraken order rejected; pausing live trading for %.0fs | pair=%s side=%s " "error=%s code=%s",
+            "Kraken order rejected; pause %.0fs | pair=%s side=%s err=%s code=%s",
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
@@ -437,8 +589,7 @@ def _submit_live_trade(
         )
         return False
 
-    _KRAKEN_FAILURE_PAUSE_UNTIL = None
-    _STATE.kraken_pause_until = None
+    _clear_kraken_failure_pause()
 
     txid = response.get("txid")
     if isinstance(txid, list) and txid:
@@ -460,6 +611,8 @@ def _submit_live_trade(
 
 
 def _log_capital(amount: float, source: str) -> None:
+    """Log the deployable capital when it changes for observability."""
+
     last_amount, last_source = _STATE.last_capital_log
     if last_amount == amount and last_source == source:
         return
@@ -475,6 +628,8 @@ def _log_capital(amount: float, source: str) -> None:
 
 # NOTE: Clear any stale kill-switch flag once at startup so live flow is not permanently blocked.
 def _ensure_kill_switch_cleared() -> None:
+    """Clean up a stale kill-switch file so the engine can resume trading."""
+
     if _STATE.kill_switch_auto_cleared:
         return
     if not os.path.exists(KILL_SWITCH_FILE):
@@ -482,7 +637,7 @@ def _ensure_kill_switch_cleared() -> None:
         return
     try:
         os.remove(KILL_SWITCH_FILE)
-        message = f"[EMERGENCY STOP] Kill-switch file {KILL_SWITCH_FILE} detected at startup — auto-cleared."
+        message = "[EMERGENCY STOP] Kill-switch file " f"{KILL_SWITCH_FILE} detected at startup — auto-cleared."
         logger.warning(message)
         send_alert(message, level="WARNING")
         print(message)
@@ -494,8 +649,11 @@ def _ensure_kill_switch_cleared() -> None:
             _STATE.kill_switch_auto_cleared = True
 
 
-# NOTE: Block new trades while disk space is critically low; resume automatically once capacity returns.
+# NOTE: Block new trades while disk space is critically low.
+# Resume automatically once capacity returns.
 def _guard_low_disk_space() -> bool:
+    """Return True if trades should be paused due to low disk space."""
+
     try:
         _, _, free = shutil.disk_usage(_DISK_GUARD_PATH)
     except OSError as exc:
@@ -507,7 +665,8 @@ def _guard_low_disk_space() -> bool:
         if not _STATE.disk_space_block_active:
             message = (
                 "Disk space critically low ("
-                f"{free_mb:.1f} MB free < {_DISK_GUARD_THRESHOLD_MB:.1f} MB) — disabling new trade submissions."
+                f"{free_mb:.1f} MB free < {_DISK_GUARD_THRESHOLD_MB:.1f} MB) — "
+                "disabling new trade submissions."
             )
             logger.critical(message)
             send_alert(
@@ -536,6 +695,7 @@ def _fetch_recent_volume(pair: str, *, candles: int = 5, fallback: float = 0.0) 
 
     try:
         rows = get_ohlc_data(pair, interval=1, limit=max(1, candles))
+    # pylint: disable=broad-exception-caught
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Volume fetch failed for %s: %s", pair, exc)
         if TEST_MODE:
@@ -730,13 +890,14 @@ class PositionManager:
                         history = ((history or []) + [price])[-(rsi_period + 5) :]
                         history_cache[pair] = history
                     if history and len(history) >= rsi_period + 1:
-                        rsi_val = calculate_rsi(history[-(rsi_period + 1) :], rsi_period)  # type: ignore[misc]
+                        lookback = history[-(rsi_period + 1) :]
+                        rsi_val = calculate_rsi(lookback, rsi_period)  # type: ignore[misc]
                         rsi_cfg = CONFIG.get("rsi", {})
                         exit_upper = rsi_cfg.get("exit_upper", rsi_cfg.get("upper", 70))
                         if rsi_val is not None and float(rsi_val) >= float(exit_upper):
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pair} rsi={float(rsi_val):.2f}")
+                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pair} " f"rsi={float(rsi_val):.2f}")
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
@@ -827,7 +988,17 @@ def _compute_position_sizing(
     max_size: float,
 ) -> tuple[float, float, float]:
     """Return (size, notional, risk_fraction) for the proposed trade."""
-    if total_capital <= 0 or remaining_capital <= 0 or current_price <= 0 or confidence <= 0 or base_risk_pct <= 0:
+    invalid_inputs = any(
+        value <= 0
+        for value in (
+            total_capital,
+            remaining_capital,
+            current_price,
+            confidence,
+            base_risk_pct,
+        )
+    )
+    if invalid_inputs:
         return 0.0, 0.0, 0.0
 
     reinvestment_factor = float(reinvestment_rate) if reinvestment_rate is not None else 1.0
@@ -853,15 +1024,11 @@ def _compute_position_sizing(
     if units < min_units:
         min_notional = min_units * current_price
         if min_notional <= remaining_capital:
-            logger.debug(
-                "Adjusting position size to meet exchange minimum | target_units=%.6f min_units=%.6f",
-                units,
-                min_units,
-            )
+            logger.debug("Adjusting size to meet minimum | target=%.6f min=%.6f", units, min_units)
             units = min_units
         else:
             logger.warning(
-                "Insufficient capital to meet minimum position size | required_notional=%.4f available=%.4f",
+                "Insufficient capital for min size | required=%.4f available=%.4f",
                 min_notional,
                 remaining_capital,
             )
@@ -915,13 +1082,13 @@ def evaluate_signals_and_trade(
         check_exits_only = True
     pause_new_trades, pause_reason = ledger.consume_pause_request()
     if pause_new_trades:
-        pause_msg = pause_reason or ("[PAUSE] skipping new trades this cycle (ledger consistency check).")
+        pause_msg = pause_reason or "[PAUSE] skipping new trades this cycle (ledger check)."
         logger.warning(pause_msg)
         print(pause_msg)
         if not check_exits_only:
             check_exits_only = True
     if CONFIG.get("live_mode", {}).get("dry_run") and not _STATE.dry_run_logged:
-        msg = "[DRY-RUN] Validate-only trades active — live orders will use validate=True."
+        msg = "[DRY-RUN] Validate-only trades active; live orders use validate=True."
         logger.warning(msg)
         print(msg)
         _STATE.dry_run_logged = True
@@ -1009,10 +1176,10 @@ def evaluate_signals_and_trade(
             if volume_estimate is not None and volume_estimate > 0:
                 current_volumes[pair] = volume_estimate
             else:
-                logger.warning("No volume data available for %s; skipping in volume map", pair)
+                logger.warning("No volume data for %s; skipping volume map entry", pair)
                 print(f"⚠️ No volume data for {pair}; skipping volume-driven checks")
         else:
-            print(f"⚠️ No current price for {pair}; skipping in price map")
+            print(f"⚠️ No current price for {pair}; skipping price map entry")
 
     # Preload seeded history for all pairs (startup fallback)
     try:
@@ -1191,22 +1358,11 @@ def evaluate_signals_and_trade(
                     continue
                 # Reinitialize strategies per iteration to reset state
                 per_asset_params = CONFIG.get("strategy_params", {})
-                strategies = [
-                    SimpleRSIStrategy(
-                        period=CONFIG.get("rsi", {}).get("period", 21),
-                        lower=CONFIG.get("rsi", {}).get("lower", 48),
-                        upper=CONFIG.get("rsi", {}).get("upper", 75),
-                        per_asset=per_asset_params.get("SimpleRSIStrategy", {}),
-                    ),
-                    DualThresholdStrategy(),
-                    MACDStrategy(per_asset=per_asset_params.get("MACDStrategy", {})),
-                    KeltnerBreakoutStrategy(per_asset=per_asset_params.get("KeltnerBreakoutStrategy", {})),
-                    StochRSIStrategy(per_asset=per_asset_params.get("StochRSIStrategy", {})),
-                    BollingerBandStrategy(per_asset=per_asset_params.get("BollingerBandStrategy", {})),
-                    VWAPStrategy(per_asset=per_asset_params.get("VWAPStrategy", {})),
-                    ADXStrategy(per_asset=per_asset_params.get("ADXStrategy", {})),
-                    CompositeStrategy(per_asset=per_asset_params.get("CompositeStrategy", {})),
-                ]
+                strategies = _get_locked_strategy_pipeline(
+                    pair,
+                    mode_label,
+                    per_asset_params=per_asset_params,
+                )
                 regime = context.get_regime()
                 strategy_candidates: list[dict[str, Any]] = []
                 signals_count = 0
@@ -1270,6 +1426,7 @@ def evaluate_signals_and_trade(
                                 "confidence": candidate_confidence,
                                 "raw": signal_result,
                                 "buffer": context.get_buffer_for_strategy(strategy_name),
+                                "strategy_obj": strategy,
                             }
                         )
                         signals_count += 1
@@ -1281,7 +1438,9 @@ def evaluate_signals_and_trade(
                         skipped_none += 1
                         print(f"⚠️ Skipping {pair} — No actionable signal")
 
-                actionable_candidates = [c for c in strategy_candidates if c["signal"] in {"buy", "sell"}]
+                actionable_candidates = [
+                    candidate for candidate in strategy_candidates if candidate["signal"] in {"buy", "sell"}
+                ]
                 if not actionable_candidates:
                     continue
 
@@ -1289,6 +1448,7 @@ def evaluate_signals_and_trade(
                 signal = selected["signal"]
                 confidence = selected["confidence"]
                 strategy_name = selected["strategy"]
+                selected_strategy = selected["strategy_obj"]
                 buffer = selected["buffer"]
 
                 # ADX gating (regime filter)
@@ -1296,13 +1456,13 @@ def evaluate_signals_and_trade(
                     if adx_val < 20.0:
                         skipped_none += 1
                         print(f"[SKIP] {pair}: ADX too weak ({adx_val:.2f})")
-                        print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence=0.0")
+                        print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, " "adjusted confidence=0.0")
                         continue
                     if adx_val > 40.0:
                         before = confidence
                         confidence = min(1.0, confidence * 1.2)
-                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} (strong trend)")
-                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, adjusted confidence={confidence:.3f}")
+                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} " "(strong trend)")
+                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, " f"adjusted confidence={confidence:.3f}")
 
                 if confidence < 0.4:
                     skipped_low_conf += 1
@@ -1450,7 +1610,7 @@ def evaluate_signals_and_trade(
 
                 if not is_live:
                     logger.debug(
-                        "Paper trade simulated | pair=%s side=%s size=%.6f price=%.4f " "strategy=%s confidence=%.3f",
+                        "Paper trade | pair=%s side=%s size=%.6f price=%.4f strategy=%s conf=%.3f",
                         pair,
                         trade_side,
                         adjusted_size,
@@ -1477,7 +1637,7 @@ def evaluate_signals_and_trade(
                     trade_size=adjusted_size,
                     strategy_name=strategy_name,
                     trade_id=trade_id,
-                    strategy_instance=strategy,
+                    strategy_instance=selected_strategy,
                     confidence=confidence,
                     entry_price=entry_raw,
                     regime=regime,

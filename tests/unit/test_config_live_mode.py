@@ -18,6 +18,7 @@ def _ensure_reset():
 
 def test_set_live_mode_blocks_withdraw_enabled_key(monkeypatch):
     monkeypatch.setattr(config, "_validate_credentials", lambda: None)
+    monkeypatch.setattr(config, "_kraken_client", object())
     monkeypatch.setattr(
         config,
         "query_api_key_permissions",
@@ -32,6 +33,7 @@ def test_set_live_mode_blocks_withdraw_enabled_key(monkeypatch):
 
 def test_set_live_mode_allows_non_withdraw_key(monkeypatch):
     monkeypatch.setattr(config, "_validate_credentials", lambda: None)
+    monkeypatch.setattr(config, "_kraken_client", object())
     monkeypatch.setattr(
         config,
         "query_api_key_permissions",

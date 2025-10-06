@@ -36,19 +36,12 @@ except ImportError:  # pragma: no cover - optional dependency
     _HAVE_HTTPX = False
 
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.utils.kraken_pairs import PAIR_MAP, normalize_pair
 
 logger = logging.getLogger(__name__)
 
 # App format -> Kraken altname format. Include slash-based keys to be explicit.
 # Kraken uses "XBT" instead of "BTC". Others typically map 1:1.
-PAIR_MAP: Dict[str, str] = {
-    "BTC/USDC": "XBTUSDC",
-    "ETH/USDC": "ETHUSDC",
-    "SOL/USDC": "SOLUSDC",
-    "XRP/USDC": "XRPUSDC",
-    "LINK/USDC": "LINKUSDC",
-}
-
 # Public endpoints (no auth required)
 _TICKER_URL = "https://api.kraken.com/0/public/Ticker"
 _OHLC_URL = "https://api.kraken.com/0/public/OHLC"
@@ -62,14 +55,7 @@ def _normalize_pair(pair: str) -> str:
     """
     if not isinstance(pair, str) or "/" not in pair:
         raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USD'")
-    up = pair.upper()
-    if up in PAIR_MAP:
-        return PAIR_MAP[up]
-    # Generic fallback: XBT for BTC; remove slash
-    base, quote = up.split("/", 1)
-    if base == "BTC":
-        base = "XBT"
-    return f"{base}{quote}"
+    return normalize_pair(pair)
 
 
 def _build_headers() -> Dict[str, str]:
@@ -314,4 +300,9 @@ def get_ticker_price(
             attempt += 1
 
 
-__all__ = ["get_ticker_price", "get_ohlc_data", "PAIR_MAP"]
+try:  # Lazy import to avoid circular dependency during module init
+    from crypto_trading_bot.utils.kraken_client import kraken_client
+except ImportError:  # pragma: no cover - fallback if private client unavailable
+    kraken_client = None  # type: ignore[assignment]
+
+__all__ = ["get_ticker_price", "get_ohlc_data", "PAIR_MAP", "kraken_client"]

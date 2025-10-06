@@ -20,13 +20,14 @@ from crypto_trading_bot.bot.utils.log_rotation import (
     get_anomalies_logger,
     get_rotating_handler,
 )
-from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
+from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, is_live
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
 from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
 from crypto_trading_bot.learning.optimization import detect_outliers
 from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
+from crypto_trading_bot.safety.confirmation import require_live_confirmation
 from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
 from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
 from crypto_trading_bot.scripts.shadow_confidence_test import run_shadow_confidence_test
@@ -262,6 +263,9 @@ def run_scheduler():
 
     while True:
         try:
+            if is_live:
+                require_live_confirmation()
+
             # Refresh portfolio state and run trade evaluation
             portfolio_state = load_portfolio_state(refresh=True)
             available_capital = float(portfolio_state.get("available_capital", 0.0))
@@ -316,6 +320,23 @@ def run_scheduler():
         except KeyboardInterrupt:
             print("🛑 Scheduler stopped by user.")
             break
+        except ConfigurationError as error:
+            try:
+                anomalies_logger.critical(
+                    json.dumps(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "module": "scheduler",
+                            "action": "require_live_confirmation",
+                            "message": str(error),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            except Exception:  # pragma: no cover - defensive JSON/logging errors
+                pass
+            print(f"❌ Scheduler configuration error: {error}")
+            raise
         except (ValueError, RuntimeError, OSError) as error:
             print(f"❌ Scheduler error: {error}")
             traceback.print_exc()

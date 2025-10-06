@@ -290,7 +290,11 @@ def test_submit_live_trade_skips_volume_min(monkeypatch):
 
     _reset_trading_state()
     monkeypatch.setitem(trading_logic.CONFIG, "kraken_min_cost_threshold", 0.0)
-    monkeypatch.setitem(trading_logic.CONFIG, "kraken", {"min_cost_threshold": 0.0, "pair_cost_minimums": {}})
+    monkeypatch.setitem(
+        trading_logic.CONFIG,
+        "kraken",
+        {"min_cost_threshold": 0.0, "pair_cost_minimums": {}},
+    )
 
     monkeypatch.setattr(
         trading_logic,
@@ -305,7 +309,7 @@ def test_submit_live_trade_skips_volume_min(monkeypatch):
 
     called = False
 
-    def fake_place_order(*args, **kwargs):
+    def fake_place_order(*_args, **_kwargs):
         nonlocal called
         called = True
         return {"ok": True, "code": "ok"}
@@ -330,7 +334,11 @@ def test_submit_live_trade_skips_cost_min(monkeypatch):
 
     _reset_trading_state()
     monkeypatch.setitem(trading_logic.CONFIG, "kraken_min_cost_threshold", 0.0)
-    monkeypatch.setitem(trading_logic.CONFIG, "kraken", {"min_cost_threshold": 0.0, "pair_cost_minimums": {}})
+    monkeypatch.setitem(
+        trading_logic.CONFIG,
+        "kraken",
+        {"min_cost_threshold": 0.0, "pair_cost_minimums": {}},
+    )
 
     monkeypatch.setattr(
         trading_logic,
@@ -345,7 +353,7 @@ def test_submit_live_trade_skips_cost_min(monkeypatch):
 
     called = False
 
-    def fake_place_order(*args, **kwargs):  # pragma: no cover - should not run
+    def fake_place_order(*_args, **_kwargs):  # pragma: no cover - should not run
         nonlocal called
         called = True
         return {"ok": True, "code": "ok"}
@@ -370,7 +378,11 @@ def test_submit_live_trade_boundary_executes(monkeypatch):
 
     _reset_trading_state()
     monkeypatch.setitem(trading_logic.CONFIG, "kraken_min_cost_threshold", 0.0)
-    monkeypatch.setitem(trading_logic.CONFIG, "kraken", {"min_cost_threshold": 0.0, "pair_cost_minimums": {}})
+    monkeypatch.setitem(
+        trading_logic.CONFIG,
+        "kraken",
+        {"min_cost_threshold": 0.0, "pair_cost_minimums": {}},
+    )
 
     meta_payload = {
         "ordermin": 0.01000000,
@@ -408,7 +420,11 @@ def test_submit_live_trade_rate_limit_pause(monkeypatch):
 
     _reset_trading_state()
     monkeypatch.setitem(trading_logic.CONFIG, "kraken_min_cost_threshold", 0.0)
-    monkeypatch.setitem(trading_logic.CONFIG, "kraken", {"min_cost_threshold": 0.0, "pair_cost_minimums": {}})
+    monkeypatch.setitem(
+        trading_logic.CONFIG,
+        "kraken",
+        {"min_cost_threshold": 0.0, "pair_cost_minimums": {}},
+    )
 
     monkeypatch.setattr(
         trading_logic,
@@ -422,9 +438,13 @@ def test_submit_live_trade_rate_limit_pause(monkeypatch):
     )
 
     fake_time = {"now": 1000.0}
-    monkeypatch.setattr(trading_logic, "time", SimpleNamespace(monotonic=lambda: fake_time["now"]))
+    monkeypatch.setattr(
+        trading_logic,
+        "time",
+        SimpleNamespace(monotonic=lambda: fake_time["now"]),
+    )
 
-    def fake_place_order(*args, **kwargs):  # pylint: disable=unused-argument
+    def fake_place_order(*_args, **_kwargs):  # pylint: disable=unused-argument
         return {
             "ok": False,
             "code": "rate_limit",

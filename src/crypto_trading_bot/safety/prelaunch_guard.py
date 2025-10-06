@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from crypto_trading_bot.bot.simulation import collect_signal_snapshot
-from crypto_trading_bot.bot.trading_logic import KILL_SWITCH_FILE, ledger
 from crypto_trading_bot.config import CONFIG, ConfigurationError, is_live, set_live_mode
+from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
+from crypto_trading_bot.ledger.ledger_access import get_ledger
 from crypto_trading_bot.utils.price_history import get_fallback_metrics
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 
@@ -33,7 +34,7 @@ _DEFAULT_MAX_HIGH = int(CONFIG.get("prelaunch_guard", {}).get("max_recent_high_s
 CONFIDENCE_TOLERANCE = 0.25  # Allow small confidence deviations when signals agree (see module docstring).
 
 
-def _clear_kill_switch(path: Path = Path(KILL_SWITCH_FILE)) -> None:
+def _clear_kill_switch(path: Path = KILL_SWITCH_FILE) -> None:
     if not path:
         return
     if not path.exists():
@@ -249,7 +250,7 @@ def _ensure_no_mock_fallbacks() -> None:
 
 
 def _ensure_missing_trade_health() -> None:
-    metrics = ledger.get_missing_trade_metrics(reset=False)
+    metrics = get_ledger().get_missing_trade_metrics(reset=False)
     for bucket, state in metrics.items():
         count = int(state.get("count", 0))
         suppressed = int(state.get("suppressed", 0))
@@ -291,8 +292,28 @@ def _run_mode_compare(pairs: Iterable[str]) -> None:
 
     mismatches = []
     for pair in pairs_list:
-        paper_sig = _first_actionable(paper_map.get(pair))
-        live_sig = _first_actionable(live_map.get(pair))
+        paper_entry = paper_map.get(pair) or {}
+        live_entry = live_map.get(pair) or {}
+
+        paper_hist = paper_entry.get("history_length")
+        live_hist = live_entry.get("history_length")
+        if paper_hist is not None and live_hist is not None and paper_hist != live_hist:
+            logger.warning("Historical candle mismatch for %s | paper=%s live=%s", pair, paper_hist, live_hist)
+            raise ConfigurationError(
+                f"Historical data mismatch detected for {pair}: paper={paper_hist} candles, "
+                f"live={live_hist} candles. Aborting prelaunch guard."
+            )
+
+        paper_strategies = {sig.get("strategy") for sig in (paper_entry.get("signals") or []) if isinstance(sig, dict)}
+        live_strategies = {sig.get("strategy") for sig in (live_entry.get("signals") or []) if isinstance(sig, dict)}
+        if paper_strategies != live_strategies:
+            raise ConfigurationError(
+                f"Strategy pipeline mismatch for {pair}: paper={sorted(paper_strategies)} "
+                f"live={sorted(live_strategies)}"
+            )
+
+        paper_sig = _first_actionable(paper_entry)
+        live_sig = _first_actionable(live_entry)
 
         if paper_sig is None and live_sig is None:
             logger.warning("No actionable signals found for pair %s; skipping.", pair)

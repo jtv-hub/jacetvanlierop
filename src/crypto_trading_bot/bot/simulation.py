@@ -10,17 +10,7 @@ from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import append_live_price, get_history_prices
 
-from .strategies.advanced_strategies import (
-    ADXStrategy,
-    BollingerBandStrategy,
-    CompositeStrategy,
-    KeltnerBreakoutStrategy,
-    MACDStrategy,
-    StochRSIStrategy,
-    VWAPStrategy,
-)
-from .strategies.dual_threshold_strategies import DualThresholdStrategy
-from .strategies.simple_rsi_strategies import SimpleRSIStrategy
+from . import trading_logic
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +45,8 @@ def collect_signal_snapshot(pairs: List[str]) -> List[Dict[str, object]]:
                     "pair": pair,
                     "status": "insufficient_history",
                     "signals": [],
+                    "history_length": len(prices),
+                    "history_required": min_needed,
                 }
             )
             continue
@@ -62,22 +54,7 @@ def collect_signal_snapshot(pairs: List[str]) -> List[Dict[str, object]]:
         adx_val = context.get_adx(pair, prices)
         volume_estimate = max(min_volume, min_volume)
 
-        strategies = [
-            SimpleRSIStrategy(
-                period=rsi_period,
-                lower=CONFIG.get("rsi", {}).get("lower", 48),
-                upper=CONFIG.get("rsi", {}).get("upper", 75),
-                per_asset=per_asset_params.get("SimpleRSIStrategy", {}),
-            ),
-            DualThresholdStrategy(),
-            MACDStrategy(per_asset=per_asset_params.get("MACDStrategy", {})),
-            KeltnerBreakoutStrategy(per_asset=per_asset_params.get("KeltnerBreakoutStrategy", {})),
-            StochRSIStrategy(per_asset=per_asset_params.get("StochRSIStrategy", {})),
-            BollingerBandStrategy(per_asset=per_asset_params.get("BollingerBandStrategy", {})),
-            VWAPStrategy(per_asset=per_asset_params.get("VWAPStrategy", {})),
-            ADXStrategy(per_asset=per_asset_params.get("ADXStrategy", {})),
-            CompositeStrategy(per_asset=per_asset_params.get("CompositeStrategy", {})),
-        ]
+        strategies = trading_logic.get_strategy_pipeline(per_asset_params)
 
         signal_entries: List[Dict[str, object]] = []
         for strategy in strategies:
@@ -107,6 +84,13 @@ def collect_signal_snapshot(pairs: List[str]) -> List[Dict[str, object]]:
                 }
             )
 
-        snapshots.append({"pair": pair, "signals": signal_entries})
+        snapshots.append(
+            {
+                "pair": pair,
+                "signals": signal_entries,
+                "history_length": len(prices),
+                "history_required": min_needed,
+            }
+        )
 
     return snapshots

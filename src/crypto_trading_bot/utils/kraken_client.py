@@ -15,31 +15,12 @@ import hmac
 import json
 import logging
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlencode
 
-try:  # pragma: no cover - optional dependency
-    import requests
-
-    _HAVE_REQUESTS = True
-except ImportError:  # pragma: no cover - optional dependency
-    requests = None  # type: ignore[assignment]
-    _HAVE_REQUESTS = False
-
-try:  # pragma: no cover - optional dependency
-    import httpx  # type: ignore[import-not-found]
-
-    _HAVE_HTTPX = True
-except ImportError:  # pragma: no cover - optional dependency
-    httpx = None  # type: ignore[assignment]
-    _HAVE_HTTPX = False
-
+from crypto_trading_bot import config as config_module
 from crypto_trading_bot.config import CONFIG, _sanitize_base64_secret
-
-try:  # Reuse pair normalization rules from the public client when available.
-    from crypto_trading_bot.utils import kraken_api as _public_api
-except ImportError:  # pragma: no cover - fallback if module renamed/removed
-    _public_api = None  # type: ignore[assignment]
+from crypto_trading_bot.utils.kraken_pairs import normalize_pair
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +43,49 @@ _ASSET_HINTS: Dict[str, Iterable[str]] = {
 
 _PAIR_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _PAIR_CACHE_TTL = 300.0
+_HTTP_BACKEND: Tuple[str, Any] | None = None
+
+
+def _resolve_http_client() -> Tuple[str, Any]:
+    """Return the HTTP backend module to use for Kraken requests."""
+
+    global _HTTP_BACKEND  # pylint: disable=global-statement
+    if _HTTP_BACKEND is not None:
+        return _HTTP_BACKEND
+
+    for backend_name in ("requests", "httpx"):
+        try:
+            module = __import__(backend_name)  # type: ignore[import]
+        except ImportError:  # pragma: no cover - optional dependency
+            continue
+        _HTTP_BACKEND = (backend_name, module)
+        return _HTTP_BACKEND
+
+    raise RuntimeError("Missing HTTP client dependency. Install 'requests' or 'httpx'.")
 
 
 def _invalidate_pair_cache() -> None:
     _PAIR_CACHE.clear()
+
+
+def describe_api_permissions() -> str:
+    """Return a human-readable summary of current API key permissions."""
+
+    try:
+        permissions = config_module.query_api_key_permissions()
+    except (
+        config_module.KrakenAPIError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as exc:  # pragma: no cover - defensive logging
+        return f"unavailable ({exc})"
+
+    rights = (permissions or {}).get("rights", {})
+    try:
+        return json.dumps(rights, sort_keys=True)
+    except TypeError:  # pragma: no cover - defensive
+        return str(rights)
 
 
 class KrakenAPIError(RuntimeError):
@@ -86,8 +106,14 @@ def _get_credentials() -> tuple[str, str]:
         )
     key_origin = CONFIG.get("_kraken_key_origin", "unknown")
     secret_origin = CONFIG.get("_kraken_secret_origin", "unknown")
+    sanitized_message = " ".join(
+        [
+            "Kraken credentials sanitised | key_prefix=%s key_length=%d key_origin=%s",
+            "secret_length=%d secret_origin=%s",
+        ]
+    )
     logger.debug(
-        "Kraken credentials sanitised | key_prefix=%s key_length=%d key_origin=%s " "secret_length=%d secret_origin=%s",
+        sanitized_message,
         (key[:6] + "***") if len(key) >= 6 else "***",
         len(key),
         key_origin,
@@ -128,20 +154,7 @@ def _decode_secret(secret: str) -> bytes:
 def _normalize_pair(pair: str) -> str:
     """Return Kraken's altname for a pair like ``BTC/USD``."""
 
-    if _public_api and hasattr(_public_api, "PAIR_MAP"):
-        pair_map = getattr(_public_api, "PAIR_MAP")
-        if isinstance(pair_map, dict):
-            mapped = pair_map.get(pair.upper())
-            if mapped:
-                return mapped
-    # Fallback behaviour mirrors the public helper: uppercase, swap BTC->XBT, drop slash.
-    up = pair.upper()
-    if "/" not in up:
-        raise ValueError(f"Invalid trading pair format: {pair!r}")
-    base, quote = up.split("/", 1)
-    if base == "BTC":
-        base = "XBT"
-    return f"{base}{quote}"
+    return normalize_pair(pair)
 
 
 def _asset_candidates(asset: str) -> tuple[str, ...]:
@@ -183,28 +196,35 @@ def _sign_request(url_path: str, nonce: str, postdata: str, secret: str) -> str:
 def _http_post(url: str, data: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
     """Perform an HTTP POST using requests or httpx and return JSON."""
 
-    if _HAVE_REQUESTS and requests is not None:
+    try:
+        backend_name, client_module = _resolve_http_client()
+    except RuntimeError as exc:
+        raise KrakenAPIError(str(exc)) from exc
+
+    if backend_name == "requests":
         try:
-            response = requests.post(url, data=data, headers=headers, timeout=timeout)
+            response = client_module.post(url, data=data, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except (  # type: ignore[attr-defined]
-            requests.exceptions.RequestException,
+            client_module.exceptions.RequestException,
             ValueError,
             TypeError,
         ) as exc:
             raise KrakenAPIError(f"HTTP POST failed: {exc}") from exc
 
-    if _HAVE_HTTPX and httpx is not None:
+    if backend_name == "httpx":
+        client_class = client_module.Client  # type: ignore[attr-defined]
+        http_error = client_module.HTTPError  # type: ignore[attr-defined]
         try:
-            with httpx.Client(timeout=timeout, headers=headers) as client:
+            with client_class(timeout=timeout, headers=headers) as client:
                 response = client.post(url, content=data)
                 response.raise_for_status()
                 return response.json()
-        except (httpx.HTTPError, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+        except (http_error, ValueError, TypeError) as exc:
             raise KrakenAPIError(f"HTTP POST failed: {exc}") from exc
 
-    raise KrakenAPIError("No HTTP client available. Install 'requests' or 'httpx'.")
+    raise KrakenAPIError("Unsupported HTTP backend configured.")
 
 
 def _http_public(
@@ -221,28 +241,35 @@ def _http_public(
         "Accept": "application/json",
     }
 
-    if _HAVE_REQUESTS and requests is not None:
+    try:
+        backend_name, client_module = _resolve_http_client()
+    except RuntimeError as exc:
+        raise KrakenAPIError(str(exc)) from exc
+
+    if backend_name == "requests":
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            response = client_module.get(url, params=params, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except (  # type: ignore[attr-defined]
-            requests.exceptions.RequestException,
+            client_module.exceptions.RequestException,
             ValueError,
             TypeError,
         ) as exc:
             raise KrakenAPIError(f"HTTP GET failed: {exc}") from exc
 
-    if _HAVE_HTTPX and httpx is not None:
+    if backend_name == "httpx":
+        client_class = client_module.Client  # type: ignore[attr-defined]
+        http_error = client_module.HTTPError  # type: ignore[attr-defined]
         try:
-            with httpx.Client(timeout=timeout, headers=headers) as client:
+            with client_class(timeout=timeout, headers=headers) as client:
                 response = client.get(url, params=params)
                 response.raise_for_status()
                 return response.json()
-        except (httpx.HTTPError, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+        except (http_error, ValueError, TypeError) as exc:
             raise KrakenAPIError(f"HTTP GET failed: {exc}") from exc
 
-    raise KrakenAPIError("No HTTP client available for public requests. Install 'requests' or 'httpx'.")
+    raise KrakenAPIError("Unsupported HTTP backend configured.")
 
 
 def _standard_response(
@@ -360,7 +387,14 @@ def _private_request(
             )
             time.sleep(0.5 * attempt)
             continue
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except (
+            AttributeError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as exc:
             logger.exception("Unexpected HTTP error for %s: %s", endpoint, exc)
             return {
                 "ok": False,
@@ -442,6 +476,36 @@ def _private_request(
     }
 
 
+def query_private(
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: float = 15.0,
+    max_attempts: int = 2,
+    raise_for_error: bool = True,
+) -> Dict[str, Any]:
+    """Public helper for Kraken authenticated REST endpoints.
+
+    Returns the normalized response payload produced by ``_private_request``.
+    When ``raise_for_error`` is ``True`` (default), a ``KrakenAPIError`` is
+    raised if Kraken returns an error payload. Callers that want to inspect
+    the error details manually can set ``raise_for_error=False``.
+    """
+
+    response = _private_request(
+        method,
+        dict(params or {}),
+        timeout=timeout,
+        max_attempts=max_attempts,
+    )
+
+    if raise_for_error and not response.get("ok"):
+        error_text = response.get("error") or response.get("code") or "unknown error"
+        raise KrakenAPIError(f"Kraken {method} failed: {error_text}")
+
+    return response
+
+
 def _redact_nonce(postdata: str) -> str:
     """Hide the nonce value in debug logs."""
 
@@ -459,7 +523,7 @@ def _redact_nonce(postdata: str) -> str:
 def kraken_get_balance(asset: str = "USDC") -> Dict[str, Any]:
     """Return the available balance for ``asset`` (defaults to USDC)."""
 
-    base = _private_request("Balance")
+    base = query_private("Balance", raise_for_error=False)
     response = _standard_response(base, endpoint="Balance", extra={"asset": asset.upper()})
     if not response.get("ok"):
         response.setdefault("balance", None)
@@ -766,9 +830,87 @@ def kraken_open_orders(include_trades: bool = False) -> Dict[str, Any]:
     return response
 
 
+class KrakenClient:
+    """State-free convenience wrapper for Kraken private endpoints."""
+
+    def query_private(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 15.0,
+        max_attempts: int = 2,
+        raise_for_error: bool = True,
+        return_result: bool = True,
+    ) -> Dict[str, Any] | Any:
+        """Call a Kraken private endpoint and optionally return only the result."""
+
+        payload = query_private(
+            method,
+            params=params,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            raise_for_error=raise_for_error,
+        )
+        if return_result and payload.get("ok"):
+            return payload.get("result")
+        return payload
+
+    def balance(
+        self,
+        asset: str = "USDC",
+        *,
+        raise_for_error: bool = True,
+    ) -> Dict[str, Any]:
+        """Convenience wrapper around ``kraken_get_balance``."""
+
+        response = kraken_get_balance(asset)
+        if raise_for_error and not response.get("ok"):
+            error_text = response.get("error") or response.get("code") or "unknown error"
+            raise KrakenAPIError(f"Kraken balance lookup failed: {error_text}")
+        return response
+
+    def trades_history(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        raise_for_error: bool = True,
+        return_result: bool = True,
+    ) -> Dict[str, Any] | Any:
+        """Thin wrapper for Kraken's ``TradesHistory`` endpoint."""
+
+        return self.query_private(
+            "TradesHistory",
+            params=params,
+            raise_for_error=raise_for_error,
+            return_result=return_result,
+        )
+
+    def raw_balance(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        raise_for_error: bool = True,
+    ) -> Dict[str, Any] | Any:
+        """Direct access to the ``Balance`` endpoint without normalization."""
+
+        return self.query_private(
+            "Balance",
+            params=params,
+            raise_for_error=raise_for_error,
+            return_result=False,
+        )
+
+
+kraken_client = KrakenClient()
+
+
 __all__ = [
     "KrakenAPIError",
     "KrakenAuthError",
+    "KrakenClient",
+    "kraken_client",
+    "query_private",
     "kraken_get_balance",
     "kraken_get_asset_pair_meta",
     "kraken_place_order",
