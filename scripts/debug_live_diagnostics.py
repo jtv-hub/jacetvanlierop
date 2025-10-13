@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -40,8 +41,25 @@ from crypto_trading_bot.utils.kraken_client import (
 # Tail at most this many lines from each log file.
 _LOG_TAIL_LIMIT = 200
 _TRADELN_MARKER = "Submitting live trade | pair="
-_ERROR_KEYWORDS = ("error", "warning", "critical", "exception", "traceback")
+_ERROR_KEYWORDS = ("error", "critical", "exception", "traceback")
+_WARNING_KEYWORDS = ("warning",)
 _DEFAULT_VALIDATE_SIZE = 0.001
+_ERROR_STALE_WINDOW_HOURS = 24
+
+
+def _extract_timestamp(line: str) -> datetime | None:
+    """Parse leading timestamp 'YYYY-MM-DD HH:MM:SS,mmm' (if present)."""
+
+    if len(line) < 19:
+        return None
+    segment = line[:23]
+    for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(segment[: len(fmt)], fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def _mask(value: str | None) -> str:
@@ -120,44 +138,70 @@ def _tail_lines(path: Path, limit: int) -> list[str]:
 def _scan_logs(summary: Dict[str, Any]) -> None:
     _print_header("Log Inspection")
     trade_lines: list[str] = []
-    error_lines: list[str] = []
+    recent_error_lines: list[str] = []
+    stale_error_lines: list[str] = []
+    recent_warning_lines: list[str] = []
+    stale_warning_lines: list[str] = []
     log_files = [Path("logs/daemon.out"), Path("logs/system.log")]
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_ERROR_STALE_WINDOW_HOURS)
     for log_path in log_files:
         print(f"-- {log_path} --")
         lines = _tail_lines(log_path, _LOG_TAIL_LIMIT)
         if not lines:
             continue
         local_trade_lines: list[str] = []
-        local_error_lines: list[str] = []
+        local_recent_errors: list[str] = []
+        local_stale_errors: list[str] = []
         for line in lines:
             lower = line.lower()
             if _TRADELN_MARKER in line:
                 entry = f"{log_path}: {line}"
                 trade_lines.append(entry)
                 local_trade_lines.append(entry)
+            ts = _extract_timestamp(line)
+            is_recent = ts is not None and ts >= cutoff
             if any(keyword in lower for keyword in _ERROR_KEYWORDS):
                 entry = f"{log_path}: {line}"
-                error_lines.append(entry)
-                local_error_lines.append(entry)
+                if is_recent:
+                    recent_error_lines.append(entry)
+                    local_recent_errors.append(entry)
+                else:
+                    stale_error_lines.append(entry)
+                    local_stale_errors.append(entry)
+            elif any(keyword in lower for keyword in _WARNING_KEYWORDS):
+                entry = f"{log_path}: {line}"
+                if is_recent:
+                    recent_warning_lines.append(entry)
+                else:
+                    stale_warning_lines.append(entry)
         if local_trade_lines:
             print("Live trade submissions detected:")
             for entry in local_trade_lines:
                 print(f"  {entry}")
         else:
             print("No live trade submissions found in tail segment.")
-        if local_error_lines:
-            print("Errors or warnings detected:")
-            for entry in local_error_lines:
+        if local_recent_errors:
+            print("Recent errors detected (<=24h):")
+            for entry in local_recent_errors:
+                print(f"  {entry}")
+        elif local_stale_errors:
+            print("Stale errors (>24h) ignored:")
+            for entry in local_stale_errors:
                 print(f"  {entry}")
         else:
             print("No errors or warnings detected in tail segment.")
     summary["trade_lines"] = bool(trade_lines)
-    summary["log_errors"] = bool(error_lines)
+    summary["log_errors"] = bool(recent_error_lines)
+    summary["log_warnings"] = bool(recent_warning_lines)
+    summary["log_warning_entries"] = recent_warning_lines
+    summary["stale_log_errors"] = stale_error_lines
+    summary["stale_log_warnings"] = stale_warning_lines
+    summary["recent_error_entries"] = recent_error_lines
 
 
 def _check_risk_guard(summary: Dict[str, Any]) -> None:
     _print_header("Risk Guard")
-    state = risk_guard_load_state()
+    state = risk_guard_load_state(force_reload=True)
     paused, reason = risk_guard_check_pause(state)
     path = risk_guard_state_path()
     print(f"State file: {path}")
@@ -215,6 +259,7 @@ def _validate_trade(summary: Dict[str, Any]) -> None:
     if not summary.get("credentials"):
         print("Skipping validate-only trade: credentials missing.")
         summary["validate_trade"] = "skipped_missing_credentials"
+        summary["validate_trade_timestamp"] = datetime.now(timezone.utc).isoformat()
         return
 
     pair, size, price, threshold = _pick_validate_trade()
@@ -239,6 +284,7 @@ def _validate_trade(summary: Dict[str, Any]) -> None:
         ok = bool(trade_response.get("ok"))
         failure_detail = trade_response.get("error") or trade_response.get("code") or "unknown"
         summary["validate_trade"] = "ok" if ok else failure_detail
+        summary["validate_trade_timestamp"] = datetime.now(timezone.utc).isoformat()
         if ok:
             print("Validate-only trade would have succeeded (response ok=True).")
         else:
@@ -246,9 +292,11 @@ def _validate_trade(summary: Dict[str, Any]) -> None:
     except (KrakenAPIError, KrakenAuthError) as exc:
         print(f"Validate-only trade raised error: {exc}")
         summary["validate_trade"] = f"error: {exc}"
+        summary["validate_trade_timestamp"] = datetime.now(timezone.utc).isoformat()
     except (TimeoutError, OSError, ValueError, RuntimeError) as exc:
         print(f"Unexpected error during validate-only trade: {exc}")
         summary["validate_trade"] = f"unexpected_error: {exc}"
+        summary["validate_trade_timestamp"] = datetime.now(timezone.utc).isoformat()
     finally:
         if live_enabled:
             set_live_mode(False)
@@ -263,6 +311,7 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     trade_lines = "found" if summary.get("trade_lines") else "not found"
     log_errors = "detected" if summary.get("log_errors") else "none detected"
     validate = summary.get("validate_trade") or "not attempted"
+    validate_timestamp = summary.get("validate_trade_timestamp")
     risk = summary.get("risk_guard", {})
     risk_status = "paused" if risk.get("paused") else "clear"
 
@@ -271,7 +320,10 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     print(f"TradesHistory API: {trades_status}")
     print(f"Trade submission logs: {trade_lines}")
     print(f"Log errors/warnings: {log_errors}")
-    print(f"Validate-only trade: {validate}")
+    if validate_timestamp:
+        print(f"Validate-only trade: {validate} at {validate_timestamp}")
+    else:
+        print(f"Validate-only trade: {validate}")
     print(f"Risk guard: {risk_status}")
     if risk.get("paused") and risk.get("reason"):
         print(f"Risk guard reason: {risk.get('reason')}")

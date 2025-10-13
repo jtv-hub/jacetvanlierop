@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PAIR="${PAIR:-BTC/USD}"
+PAIR="${PAIR:-BTC/USDC}"
 INTERVAL="${INTERVAL:-30}"      # seconds
 MAX_SAMPLES="${MAX_SAMPLES:-60}"
 

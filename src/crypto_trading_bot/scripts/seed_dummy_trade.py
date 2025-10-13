@@ -8,7 +8,7 @@ if __name__ == "__main__":
     dummy_strategy.confidence = 0.85
 
     log_trade(
-        trading_pair="BTC/USD",
+        trading_pair="BTC/USDC",
         trade_size=100,
         strategy_instance=dummy_strategy,
         strategy_name="SimpleRSIStrategy",

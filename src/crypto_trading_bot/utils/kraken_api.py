@@ -2,13 +2,13 @@
 Lightweight Kraken REST API utility.
 
 - Public Ticker endpoint only (no auth required)
-- Converts app pairs like "BTC/USD" to Kraken's altname (e.g., "XBTUSD")
+- Converts app pairs like "BTC/USDC" to Kraken's altname (e.g., "XBTUSDC")
 - Safe retries with backoff and structured logging
 - Designed to be imported by other modules, e.g., price feeds
 
 Example:
     from crypto_trading_bot.utils.kraken_api import get_ticker_price
-    px = get_ticker_price("BTC/USD")
+    px = get_ticker_price("BTC/USDC")
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def _normalize_pair(pair: str) -> str:
     - Uppercases input defensively.
     """
     if not isinstance(pair, str) or "/" not in pair:
-        raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USD'")
+        raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USDC'")
     return normalize_pair(pair)
 
 
@@ -264,7 +264,7 @@ def get_ticker_price(
     retries: int = 3,
     backoff: float = 0.5,
 ) -> float:
-    """Return the latest market price for a given pair like "BTC/USD".
+    """Return the latest market price for a given pair like "BTC/USDC".
 
     - Uses Kraken public /Ticker endpoint
     - Retries transient network or response errors with exponential backoff

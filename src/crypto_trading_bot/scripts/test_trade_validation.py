@@ -16,13 +16,13 @@ class DummyStrategy:
 
 
 # 1. ✅ Valid Trade
-log_trade("BTC/USD", 100, DummyStrategy("SimpleRSIStrategy", 0.9), "SimpleRSIStrategy")
+log_trade("BTC/USDC", 100, DummyStrategy("SimpleRSIStrategy", 0.9), "SimpleRSIStrategy")
 
 # 2. ❌ Duplicate Trade (same timestamp/pair/strategy as above — simulate by overriding timestamp)
-log_trade("BTC/USD", 100, DummyStrategy("SimpleRSIStrategy", 0.9), "SimpleRSIStrategy")
+log_trade("BTC/USDC", 100, DummyStrategy("SimpleRSIStrategy", 0.9), "SimpleRSIStrategy")
 
 # 3. ❌ Anomalous Trade (invalid strategy + large size)
-log_trade("ETH/USD", 9999, DummyStrategy("FakeStrategy", 0.5), "FakeStrategy")
+log_trade("ETH/USDC", 9999, DummyStrategy("FakeStrategy", 0.5), "FakeStrategy")
 
 
 # 4. ❌ Invalid Schema (simulate by using an invalid strategy instance that lacks confidence)
@@ -35,4 +35,4 @@ class BadStrategy:
         self.name = "SimpleRSIStrategy"
 
 
-log_trade("SOL/USD", 100, BadStrategy(), "SimpleRSIStrategy")
+log_trade("SOL/USDC", 100, BadStrategy(), "SimpleRSIStrategy")

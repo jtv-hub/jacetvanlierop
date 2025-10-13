@@ -30,7 +30,7 @@ def log_shadow_test_result(
         suggestion_id (str): ID of the rejected suggestion being shadow tested
         strategy_name (str): Strategy class name
         parameters (dict): Parameters tested
-        asset (str): Trading pair (e.g., BTC/USD)
+        asset (str): Trading pair (e.g., BTC/USDC)
         timeframe (str): Timeframe used (e.g., 5m)
         roi (float): Total return on investment
         win_rate (float): Win rate during the test

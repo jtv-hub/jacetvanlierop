@@ -134,7 +134,7 @@ def main() -> int:
         print(f"{now:%Y-%m-%d %H:%M:%S} - WARNING - {msg}")
         write_human_log(repo_root, f"⚠️ {msg}")
         append_metrics_snapshot(repo_root, now, None, 0, "no_live_file")
-        notify_mac("No BTC/USD live file found. Check capture.")
+        notify_mac("No BTC/USDC live file found. Check capture.")
         return 3
 
     n_lines = count_lines(live)

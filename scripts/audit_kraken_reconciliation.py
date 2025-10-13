@@ -20,26 +20,131 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 from collections import Counter, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from crypto_trading_bot.utils.kraken_api import kraken_client
 from crypto_trading_bot.utils.kraken_client import KrakenAPIError
-from crypto_trading_bot.utils.kraken_pairs import PAIR_MAP
+from crypto_trading_bot.utils.kraken_pairs import PAIR_MAP, ensure_usdc_pair
 
 LOG_PATH = Path("logs/trades.log")
 PORTFOLIO_STATE_PATH = Path("data/portfolio_state.json")
 DAEMON_LOG_PATH = Path("logs/daemon.out")
+DAEMON_ARCHIVE_DIR = Path("logs/archive")
+DAEMON_RETENTION_HOURS = 48
+DAEMON_CRITICAL_WINDOW_HOURS = 24
 TRADES_TO_CONSIDER = 200  # limit reconciliation to the most recent trades
 TIME_TOLERANCE_SECONDS = 30 * 60  # tolerate +/- 30 minutes between entries
 VOLUME_TOLERANCE = 1e-6  # absolute volume tolerance for matching
 SWITCH_ENV_VAR = "USDC_SWITCH_TIMESTAMP"
 
 REVERSE_PAIR_MAP = {v: k for k, v in PAIR_MAP.items()}
+
+
+def _extract_daemon_timestamp(line: str) -> Optional[datetime]:
+    """Best-effort extraction of a timestamp from a daemon log line."""
+
+    match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[.,]\d+)?", line)
+    if not match:
+        return None
+    raw = match.group(1)
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _cleanup_daemon_log(
+    *,
+    path: Path = DAEMON_LOG_PATH,
+    archive_dir: Path = DAEMON_ARCHIVE_DIR,
+    retention_hours: int = DAEMON_RETENTION_HOURS,
+    critical_window_hours: int = DAEMON_CRITICAL_WINDOW_HOURS,
+) -> Dict[str, Any]:
+    """Purge stale entries from daemon.out or archive when no recent CRITICAL alerts exist."""
+
+    result: Dict[str, Any] = {"cleaned": False, "archived": False}
+    if not path.exists():
+        result["reason"] = "missing"
+        return result
+
+    now = datetime.now(timezone.utc)
+    retention_cutoff = now - timedelta(hours=max(retention_hours, 1))
+    critical_cutoff = now - timedelta(hours=max(critical_window_hours, 1))
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        result["reason"] = f"read_error:{exc}"
+        return result
+
+    last_critical: Optional[datetime] = None
+    parsed_lines: list[tuple[Optional[datetime], str]] = []
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+        ts = _extract_daemon_timestamp(line)
+        parsed_lines.append((ts, line))
+        if "CRITICAL" in line.upper() and ts is not None:
+            if last_critical is None or ts > last_critical:
+                last_critical = ts
+
+    if last_critical is None or last_critical <= critical_cutoff:
+        # No recent critical alerts — archive entire log and reset.
+        if lines:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_path = archive_dir / f"daemon_{now:%Y%m%d%H%M%S}.out"
+            try:
+                shutil.move(str(path), archive_path)
+                path.write_text("", encoding="utf-8")
+                result.update({"archived": True, "archive_path": str(archive_path)})
+            except OSError as exc:
+                result["reason"] = f"archive_error:{exc}"
+                return result
+        result["cleaned"] = True
+        result["last_critical"] = last_critical.isoformat() if last_critical else None
+        return result
+
+    # Retain recent entries, drop anything older than retention window.
+    kept_lines: list[str] = []
+    for ts, line in parsed_lines:
+        if ts is None:
+            continue
+        if ts >= retention_cutoff:
+            kept_lines.append(line)
+
+    if len(kept_lines) != len(lines):
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / f"daemon_{now:%Y%m%d%H%M%S}.out"
+        stale_lines = [line for ts, line in parsed_lines if ts is None or ts < retention_cutoff]
+        try:
+            with archive_path.open("w", encoding="utf-8") as handle:
+                for entry in stale_lines:
+                    handle.write(entry + "\n")
+            with path.open("w", encoding="utf-8") as handle:
+                for entry in kept_lines:
+                    handle.write(entry + "\n")
+            result.update(
+                {
+                    "cleaned": True,
+                    "archived": True,
+                    "archive_path": str(archive_path),
+                    "pruned_count": len(stale_lines),
+                }
+            )
+        except OSError as exc:
+            result["reason"] = f"prune_error:{exc}"
+            return result
+    else:
+        result["reason"] = "no_prune_needed"
+    result["last_critical"] = last_critical.isoformat()
+    return result
 
 
 def _coerce_utc(value: datetime) -> datetime:
@@ -184,10 +289,7 @@ def kraken_pair_to_human(raw_pair: str | None) -> str:
 def to_usdc_pair(pair: str) -> str:
     """Ensure that the provided pair string uses a USDC quote."""
 
-    base, quote = pair.upper().replace("-", "/").split("/")
-    if quote == "USD":
-        return f"{base}/USDC"
-    return f"{base}/{quote}"
+    return ensure_usdc_pair(pair)
 
 
 def load_log_trades(
@@ -226,16 +328,21 @@ def load_log_trades(
             continue
         if switch_time and ts < switch_time:
             continue
+        try:
+            normalized_pair = to_usdc_pair(pair)
+        except ValueError:
+            normalized_pair = pair
         log_trade = LogTrade(
             trade_id=str(item.get("trade_id") or ""),
             timestamp=ts,
             pair=pair,
-            normalized_pair=to_usdc_pair(pair),
+            normalized_pair=normalized_pair,
             size=float(size),
             side=(item.get("side") or "").lower(),
             raw=item,
         )
-        if pair.endswith("/USD"):
+        quote = normalized_pair.split("/", 1)[-1] if "/" in normalized_pair else ""
+        if quote != "USDC":
             usd_after_switch.append(log_trade)
         trades.append(log_trade)
     return trades, usd_after_switch
@@ -355,8 +462,9 @@ def load_internal_portfolio_state() -> Dict[str, Any]:
 def inspect_daemon_logs(limit: int = 1000) -> Dict[str, Any]:
     """Inspect daemon log tail for live-trade activity and drawdown lines."""
 
+    maintenance = _cleanup_daemon_log()
     if not DAEMON_LOG_PATH.exists():
-        return {"found": False, "lines": []}
+        return {"found": False, "lines": [], "maintenance": maintenance}
 
     pattern_live = re.compile(r"Submitting live trade .*pair=(?P<pair>[^\s|]+)")
 
@@ -382,6 +490,7 @@ def inspect_daemon_logs(limit: int = 1000) -> Dict[str, Any]:
         "live_trade_lines": live_trades[-5:],
         "usd_quote_lines": usd_pairs[-5:],
         "drawdown_lines": drawdown_lines[-5:],
+        "maintenance": maintenance,
     }
 
 

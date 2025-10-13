@@ -56,6 +56,8 @@ def _to_float(val: Any) -> float | None:
 
 
 def _extract_entry(obj: Dict[str, Any]) -> Dict[str, Any]:
+    if obj.get("type") == "strategy_confidence_summary":
+        return {"skip": True, "raw": obj}
     strategy = _first(obj, "strategy", "strategy_name") or "Unknown"
     status = _first(obj, "result", "status", "outcome")
     success = _to_float(_first(obj, "win_rate", "success_rate"))
@@ -85,7 +87,10 @@ def _load_results(path: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             malformed += 1
             continue
-        entries.append(_extract_entry(obj))
+        entry = _extract_entry(obj)
+        if entry.get("skip"):
+            continue
+        entries.append(entry)
     return {"entries": entries, "malformed": malformed}
 
 

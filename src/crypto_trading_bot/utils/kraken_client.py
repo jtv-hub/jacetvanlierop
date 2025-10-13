@@ -152,7 +152,7 @@ def _decode_secret(secret: str) -> bytes:
 
 
 def _normalize_pair(pair: str) -> str:
-    """Return Kraken's altname for a pair like ``BTC/USD``."""
+    """Return Kraken's altname for a pair like ``BTC/USDC``."""
 
     return normalize_pair(pair)
 
@@ -587,6 +587,36 @@ def query_api_key_permissions() -> Optional[Dict[str, Any]]:
     return {"rights": rights, "raw": result}
 
 
+def _fallback_pair_meta(pair: str) -> Dict[str, Any]:
+    """Return a safe fallback metadata payload when Kraken data is unavailable."""
+
+    trade_cfg = CONFIG.get("trade_size", {}) or {}
+    per_pair = trade_cfg.get("per_pair", {}) or {}
+    pair_cfg = per_pair.get(pair, {}) or {}
+
+    default_min_volume = float(trade_cfg.get("default_min", 0.0) or 0.0)
+    fallback_volume = float(pair_cfg.get("min_volume", default_min_volume) or default_min_volume)
+
+    kraken_cfg = CONFIG.get("kraken", {}) or {}
+    default_cost_threshold = float(
+        CONFIG.get("kraken_min_cost_threshold", kraken_cfg.get("min_cost_threshold", 0.0)) or 0.0
+    )
+    fallback_cost = float(pair_cfg.get("min_cost", default_cost_threshold) or default_cost_threshold)
+
+    price_decimals = int(kraken_cfg.get("pair_decimals_default", 5) or 5)
+    lot_decimals = int(kraken_cfg.get("lot_decimals_default", 8) or 8)
+
+    payload = {
+        "ordermin": max(fallback_volume, 0.0),
+        "costmin": max(fallback_cost, 0.0),
+        "pair_decimals": max(price_decimals, 0),
+        "lot_decimals": max(lot_decimals, 0),
+        "source": "fallback",
+    }
+    logger.warning("Using fallback Kraken metadata for %s: %s", pair, payload)
+    return payload
+
+
 def kraken_get_asset_pair_meta(pair: str) -> Dict[str, Any]:
     """Return Kraken asset pair metadata including order and cost minimums."""
 
@@ -596,18 +626,34 @@ def kraken_get_asset_pair_meta(pair: str) -> Dict[str, Any]:
     if cached and now - cached[0] < _PAIR_CACHE_TTL:
         return dict(cached[1])
 
-    payload = _http_public("AssetPairs", {"pair": normalized})
+    try:
+        payload = _http_public("AssetPairs", {"pair": normalized})
+    except KrakenAPIError as exc:
+        logger.error("AssetPairs HTTP failure for %s: %s", pair, exc)
+        fallback = _fallback_pair_meta(pair)
+        _PAIR_CACHE[normalized] = (now, fallback)
+        return dict(fallback)
+
     errors = payload.get("error")
     if errors:
-        raise KrakenAPIError(f"AssetPairs error for {pair}: {errors}")
+        logger.error("AssetPairs error for %s: %s", pair, errors)
+        fallback = _fallback_pair_meta(pair)
+        _PAIR_CACHE[normalized] = (now, fallback)
+        return dict(fallback)
 
     result = payload.get("result")
     if not isinstance(result, dict):
-        raise KrakenAPIError(f"Invalid AssetPairs payload for {pair}")
+        logger.error("Invalid AssetPairs payload for %s: %s", pair, payload)
+        fallback = _fallback_pair_meta(pair)
+        _PAIR_CACHE[normalized] = (now, fallback)
+        return dict(fallback)
 
     meta = result.get(normalized)
     if not isinstance(meta, dict):
-        raise KrakenAPIError(f"Asset metadata missing for pair {pair}")
+        logger.error("Asset metadata missing for pair %s in payload: %s", pair, result)
+        fallback = _fallback_pair_meta(pair)
+        _PAIR_CACHE[normalized] = (now, fallback)
+        return dict(fallback)
 
     try:
         ordermin = float(meta.get("ordermin", 0.0) or 0.0)

@@ -27,7 +27,7 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
         t1 = {
             "trade_id": f"T-{uuid.uuid4()}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pair": "BTC/USD",
+            "pair": "BTC/USDC",
             "size": 0.01,
             "strategy": "TestStrat",
             "confidence": 0.2,  # low confidence
@@ -40,7 +40,7 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
         t2 = {
             "trade_id": f"T-{uuid.uuid4()}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pair": "ETH/USD",
+            "pair": "ETH/USDC",
             "size": 0.05,
             "strategy": "TestStrat",
             "confidence": 0.9,  # high confidence

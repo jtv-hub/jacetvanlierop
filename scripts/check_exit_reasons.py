@@ -16,6 +16,26 @@ from collections import Counter
 from typing import Dict
 
 TRADES_PATH = os.path.join("logs", "trades.log")
+LEGACY_MAP = {
+    "STOP_LOSS": "sl_triggered",
+    "STOPLOSS": "sl_triggered",
+    "TRAILING_STOP": "trailing_exit",
+    "TRAIL_STOP": "trailing_exit",
+    "TAKE_PROFIT": "tp_hit",
+    "TAKEPROFIT": "tp_hit",
+    "RSI_EXIT": "indicator_exit",
+    "RSI": "indicator_exit",
+    "MAX_HOLD": "max_hold_expired",
+    "MAX HOLD": "max_hold_expired",
+}
+DISPLAY_LABELS = {
+    "sl_triggered": "Stop Loss",
+    "tp_hit": "Take Profit",
+    "indicator_exit": "Indicator Exit",
+    "trailing_exit": "Trailing Stop",
+    "max_hold_expired": "Max Hold",
+    "unknown": "Unknown",
+}
 
 
 def _read_lines(path: str) -> list[str]:
@@ -23,6 +43,25 @@ def _read_lines(path: str) -> list[str]:
         return []
     with open(path, "r", encoding="utf-8") as f:
         return [ln.rstrip("\n") for ln in f]
+
+
+def _canonical_reason(obj: dict) -> str:
+    candidates = [
+        obj.get("exit_reason"),
+        obj.get("reason"),
+        obj.get("reason_display"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        lowered = text.lower().replace(" ", "_")
+        if lowered in DISPLAY_LABELS:
+            return lowered
+        mapped = LEGACY_MAP.get(text.upper())
+        if mapped:
+            return mapped
+    return "unknown"
 
 
 def count_exit_reasons(path: str) -> Counter:
@@ -36,18 +75,17 @@ def count_exit_reasons(path: str) -> Counter:
         except json.JSONDecodeError:
             # Skip malformed
             continue
-        if obj.get("status") != "closed":
+        if (obj.get("status") or "").lower() != "closed":
             continue
-        r = obj.get("reason")
-        if isinstance(r, str) and r.strip():
-            counts[r.strip().upper()] += 1
+        counts[_canonical_reason(obj)] += 1
     return counts
 
 
 def _print_human(counts: Dict[str, int]) -> None:
     print("\n📤 Exit Reason Summary\n")
     for key, value in counts.items():
-        print(f"• {key}: {value}")
+        label = DISPLAY_LABELS.get(key, key)
+        print(f"• {label}: {value}")
 
 
 def main() -> None:

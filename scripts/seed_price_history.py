@@ -2,16 +2,16 @@
 Seed historical daily close prices from Kraken OHLC API.
 
 Pairs:
-  BTC/USD -> XBTUSD
-  ETH/USD -> ETHUSD
-  XRP/USD -> XRPUSD
-  SOL/USD -> SOLUSD
-  LINK/USD -> LINKUSD
+  BTC/USDC -> XBTUSDC
+  ETH/USDC -> ETHUSDC
+  XRP/USDC -> XRPUSDC
+  SOL/USDC -> SOLUSDC
+  LINK/USDC -> LINKUSDC
 
 Writes JSON file at `data/seeded_prices.json` in the format:
 
 price_history_cache = {
-  "ETH/USD": [
+  "ETH/USDC": [
       ["2025-08-01T00:00:00", 2821.45],
       ["2025-08-02T00:00:00", 2877.21],
       ...
@@ -47,11 +47,11 @@ OUT_PATH = "data/seeded_prices.json"
 
 # Mapping from display pair to Kraken API pair
 PAIR_MAP: Dict[str, str] = {
-    "BTC/USD": "XBTUSD",
-    "ETH/USD": "ETHUSD",
-    "XRP/USD": "XRPUSD",
-    "SOL/USD": "SOLUSD",
-    "LINK/USD": "LINKUSD",
+    "BTC/USDC": "XBTUSDC",
+    "ETH/USDC": "ETHUSDC",
+    "XRP/USDC": "XRPUSDC",
+    "SOL/USDC": "SOLUSDC",
+    "LINK/USDC": "LINKUSDC",
 }
 
 

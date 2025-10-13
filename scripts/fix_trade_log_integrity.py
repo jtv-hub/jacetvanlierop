@@ -164,7 +164,7 @@ def repair(trades_path: str, positions_path: str, dry_run: bool = False) -> Dict
             entry_time = t.get("timestamp") or datetime.now(timezone.utc).isoformat()
             synthetic = {
                 "trade_id": tid,
-                "pair": t.get("pair") or "BTC/USD",
+                "pair": t.get("pair") or "BTC/USDC",
                 "side": side_norm,
                 "entry_price": entry_price,
                 "entry_time": entry_time,
@@ -198,7 +198,7 @@ def repair(trades_path: str, positions_path: str, dry_run: bool = False) -> Dict
         entry_time = t.get("timestamp") or datetime.now(timezone.utc).isoformat()
         synthetic_open = {
             "trade_id": tid,
-            "pair": t.get("pair") or "BTC/USD",
+            "pair": t.get("pair") or "BTC/USDC",
             "side": side_norm,
             "entry_price": entry_price,
             "entry_time": entry_time,

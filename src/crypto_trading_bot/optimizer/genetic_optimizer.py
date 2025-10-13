@@ -10,7 +10,7 @@ from __future__ import annotations
 import random
 from typing import Dict, List, Tuple
 
-from crypto_trading_bot.bot.utils.alert import send_alert
+from crypto_trading_bot.bot.utils.alerts import send_alert
 
 
 def evaluate_fitness(

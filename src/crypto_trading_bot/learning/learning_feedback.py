@@ -66,7 +66,7 @@ def log_forward_test_plan(
         parameters (dict): Parameters being tested
         test_type (str): 'shadow' or 'live'
         confidence_score (float): Confidence score from learning machine
-        asset (str): Trading pair/asset (e.g., BTC/USD)
+        asset (str): Trading pair/asset (e.g., BTC/USDC)
         timeframe (str): Timeframe being tested (e.g., 5m, 1h)
     """
     entry = {

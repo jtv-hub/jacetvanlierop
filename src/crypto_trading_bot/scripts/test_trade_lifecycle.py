@@ -86,7 +86,7 @@ def run_test_lifecycle():
     """Execute a headless trade lifecycle test using live prices and RSI."""
     _ensure_dirs()
 
-    pairs = CONFIG.get("tradable_pairs", ["BTC/USD"]) or ["BTC/USD"]
+    pairs = CONFIG.get("tradable_pairs", ["BTC/USDC"]) or ["BTC/USDC"]
     pair = pairs[0]
     logger.info("Using pair: %s", pair)
 

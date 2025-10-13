@@ -11,6 +11,7 @@ import pytest
 from crypto_trading_bot import config as config_module
 from crypto_trading_bot.bot import market_data, trading_logic
 from crypto_trading_bot.config import ConfigurationError, set_live_mode
+from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.utils import kraken_client
 
 
@@ -51,7 +52,7 @@ def test_place_order_invalid_secret(monkeypatch):
 
     monkeypatch.setattr(kraken_client, "_http_post", fake_http_post)
 
-    response = kraken_client.kraken_place_order("BTC/USD", "buy", 0.01, price=20_000.0)
+    response = kraken_client.kraken_place_order("BTC/USDC", "buy", 0.01, price=20_000.0)
 
     assert response.get("ok") is False
     assert response.get("code") == "auth"
@@ -161,7 +162,7 @@ def test_place_order_success_with_valid_secret(monkeypatch):
 
     monkeypatch.setattr(kraken_client, "_private_request", fake_private_request)
 
-    response = kraken_client.kraken_place_order("BTC/USD", "buy", 0.01, price=20_000.0)
+    response = kraken_client.kraken_place_order("BTC/USDC", "buy", 0.01, price=20_000.0)
 
     assert response["ok"] is True
     assert response["txid"] == ["abc123"]
@@ -189,7 +190,7 @@ def test_place_order_validate_only_success(monkeypatch):
     monkeypatch.setattr(kraken_client, "_private_request", fake_private_request)
 
     response = kraken_client.kraken_place_order(
-        "BTC/USD",
+        "BTC/USDC",
         "buy",
         0.05,
         price=25_000.0,
@@ -227,7 +228,7 @@ def test_place_order_cost_minimum_not_met(monkeypatch):
     monkeypatch.setattr(kraken_client, "_private_request", fake_private_request)
 
     response = kraken_client.kraken_place_order(
-        "BTC/USD",
+        "BTC/USDC",
         "buy",
         0.0001,
         price=10.0,
@@ -242,7 +243,7 @@ def test_place_order_cost_minimum_not_met(monkeypatch):
 
 
 def test_asset_pair_meta_missing_pair(monkeypatch):
-    """Metadata fetch should raise when Kraken omits the requested pair."""
+    """Metadata fetch should fall back when Kraken omits the requested pair."""
 
     monkeypatch.setattr(
         kraken_client,
@@ -250,8 +251,10 @@ def test_asset_pair_meta_missing_pair(monkeypatch):
         lambda endpoint, params=None, timeout=10.0: {"error": [], "result": {}},
     )
 
-    with pytest.raises(kraken_client.KrakenAPIError):
-        kraken_client.kraken_get_asset_pair_meta("FOO/BAR")
+    meta = kraken_client.kraken_get_asset_pair_meta("FOO/BAR")
+    assert meta["ordermin"] >= 0.0
+    assert meta["costmin"] >= 0.0
+    assert meta.get("source") == "fallback"
 
 
 def test_kraken_place_order_rate_limit_code(monkeypatch):
@@ -274,7 +277,7 @@ def test_kraken_place_order_rate_limit_code(monkeypatch):
 
     monkeypatch.setattr(kraken_client, "_private_request", fake_private_request)
 
-    response = kraken_client.kraken_place_order("BTC/USD", "buy", 0.01, price=20_000.0)
+    response = kraken_client.kraken_place_order("BTC/USDC", "buy", 0.01, price=20_000.0)
 
     assert response["code"] == "rate_limit"
 
@@ -283,6 +286,9 @@ def _reset_trading_state():
     trading_logic.is_live = True
     trading_logic._live_block_logged = False  # type: ignore[attr-defined]
     trading_logic._KRAKEN_FAILURE_PAUSE_UNTIL = None  # type: ignore[attr-defined]
+    trading_logic.DEPLOY_PHASE = "full"
+    risk_guard.invalidate_cache()
+    risk_guard.resume_trading(context={"test": "reset"})
 
 
 def test_submit_live_trade_skips_volume_min(monkeypatch):
@@ -463,4 +469,5 @@ def test_submit_live_trade_rate_limit_pause(monkeypatch):
     )
 
     assert result is False
-    assert trading_logic._KRAKEN_FAILURE_PAUSE_UNTIL == pytest.approx(1090.0)  # type: ignore[attr-defined]
+    pause_until = getattr(trading_logic, "_KRAKEN_FAILURE_PAUSE_UNTIL")
+    assert pause_until == pytest.approx(1090.0)

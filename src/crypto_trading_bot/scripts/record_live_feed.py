@@ -43,7 +43,7 @@ def utc_now_str() -> str:
 
 
 def sanitize_pair(pair: str) -> str:
-    """Return a filesystem-friendly version of a trading pair like BTC/USD."""
+    """Return a filesystem-friendly version of a trading pair like BTC/USDC."""
     return pair.replace("/", "")
 
 
@@ -235,7 +235,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Record live public ticker data (Kraken).")
     p.add_argument(
         "--pair",
-        default="BTC/USD",
+        default="BTC/USDC",
         help="Trading pair to record (default: %(default)s)",
     )
     p.add_argument(

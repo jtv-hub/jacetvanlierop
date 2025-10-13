@@ -42,5 +42,5 @@ def generate_mock_data(pair_name: str, days: int = 1):
 
 
 if __name__ == "__main__":
-    for pair in ["BTC/USD", "ETH/USD", "SOL/USD"]:
+    for pair in ["BTC/USDC", "ETH/USDC", "SOL/USDC"]:
         generate_mock_data(pair, days=1)

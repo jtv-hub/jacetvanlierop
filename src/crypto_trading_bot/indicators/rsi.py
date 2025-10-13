@@ -7,7 +7,10 @@ Implements the Relative Strength Index (RSI) calculation for trading strategies.
 import json
 from datetime import datetime, timezone
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency guard
+    np = None  # type: ignore[assignment]
 
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 
@@ -29,6 +32,9 @@ def calculate_rsi(prices, period=14):
         ValueError: If input is invalid or RSI cannot be computed safely.
     """
     # Input validation: ensure list-like, sufficient length, and positive prices
+    if np is None:  # pragma: no cover - requires numpy installed
+        raise ImportError("numpy is required for RSI calculations")
+
     if prices is None:
         raise ValueError("RSI: prices is None")
     if period is None or period <= 0:

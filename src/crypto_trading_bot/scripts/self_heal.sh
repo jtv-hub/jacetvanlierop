@@ -77,7 +77,7 @@ if [[ -f scripts/nightly_pipeline.sh ]]; then
   MODE=playback ./scripts/nightly_pipeline.sh || true
   # If no data exists yet, do a tiny live capture to seed files
   if [[ -z "$(latest_live_file)" ]]; then
-    PAIR="BTC/USD" INTERVAL=5 MAX_SAMPLES=5 ./scripts/nightly_pipeline.sh || true
+    PAIR="BTC/USDC" INTERVAL=5 MAX_SAMPLES=5 ./scripts/nightly_pipeline.sh || true
   fi
 else
   log "nightly_pipeline.sh missing; cannot run fallback"

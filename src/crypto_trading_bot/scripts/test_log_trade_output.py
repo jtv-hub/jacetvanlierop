@@ -17,4 +17,4 @@ class DummyStrategy:
         self.confidence = 0.8
 
 
-log_trade("BTC/USD", 100, DummyStrategy(), "SimpleRSIStrategy", entry_price=29000.0)
+log_trade("BTC/USDC", 100, DummyStrategy(), "SimpleRSIStrategy", entry_price=29000.0)

@@ -67,6 +67,9 @@ def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
 
 def run_anomaly_audit() -> bool:
     """Run audit with cleanup of closed positions; return True if final state passes."""
+    if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
+        print("ℹ️ Skipping anomaly audit — live mode disabled.")
+        return True
     try:
         result = audit_run_and_cleanup("logs/trades.log", "logs/positions.jsonl")
         initial_errors = result.get("initial_errors", 0)
@@ -140,6 +143,9 @@ def update_shadow_test_results():
 
 def run_daily_pipeline() -> None:
     """Run all daily tasks: heartbeat, optimization, shadow testing, learning."""
+    if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
+        print("ℹ️ Skipping daily pipeline — live mode disabled.")
+        return
     state = refresh_portfolio_state()
     available = float(state.get("available_capital", 0.0) or 0.0)
     print("🧹 Rotating logs before running daily tasks...")
@@ -217,6 +223,9 @@ def should_run_anomaly_audit(last_audit_time):
 def run_scheduler():
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
     print("📅 Scheduler started. Running bot tasks...")
+    if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
+        print("⚠️ Live mode disabled in configuration — scheduler will not start.")
+        return
     mode_label = get_mode_label()
     print(f"🛰️  Operating mode: {mode_label} (is_live={is_live})")
 
@@ -263,6 +272,11 @@ def run_scheduler():
 
     while True:
         try:
+            if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
+                print("⏸️  Live mode disabled — scheduler idle.")
+                time.sleep(TRADE_INTERVAL)
+                continue
+
             if is_live:
                 require_live_confirmation()
 

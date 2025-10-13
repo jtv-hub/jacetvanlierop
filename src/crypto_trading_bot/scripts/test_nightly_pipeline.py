@@ -18,7 +18,7 @@ LEDGER_FILE = "ledger/trade_ledger.json"
 mock_trades = [
     {
         "timestamp": "2025-08-16 12:00:00",
-        "pair": "BTC/USD",
+        "pair": "BTC/USDC",
         "signal": "BUY",
         "confidence": 0.8,
         "regime": "trend",
@@ -26,7 +26,7 @@ mock_trades = [
     },
     {
         "timestamp": "2025-08-16 12:05:00",
-        "pair": "ETH/USD",
+        "pair": "ETH/USDC",
         "signal": "SELL",
         "confidence": 0.6,
         "regime": "chop",

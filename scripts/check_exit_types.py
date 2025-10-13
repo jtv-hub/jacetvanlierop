@@ -15,29 +15,47 @@ import os
 from collections import Counter
 
 TRADES_PATH = os.path.join("logs", "trades.log")
-REQUIRED = {"STOP_LOSS", "TAKE_PROFIT", "RSI_EXIT", "TRAILING_STOP", "MAX_HOLD"}
+REQUIRED = {"sl_triggered", "tp_hit", "indicator_exit", "trailing_exit", "max_hold_expired"}
+_DISPLAY_LABELS = {
+    "sl_triggered": "STOP_LOSS",
+    "tp_hit": "TAKE_PROFIT",
+    "indicator_exit": "RSI_EXIT",
+    "trailing_exit": "TRAILING_STOP",
+    "max_hold_expired": "MAX_HOLD",
+}
+_LEGACY_MAP = {
+    "STOP_LOSS": "sl_triggered",
+    "STOPLOSS": "sl_triggered",
+    "TRAILING_STOP": "trailing_exit",
+    "TRAIL_STOP": "trailing_exit",
+    "TAKE_PROFIT": "tp_hit",
+    "TAKEPROFIT": "tp_hit",
+    "RSI_EXIT": "indicator_exit",
+    "RSI": "indicator_exit",
+    "MAX_HOLD": "max_hold_expired",
+    "MAX HOLD": "max_hold_expired",
+}
 
 
-def _normalize_reason(raw: str) -> str | None:
-    """Map a free-form reason string to one of the REQUIRED categories.
+def _normalize_reason(obj: dict) -> str | None:
+    """Return canonical exit reason for a trade record."""
 
-    Returns the normalized reason or None if it cannot be mapped.
-    """
-    r = (raw or "").upper()
-    if not r:
-        return None
-    if "TRAIL" in r:
-        return "TRAILING_STOP"
-    if "STOP" in r:
-        return "STOP_LOSS"
-    if "TAKE" in r or "PROFIT" in r:
-        return "TAKE_PROFIT"
-    if "RSI" in r:
-        return "RSI_EXIT"
-    if "MAX_HOLD" in r or "HOLD" in r:
-        return "MAX_HOLD"
-    if r in REQUIRED:
-        return r
+    candidates = [
+        obj.get("exit_reason"),
+        obj.get("reason"),
+        obj.get("reason_display"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        lowered = text.lower().replace(" ", "_")
+        if lowered in REQUIRED:
+            return lowered
+        legacy = text.upper()
+        mapped = _LEGACY_MAP.get(legacy)
+        if mapped:
+            return mapped
     return None
 
 
@@ -65,9 +83,9 @@ def compute_exit_counts(path: str) -> tuple[Counter, list[str]]:
         except json.JSONDecodeError as e:
             warnings.append(f"Malformed JSON (L{i}): {e}")
             continue
-        if obj.get("status") != "closed":
+        if (obj.get("status") or "").lower() != "closed":
             continue
-        norm = _normalize_reason(str(obj.get("reason", "")))
+        norm = _normalize_reason(obj)
         if norm is None:
             continue
         counts[norm] += 1
@@ -101,7 +119,8 @@ def main() -> None:
     for key in sorted(REQUIRED):
         c = counts.get(key, 0)
         icon = "✅" if c > 0 else "❌"
-        print(f"{icon} {key}: {c}")
+        label = _DISPLAY_LABELS.get(key, key)
+        print(f"{icon} {label}: {c}")
 
     for w in warnings:
         print(f"⚠️  {w}")

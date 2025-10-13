@@ -27,7 +27,7 @@ def reset_trades(num_trades: int = 20):
     ledger = TradeLedger(_PM())
 
     for _ in range(num_trades):
-        pair = random.choice(["BTC/USD", "ETH/USD", "XRP/USD"])
+        pair = random.choice(["BTC/USDC", "ETH/USDC", "XRP/USDC"])
         size = random.randint(10, 100)
         strategy = random.choice(strategies)
         confidence = round(random.uniform(0.5, 1.0), 2)

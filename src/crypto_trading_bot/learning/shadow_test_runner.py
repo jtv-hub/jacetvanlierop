@@ -46,6 +46,7 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
 
     results = []
     confidences = []
+    strategy_stats: dict[str, dict[str, float]] = {}
 
     try:
         with open(input_file, "r", encoding="utf-8") as infile:
@@ -105,11 +106,14 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
                 else "Met confidence threshold"
             )
             logger.info(
-                "Suggestion %s: %s (confidence: %.2f, threshold: %.2f)",
+                "Suggestion %s: %s (confidence=%.2f threshold=%.2f avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
                 suggestion.get("suggestion", "unknown"),
                 status,
                 confidence,
                 threshold,
+                avg_roi,
+                win_rate,
+                sharpe,
             )
 
             result = {
@@ -125,22 +129,61 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
                 "threshold": threshold,
                 "status": status,
                 "reason": reason,
+                "success_rate": 1.0 if status == "pass" else 0.0,
             }
             results.append(result)
+            strategy_key = result["strategy_name"]
+            stats = strategy_stats.get(strategy_key) or {"passes": 0.0, "fails": 0.0, "confidence_sum": 0.0}
+            if status == "pass":
+                stats["passes"] += 1.0
+            else:
+                stats["fails"] += 1.0
+            try:
+                stats["confidence_sum"] += float(confidence)
+            except (TypeError, ValueError):
+                pass
+            strategy_stats[strategy_key] = stats
 
     except OSError as e:
         logger.error("Error reading suggestions from %s: %s", input_file, e)
         return
     except (ValueError, TypeError, KeyError) as e:
-        logger.error("Unexpected error in %s: %s", input_file, e)
+        logger.error("Unexpected error parsing %s: %s", input_file, e, exc_info=True)
         return
 
     # === Write results ===
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        summary_rows = []
+        for strategy_name, stats in strategy_stats.items():
+            total = stats["passes"] + stats["fails"]
+            if total <= 0:
+                continue
+            pass_rate = stats["passes"] / total
+            avg_conf = stats["confidence_sum"] / total
+            summary_rows.append(
+                {
+                    "strategy_name": strategy_name,
+                    "tests": int(total),
+                    "passes": int(stats["passes"]),
+                    "fails": int(stats["fails"]),
+                    "pass_rate": round(pass_rate, 4),
+                    "avg_confidence": round(avg_conf, 4),
+                }
+            )
+        summary_rows.sort(key=lambda row: (-row["pass_rate"], -row["avg_confidence"]))
+        if summary_rows:
+            summary_record = {
+                "shadow_test_id": f"summary-{uuid.uuid4()}",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "type": "strategy_confidence_summary",
+                "strategies": summary_rows,
+            }
+            results.append(summary_record)
+
         with open(output_file, "w", encoding="utf-8") as outfile:
-            for r in results:
-                outfile.write(json.dumps(r) + "\n")
+            for record in results:
+                outfile.write(json.dumps(record) + "\n")
         logger.info("✅ Shadow test results saved to %s", output_file)
     except OSError as e:
         logger.error("Failed to write results to %s: %s", output_file, e)

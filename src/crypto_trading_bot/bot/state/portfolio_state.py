@@ -16,7 +16,7 @@ from statistics import mean, pstdev
 from typing import Any, Dict, List, Optional, Tuple
 
 from crypto_trading_bot.analytics.roi_calculator import compute_running_balance
-from crypto_trading_bot.bot.market_data import get_account_balance
+from crypto_trading_bot.bot.market_data import BalanceFetchError, get_account_balance
 from crypto_trading_bot.bot.utils.reinvestment import calculate_reinvestment_rate
 from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
 
@@ -51,7 +51,11 @@ def _log_detected_balance(amount: float, source: str) -> None:
 def _resolve_live_balance() -> Tuple[Optional[float], str]:
     """Fetch live account balance if available."""
 
-    balance = get_account_balance(use_mock_for_paper=False)
+    try:
+        balance = get_account_balance(use_mock_for_paper=False)
+    except BalanceFetchError as exc:
+        logger.warning("Live balance fetch failed: %s", exc)
+        return None, "simulated"
     if balance is None:
         return None, "simulated"
 

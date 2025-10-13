@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from pathlib import Path
@@ -44,7 +45,8 @@ def require_live_confirmation(raise_on_fail: bool = True) -> bool:
     ``raise_on_fail``.
     """
 
-    if not bot_config.is_live:
+    live_requested = bool(getattr(bot_config, "IS_LIVE", False) or bot_config.is_live)
+    if not live_requested:
         return True
 
     if _force_override_enabled():
@@ -62,10 +64,15 @@ def require_live_confirmation(raise_on_fail: bool = True) -> bool:
         return True
 
     message = (
-        "Live trading blocked: confirmation file missing. "
-        f"Expected sentinel at {confirmation_path}. Run scripts/enable_live.sh to proceed."
+        "Live trading blocked: confirmation file missing at "
+        f"{confirmation_path}. Create `.confirm_live_trade` or set `LIVE_FORCE=1` to proceed."
     )
     logger.critical(message)
+    _send_alert(
+        "[confirmation] Live trading blocked — sentinel missing.",
+        level="CRITICAL",
+        context={"expected_path": str(confirmation_path)},
+    )
 
     if raise_on_fail:
         raise ConfigurationError(message)
@@ -73,3 +80,22 @@ def require_live_confirmation(raise_on_fail: bool = True) -> bool:
 
 
 __all__ = ["require_live_confirmation"]
+_ALERT_MODULE = None
+
+
+def _send_alert(message: str, *, level: str = "INFO", context: dict | None = None) -> None:
+    global _ALERT_MODULE  # pylint: disable=global-statement
+    try:
+        if _ALERT_MODULE is None:
+            alerts_path = Path(__file__).resolve().parents[1] / "bot" / "utils" / "alerts.py"
+            spec = importlib.util.spec_from_file_location("_alerts_mod", alerts_path)
+            if not spec or not spec.loader:
+                raise ImportError("alerts module unavailable")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # type: ignore[arg-type]
+            _ALERT_MODULE = module
+        send = getattr(_ALERT_MODULE, "send_alert", None)
+        if callable(send):
+            send(message, level=level, context=context)  # type: ignore[misc]
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("alerts module unavailable; skipping alert: %s", message, exc_info=True)

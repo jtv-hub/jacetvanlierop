@@ -19,12 +19,23 @@ PAIR_MAP: Dict[str, str] = {
 }
 
 
+def ensure_usdc_pair(pair: str) -> str:
+    """Normalise any USD-quoted pair to USDC, preserving already-normalised pairs."""
+
+    if not isinstance(pair, str):
+        raise ValueError(f"Invalid pair format: {pair!r}; expected string like 'BTC/USDC'")
+    up = pair.upper().replace("-", "/")
+    if up.endswith("/USD") and not up.endswith("/USDC"):
+        return f"{up[:-3]}USDC"
+    return up
+
+
 def normalize_pair(pair: str) -> str:
     """Return Kraken's altname for a human-readable trading pair."""
 
     if not isinstance(pair, str) or "/" not in pair:
-        raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USD'")
-    up = pair.upper()
+        raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USDC'")
+    up = ensure_usdc_pair(pair)
     mapped = PAIR_MAP.get(up)
     if mapped:
         return mapped
@@ -34,4 +45,4 @@ def normalize_pair(pair: str) -> str:
     return f"{base}{quote}"
 
 
-__all__ = ["PAIR_MAP", "normalize_pair"]
+__all__ = ["PAIR_MAP", "ensure_usdc_pair", "normalize_pair"]

@@ -6,7 +6,7 @@ injecting a synthetic RSI-friendly history and invoking the bot's
 ``evaluate_signals_and_trade`` flow.
 
 Usage:
-    python scripts/force_test_trade.py --pair ETH/USD [--debug]
+    python scripts/force_test_trade.py --pair ETH/USDC [--debug]
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from crypto_trading_bot.bot.trading_logic import (
     ledger,
 )
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.utils.kraken_pairs import ensure_usdc_pair
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import (
     append_live_price,
@@ -60,7 +61,7 @@ def _inject_buy_favored_history(pair: str, current: float, period: int) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Force a test trade in paper mode")
-    parser.add_argument("--pair", default="ETH/USD", help="Trading pair, e.g., ETH/USD")
+    parser.add_argument("--pair", default="ETH/USDC", help="Trading pair, e.g., ETH/USDC")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -70,7 +71,7 @@ def main() -> int:
     os.environ.setdefault("ENV", "paper")
     os.environ.setdefault("DEBUG_MODE", "1" if args.debug else "0")
 
-    pair = args.pair.upper()
+    pair = ensure_usdc_pair(args.pair.upper())
     price = get_current_price(pair)
     if price is None or price <= 0:
         logger.error("No current price available for %s — aborting", pair)

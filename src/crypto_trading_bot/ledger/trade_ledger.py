@@ -18,33 +18,27 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
 from crypto_trading_bot import config as bot_config
-from crypto_trading_bot.bot.utils.alert import send_alert
+from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.utils.system_logger import (
+    SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
+)
+from crypto_trading_bot.utils.system_logger import (
+    get_system_logger,
+)
 
 # Enable extra debug output when explicitly requested
 DEBUG_MODE = os.getenv("DEBUG_MODE", "0") == "1"
 
 TRADES_LOG_PATH = "logs/trades.log"
-SYSTEM_LOG_PATH = "logs/system.log"
+SYSTEM_LOG_PATH = str(SHARED_SYSTEM_LOG_PATH)
 POSITIONS_PATH = "logs/positions.jsonl"
 SLIPPAGE = 0.002  # default fallback; per-asset slippage from CONFIG overrides this
 
 # System logger (warnings/errors/debug) to logs/system.log
-system_logger = logging.getLogger("trade_ledger.system")
-if not system_logger.hasHandlers():
-    os.makedirs("logs", exist_ok=True)
-    sys_handler = RotatingFileHandler(
-        SYSTEM_LOG_PATH,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    sys_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    system_logger.addHandler(sys_handler)
-    system_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
-    system_logger.propagate = False
+system_logger = get_system_logger()
 
 # Trade logger (message-only JSON lines) to logs/trades.log
 trade_logger = logging.getLogger("trade_ledger.trades")
@@ -66,6 +60,62 @@ anomalies_logger = get_anomalies_logger()
 
 _MISSING_TRADE_ALERT_LIMIT = int(os.getenv("MISSING_TRADE_ALERT_LIMIT", "2"))
 _MISSING_TRADE_WINDOW_SECONDS = float(os.getenv("MISSING_TRADE_ALERT_WINDOW", "300"))
+_DUPLICATE_WINDOW_SECONDS = float(os.getenv("TRADE_DUPLICATE_WINDOW_SECONDS", "90"))
+_DUPLICATE_SIZE_REL_TOL = float(os.getenv("TRADE_DUPLICATE_SIZE_REL_TOL", "0.001"))
+_DUPLICATE_SIZE_ABS_TOL = float(os.getenv("TRADE_DUPLICATE_SIZE_ABS_TOL", "1e-6"))
+
+_EXIT_REASON_CANONICAL_MAP = {
+    "STOP_LOSS": "sl_triggered",
+    "STOPLOSS": "sl_triggered",
+    "SL_TRIGGERED": "sl_triggered",
+    "TRAILING_STOP": "trailing_exit",
+    "TRAIL_STOP": "trailing_exit",
+    "TRAILING_EXIT": "trailing_exit",
+    "TAKE_PROFIT": "tp_hit",
+    "TAKEPROFIT": "tp_hit",
+    "TP_HIT": "tp_hit",
+    "MAX_HOLD": "max_hold_expired",
+    "MAX_HOLD_EXPIRED": "max_hold_expired",
+    "RSI_EXIT": "indicator_exit",
+    "RSI": "indicator_exit",
+    "INDICATOR_EXIT": "indicator_exit",
+    "MANUAL_EXIT": "manual_exit",
+    "MANUAL_CLOSE": "manual_exit",
+    "AUTO_PAUSE": "auto_pause_exit",
+    "KILL_SWITCH": "emergency_stop",
+    "EMERGENCY_STOP": "emergency_stop",
+}
+
+
+def _canonical_exit_reason(*candidates: Any) -> tuple[str, str]:
+    """Return (canonical_reason, display_reason) for supplied candidates."""
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = str(candidate).strip()
+        if not text:
+            continue
+        upper = text.upper()
+        mapped = _EXIT_REASON_CANONICAL_MAP.get(upper)
+        if mapped:
+            return mapped, text
+        lowered = text.lower()
+        if lowered in _EXIT_REASON_CANONICAL_MAP.values():
+            return lowered, text
+        sanitized = lowered.replace(" ", "_")
+        if sanitized:
+            return sanitized, text
+    return "unknown", "unknown"
+
+
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _slippage_rate_for_pair(pair: str) -> float:
@@ -206,6 +256,51 @@ class TradeLedger:
         self._pause_new_trades_once = False
         self._pause_reason: str | None = None
         self.reload_trades()
+
+    def _find_recent_duplicate(self, trade: dict) -> dict | None:
+        """Return an existing trade that matches the provided signature."""
+
+        timestamp = _parse_iso_datetime(trade.get("timestamp"))
+        if timestamp is None:
+            return None
+
+        window = max(1.0, _DUPLICATE_WINDOW_SECONDS)
+        pair = str(trade.get("pair") or "").upper()
+        side = str(trade.get("side") or "").lower()
+        strategy = str(trade.get("strategy") or "")
+        try:
+            size = float(trade.get("size", 0.0))
+        except (TypeError, ValueError):
+            return None
+
+        tolerance = max(_DUPLICATE_SIZE_ABS_TOL, abs(size) * _DUPLICATE_SIZE_REL_TOL)
+
+        for existing in reversed(self.trades[-100:]):
+            if existing.get("trade_id") == trade.get("trade_id"):
+                continue
+            if str(existing.get("pair") or "").upper() != pair:
+                continue
+            if str(existing.get("side") or "").lower() != side:
+                continue
+            if str(existing.get("strategy") or "") != strategy:
+                continue
+
+            existing_time = _parse_iso_datetime(existing.get("timestamp"))
+            if existing_time is None:
+                continue
+            delta = abs((timestamp - existing_time).total_seconds())
+            if delta > window:
+                if timestamp >= existing_time:
+                    break
+                continue
+
+            try:
+                existing_size = float(existing.get("size"))
+            except (TypeError, ValueError):
+                continue
+            if abs(existing_size - size) <= tolerance:
+                return existing
+        return None
 
     def request_pause_new_trades(self, reason: str | None = None) -> None:
         """Pause new trade execution for a single evaluation cycle."""
@@ -374,6 +469,50 @@ class TradeLedger:
                 pass
             raise
 
+        duplicate = self._find_recent_duplicate(trade)
+        if duplicate is not None:
+            existing_id = duplicate.get("trade_id") or "<unknown>"
+            system_logger.warning(
+                "Duplicate trade detected within %.0fs window; existing trade_id=%s pair=%s "
+                "size=%.8f strategy=%s. Skipping new entry %s.",
+                _DUPLICATE_WINDOW_SECONDS,
+                existing_id,
+                trade.get("pair"),
+                trade.get("size"),
+                trade.get("strategy"),
+                trade_id,
+            )
+            try:
+                anomalies_logger.info(
+                    json.dumps(
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "type": "DuplicateTrade",
+                            "existing_trade_id": existing_id,
+                            "duplicate_trade_id": trade_id,
+                            "pair": trade.get("pair"),
+                            "side": trade.get("side"),
+                            "size": trade.get("size"),
+                            "strategy": trade.get("strategy"),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            send_alert(
+                "[Ledger] Duplicate trade signature detected",
+                level="WARNING",
+                context={
+                    "existing_trade_id": existing_id,
+                    "duplicate_trade_id": trade_id,
+                    "pair": trade.get("pair"),
+                    "strategy": trade.get("strategy"),
+                    "size": trade.get("size"),
+                },
+            )
+            return existing_id
+
         # Write compact, one-line JSON to trades.log via trade_logger
         trade_logger.info(json.dumps(trade, separators=(",", ":")))
         self.trades.append(trade)
@@ -461,6 +600,9 @@ class TradeLedger:
         Update a trade with exit information such as exit_price, reason, and ROI.
         If trade is missing, attempts to reload from file and/or reconstruct from positions.
         Retries up to 3 times on failure and safely resyncs positions.jsonl.
+
+        Exit reasons are normalized to snake_case and stored in both ``reason`` and
+        ``exit_reason``; the original label is preserved in ``reason_display``.
         """
         # If exit_price is missing/invalid, log anomaly and return without raising.
         if exit_price is None or not isinstance(exit_price, (int, float)) or exit_price <= 0:
@@ -469,6 +611,12 @@ class TradeLedger:
             trade_idx = getattr(self, "trade_index", None)
             if isinstance(trade_idx, dict):
                 t_obj = trade_idx.get(trade_id)
+            system_logger.error(
+                "Cannot update trade %s — invalid exit_price %s (reason=%s)",
+                trade_id,
+                exit_price,
+                reason or exit_reason or "<unspecified>",
+            )
             try:
                 anomalies_logger.info(
                     json.dumps(
@@ -553,16 +701,14 @@ class TradeLedger:
                             trade_id,
                         )
                     else:
-                        message = " ".join(
-                            [
-                                f"Trade ID {trade_id} not found in memory or trades.log —",
-                                "aborting update",
-                            ]
+                        message = (
+                            f"Trade ID {trade_id} not found in memory or trades.log — skipping update "
+                            f"(exit_price={exit_price}, reason={reason or exit_reason or 'n/a'})"
                         )
                         pos = self.position_manager.positions.get(trade_id)
                         pair = (pos or {}).get("pair")
                         should_alert, state = self._register_missing_trade(trade_id, pair)
-                        system_logger.error(message)
+                        system_logger.warning(message)
                         context = {
                             "trade_id": trade_id,
                             "attempt": attempt + 1,
@@ -573,7 +719,7 @@ class TradeLedger:
                         }
                         if should_alert and trade_id not in self._missing_trade_alerted:
                             self._missing_trade_alerted.add(trade_id)
-                            send_alert(message, context=context, level="CRITICAL")
+                            send_alert(message, context=context, level="WARNING")
                             pause_reason = f"Ledger consistency check — missing trade {trade_id}"
                             self.request_pause_new_trades(reason=pause_reason)
                         else:
@@ -600,8 +746,9 @@ class TradeLedger:
                             entry_price = None
                     if entry_price is None:
                         system_logger.error(
-                            "Missing entry_price for trade %s; cannot compute PnL/ROI",
+                            "Missing entry_price for trade %s; cannot compute PnL/ROI (reason=%s)",
                             trade_id,
+                            reason or exit_reason or "<unspecified>",
                         )
                         return
                     try:
@@ -629,6 +776,10 @@ class TradeLedger:
                         t_obj.get("pair"),
                         float(exit_price),
                         exit_side,
+                    )
+                    canonical_reason, display_reason = _canonical_exit_reason(
+                        exit_reason,
+                        reason,
                     )
                     # Compute ROI and clamp/flag extreme values (> 500%)
                     if entry_price:
@@ -661,7 +812,9 @@ class TradeLedger:
                         {
                             "exit_price": exit_adj,
                             "status": "closed",
-                            "reason": reason,
+                            "reason": canonical_reason,
+                            "exit_reason": canonical_reason,
+                            "reason_display": display_reason,
                             "holding_period_days": round(
                                 (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400,
                                 2,
@@ -673,9 +826,6 @@ class TradeLedger:
                             "exit_slippage_amount": exit_slippage_amount,
                         }
                     )
-                    # Include optional exit_reason if provided by the caller
-                    if exit_reason is not None:
-                        t_obj["exit_reason"] = exit_reason
                     # Revalidate updated trade; log anomaly but do not abort update flow
                     try:
                         validate_trade_schema(t_obj)

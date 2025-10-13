@@ -15,7 +15,7 @@ def test_trading_logic_position_manager_check_exits_interface():
     trade_id = "T-1"
     pm.positions[trade_id] = {
         "trade_id": trade_id,
-        "pair": "BTC/USD",
+        "pair": "BTC/USDC",
         "size": 0.001,
         "entry_price": 20000.0,
         "timestamp": "2024-01-01T00:00:00+00:00",
@@ -23,7 +23,7 @@ def test_trading_logic_position_manager_check_exits_interface():
         "confidence": 0.65,
         "high_water_mark": 20000.0,
     }
-    exits = pm.check_exits({"BTC/USD": 19980.0}, tp=0.02, sl=0.001, trailing_stop=0.05, max_hold_bars=0)
+    exits = pm.check_exits({"BTC/USDC": 19980.0}, tp=0.02, sl=0.001, trailing_stop=0.05, max_hold_bars=0)
     assert isinstance(exits, list)
 
 
@@ -35,7 +35,7 @@ def test_trade_ledger_log_trade_validation_confidence_range():
 
     tl = ledger_mod.TradeLedger(DummyPM())
     with pytest.raises(ValueError):
-        tl.log_trade(trading_pair="BTC/USD", trade_size=0.001, strategy_name="S", confidence=1.5)
+        tl.log_trade(trading_pair="BTC/USDC", trade_size=0.001, strategy_name="S", confidence=1.5)
 
 
 def test_trade_ledger_update_trade_idempotent(tmp_path, monkeypatch):
@@ -46,7 +46,7 @@ def test_trade_ledger_update_trade_idempotent(tmp_path, monkeypatch):
 
     tl = ledger_mod.TradeLedger(DummyPM())
     tid = tl.log_trade(
-        trading_pair="BTC/USD",
+        trading_pair="BTC/USDC",
         trade_size=0.001,
         strategy_name="TestStrategy",
         confidence=0.7,
@@ -54,6 +54,47 @@ def test_trade_ledger_update_trade_idempotent(tmp_path, monkeypatch):
     )
     tl.update_trade(trade_id=tid, exit_price=20500.0, reason="TAKE_PROFIT")
     tl.update_trade(trade_id=tid, exit_price=20500.0, reason="TAKE_PROFIT")  # idempotent
+    trade = tl.trade_index.get(tid)
+    assert trade is not None
+    assert trade.get("reason") == "tp_hit"
+    assert trade.get("reason_display") == "TAKE_PROFIT"
+
+
+def test_trade_ledger_detects_duplicate(monkeypatch):
+    ledger_mod = pytest.importorskip("crypto_trading_bot.ledger.trade_ledger")
+
+    class DummyPM:
+        positions = {}
+
+    tl = ledger_mod.TradeLedger(DummyPM())
+    original_window = ledger_mod._DUPLICATE_WINDOW_SECONDS
+    ledger_mod._DUPLICATE_WINDOW_SECONDS = 300
+    tl.trades.clear()
+    tl.trade_index.clear()
+
+    try:
+        trade_id = tl.log_trade(
+            trading_pair="BTC/USDC",
+            trade_size=0.002,
+            strategy_name="DuplicateCheckStrategy",
+            confidence=0.75,
+            entry_price=21000.0,
+            side="buy",
+        )
+
+        duplicate_id = tl.log_trade(
+            trading_pair="BTC/USDC",
+            trade_size=0.002,
+            strategy_name="DuplicateCheckStrategy",
+            confidence=0.75,
+            entry_price=21000.0,
+            side="buy",
+        )
+    finally:
+        ledger_mod._DUPLICATE_WINDOW_SECONDS = original_window
+
+    assert duplicate_id == trade_id
+    assert len(tl.trades) == 1
 
 
 def test_portfolio_risk_correlation_threshold_precedence():

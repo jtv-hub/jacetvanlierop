@@ -133,7 +133,7 @@ def test_trade_ledger_schema_error_logs():
 
     # Intentionally pass wrong type for regime to trigger schema validation error
     with pytest.raises(TypeError):
-        tl.log_trade("BTC/USD", 0.01, "PytestStrategy", confidence=0.5, regime=123)
+        tl.log_trade("BTC/USDC", 0.01, "PytestStrategy", confidence=0.5, regime=123)
 
     # Find a recent schema error line
     lines = _read_anomalies_lines_tail()
@@ -170,7 +170,7 @@ def test_missing_exit_price_anomaly_logged():
 
     # First log a valid trade to obtain an id
     tid = tl.log_trade(
-        trading_pair="BTC/USD",
+        trading_pair="BTC/USDC",
         trade_size=0.001,
         strategy_name="TestStrat",
         confidence=0.5,

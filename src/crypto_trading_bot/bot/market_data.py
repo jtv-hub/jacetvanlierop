@@ -15,10 +15,11 @@ from importlib import import_module
 from typing import Callable, Optional
 
 from crypto_trading_bot.config import CONFIG, is_live
-from crypto_trading_bot.ledger.trade_ledger import system_logger
 from crypto_trading_bot.utils.kraken_client import kraken_get_balance
 from crypto_trading_bot.utils.price_feed import get_current_price
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
+system_logger = get_system_logger()
 logger = system_logger.getChild("market_data")
 
 

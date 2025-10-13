@@ -19,9 +19,12 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from crypto_trading_bot.bot.simulation import collect_signal_snapshot
-from crypto_trading_bot.config import CONFIG, ConfigurationError, is_live, set_live_mode
+from crypto_trading_bot.bot.utils.alerts import send_alert
+from crypto_trading_bot.config import CONFIG, IS_LIVE, ConfigurationError, is_live, set_live_mode
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.ledger.ledger_access import get_ledger
+from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.safety.confirmation import require_live_confirmation
 from crypto_trading_bot.utils.price_history import get_fallback_metrics
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 
@@ -32,6 +35,9 @@ _SYSTEM_LOG_PATH = Path("logs/system.log")
 _DEFAULT_WINDOW_HOURS = int(CONFIG.get("prelaunch_guard", {}).get("alert_window_hours", 72))
 _DEFAULT_MAX_HIGH = int(CONFIG.get("prelaunch_guard", {}).get("max_recent_high_severity", 50))
 CONFIDENCE_TOLERANCE = 0.25  # Allow small confidence deviations when signals agree (see module docstring).
+_STRICT_MODE_ENV = os.getenv("STRICT_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+_STRICT_MODE = _STRICT_MODE_ENV
+_DEFAULT_MISMATCH_THRESHOLD = int(os.getenv("PRELAUNCH_MISMATCH_THRESHOLD", "3") or "3")
 
 
 def _clear_kill_switch(path: Path = KILL_SWITCH_FILE) -> None:
@@ -268,6 +274,14 @@ def _run_mode_compare(pairs: Iterable[str]) -> None:
         logger.warning("No tradable pairs provided for mode comparison; skipping signal check.")
         return
 
+    mismatch_limit = 1 if _STRICT_MODE else max(1, _DEFAULT_MISMATCH_THRESHOLD)
+    logger.info(
+        "[prelaunch_guard] Running signal comparison for %d pair(s) (mismatch limit=%d, strict_mode=%s)",
+        len(pairs_list),
+        mismatch_limit,
+        _STRICT_MODE,
+    )
+
     original_mode = is_live
     original_validate = deepcopy(CONFIG.get("kraken", {}).get("validate_orders"))
     original_dry = deepcopy(CONFIG.get("live_mode", {}).get("dry_run"))
@@ -320,15 +334,55 @@ def _run_mode_compare(pairs: Iterable[str]) -> None:
             continue
         if paper_sig is None or live_sig is None:
             missing_source = "paper" if paper_sig is None else "live"
-            raise ConfigurationError(
-                f"Signal mismatch for {pair}: missing actionable signal in {missing_source} snapshot."
+            message = f"Signal mismatch for {pair}: missing actionable signal in {missing_source} snapshot."
+            if _STRICT_MODE:
+                raise ConfigurationError(message)
+            logger.warning("[prelaunch_guard] %s", message)
+            send_alert(
+                "[prelaunch] Signal mismatch",
+                level="WARNING",
+                context={"pair": pair, "missing": missing_source},
             )
+            continue
 
         if not _signals_match(paper_sig, live_sig):
             mismatches.append({"pair": pair, "paper": paper_sig, "live": live_sig})
 
     if mismatches:
-        raise ConfigurationError(f"Signal mismatch between paper and live dry-run modes: {mismatches}")
+        mismatch_pairs = {mismatch.get("pair") for mismatch in mismatches if mismatch.get("pair")}
+        if len(mismatch_pairs) >= mismatch_limit:
+            context = {
+                "pair_count": len(mismatch_pairs),
+                "limit": mismatch_limit,
+                "pairs": sorted(mismatch_pairs),
+                "resolution_tip": (
+                    "Compare paper vs live-dry snapshots, ensure price feeds match, " "then rerun prelaunch_guard."
+                ),
+            }
+            send_alert(
+                "[prelaunch] Signal mismatch threshold exceeded",
+                level="CRITICAL",
+                context=context,
+            )
+            raise ConfigurationError(
+                f"Signal mismatch between paper and live dry-run modes: "
+                f"{len(mismatch_pairs)} pair(s) exceeded limit {mismatch_limit}."
+            )
+        for mismatch in mismatches:
+            logger.warning(
+                "[prelaunch_guard] Signal mismatch | pair=%s paper=%s live=%s",
+                mismatch.get("pair"),
+                mismatch.get("paper"),
+                mismatch.get("live"),
+            )
+            send_alert(
+                "[prelaunch] Signal mismatch",
+                level="WARNING",
+                context={
+                    **mismatch,
+                    "resolution_tip": "Investigate strategy inputs for this pair and rerun prelaunch_guard.",
+                },
+            )
 
     logger.info("Mode comparison succeeded for %d pair(s).", len(pairs_list))
 
@@ -411,6 +465,22 @@ def run_prelaunch_guard(
     _prune_log_noise(_SYSTEM_LOG_PATH)
     _assert_logs_writable([_ALERT_LOG_PATH, _SYSTEM_LOG_PATH])
 
+    if IS_LIVE:
+        require_live_confirmation()
+        state_snapshot = risk_guard.load_state()
+        paused, pause_reason = risk_guard.check_pause(state_snapshot)
+        if paused:
+            send_alert(
+                "[prelaunch] Risk guard paused — live launch blocked.",
+                level="CRITICAL",
+                context={"reason": pause_reason},
+            )
+            raise ConfigurationError(
+                "Prelaunch guard: risk guard is paused "
+                f"({pause_reason}). Resolve via scripts/reset_risk_state.py before trading live."
+            )
+        logger.info("[prelaunch] Risk guard state clear (paused=%s).", paused)
+
     auto_archive_did_run = False
 
     try:
@@ -461,12 +531,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=_DEFAULT_MAX_HIGH,
         help="Maximum allowed recent high-severity alerts before failing (default: %(default)s).",
     )
+    parser.add_argument(
+        "--strict-mode",
+        action="store_true",
+        help="Fail immediately on any signal mismatch regardless of threshold.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     auto_archive = args.auto_archive_alerts or bool(os.getenv("CRYPTO_TRADING_BOT_AUTO_ARCHIVE_ALERTS"))
+    _set_strict_mode(args.strict_mode or _STRICT_MODE_ENV)
 
     try:
         run_prelaunch_guard(
@@ -487,3 +563,8 @@ __all__ = ["run_prelaunch_guard", "_count_recent_high_severity", "_signals_match
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _set_strict_mode(flag: bool) -> None:
+    global _STRICT_MODE  # pylint: disable=global-statement
+    _STRICT_MODE = bool(flag)

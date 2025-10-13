@@ -66,10 +66,10 @@ def test_gather_signals_rsi_computes():
 def test_risk_screen_returns_bool_for_various_inputs():
     """risk_screen should be a pure gate: always returns a boolean and never raises."""
     # Benign, typical input (should pass)
-    assert risk_screen({"pair": "BTC/USD", "confidence": 0.5}, context=object()) is True
+    assert risk_screen({"pair": "BTC/USDC", "confidence": 0.5}, context=object()) is True
 
     # Edge-ish inputs: empty dict / unknown fields — should still return a bool (not crash)
-    for payload in ({}, {"unknown": 123}, {"pair": "BTC/USD", "size": 0}):
+    for payload in ({}, {"unknown": 123}, {"pair": "BTC/USDC", "size": 0}):
         result = risk_screen(payload, context=None)
         assert isinstance(result, bool)
 
@@ -116,7 +116,7 @@ def test_position_manager_rsi_exit_triggers(monkeypatch):
 
     manager = trading_logic.PositionManager()
     trade_id = "t-123"
-    pair = "BTC/USD"
+    pair = "BTC/USDC"
     manager.positions[trade_id] = {
         "trade_id": trade_id,
         "pair": pair,

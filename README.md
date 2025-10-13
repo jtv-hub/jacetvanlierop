@@ -41,3 +41,13 @@ To allow the guard to auto-archive the alerts log during startup, export `CRYPTO
 - [ ] Inspect `logs/system.log` after a scheduler cycle to confirm: no phantom trades, correlation blocks logged for highly aligned pairs, minimum volume adjustments recorded.
 - [ ] Confirm per-pair minimum order sizes in `CONFIG["trade_size"]` match `kraken_get_asset_pair_meta` output (see `src/crypto_trading_bot/config/__init__.py`).
 - [ ] Execute `python -m src.crypto_trading_bot.safety.prelaunch_guard --auto-archive-alerts` immediately before `./scripts/launch_live.sh`.
+
+## Launch Checklist
+
+1. Review configuration in `src/crypto_trading_bot/config/__init__.py` – confirm `IS_LIVE = True` and `DEPLOY_PHASE = "canary"` (or override via `logs/deploy_phase.json`).
+2. Ensure the `.confirm_live_trade` sentinel exists and `scripts/kill_switch.sh status` reports `paused: false`.
+3. Run `bash scripts/prelaunch_check.sh` and address any confirmation or risk-guard failures.
+4. Run `bash scripts/final_health_audit.sh`; the script must exit successfully before promoting to full deployment.
+5. Launch the live loop via `bash scripts/run_live.sh` (writes output to `logs/system.log`).
+6. Monitor Slack/email/webhook alerts plus `logs/system.log` and `logs/alerts.log` closely for the first 24 hours; keep `scripts/kill_switch.sh pause` ready.
+7. After canary success (`logs/deploy_phase.json` shows status `pass`), rerun `scripts/final_health_audit.sh` to promote `DEPLOY_PHASE` to `"full"` for scaled sizing.

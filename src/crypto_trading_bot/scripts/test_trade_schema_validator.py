@@ -11,7 +11,7 @@ def test_valid_trade():
     """Test a valid trade with all required fields present."""
     print("\n✅ TEST: Valid Trade")
     log_trade(
-        trading_pair="BTC/USD",
+        trading_pair="BTC/USDC",
         trade_size=100,
         strategy_name="SimpleRSIStrategy",
         confidence=0.9,
@@ -23,7 +23,7 @@ def test_missing_confidence():
     """Test schema validation with missing confidence value."""
     print("\n❌ TEST: Missing Confidence")
     log_trade(
-        trading_pair="ETH/USD",
+        trading_pair="ETH/USDC",
         trade_size=100,
         strategy_name="SimpleRSIStrategy",
         confidence=None,
@@ -35,7 +35,7 @@ def test_empty_strategy_name():
     """Test schema validation with empty strategy name."""
     print("\n❌ TEST: Empty Strategy Name")
     log_trade(
-        trading_pair="ETH/USD",
+        trading_pair="ETH/USDC",
         trade_size=100,
         strategy_name="",
         confidence=0.7,
@@ -59,7 +59,7 @@ def test_roi_zero_case():
     """Test schema validation with ROI explicitly set to 0.0."""
     print("\n⚠️ TEST: ROI = 0.0")
     log_trade(
-        trading_pair="BTC/USD",
+        trading_pair="BTC/USDC",
         trade_size=100,
         strategy_name="SimpleRSIStrategy",
         confidence=0.8,

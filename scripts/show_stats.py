@@ -23,6 +23,26 @@ from typing import Any, Dict, List, Tuple
 LOG_DIR = "logs"
 TRADES_LOG = os.path.join(LOG_DIR, "trades.log")
 POSITIONS_LOG = os.path.join(LOG_DIR, "positions.jsonl")
+LEGACY_EXIT_REASON_MAP = {
+    "STOP_LOSS": "sl_triggered",
+    "STOPLOSS": "sl_triggered",
+    "TRAILING_STOP": "trailing_exit",
+    "TRAIL_STOP": "trailing_exit",
+    "TAKE_PROFIT": "tp_hit",
+    "TAKEPROFIT": "tp_hit",
+    "RSI_EXIT": "indicator_exit",
+    "RSI": "indicator_exit",
+    "MAX_HOLD": "max_hold_expired",
+    "MAX HOLD": "max_hold_expired",
+}
+EXIT_REASON_LABELS = {
+    "sl_triggered": "Stop Loss",
+    "tp_hit": "Take Profit",
+    "indicator_exit": "Indicator Exit",
+    "trailing_exit": "Trailing Stop",
+    "max_hold_expired": "Max Hold",
+    "unknown": "Unknown",
+}
 
 # Optional pretty table support
 try:  # pragma: no cover - optional dependency
@@ -122,23 +142,28 @@ def compute_metrics(closed: List[Dict[str, Any]], positions_count: int) -> Dict[
             max_dd = drawdown
     max_drawdown_pct = abs(max_dd)
 
-    # Exit reason counts (normalize a few common categories)
-    reasons = []
+    # Exit reason counts (canonical snake_case, legacy-friendly)
+    reasons: List[str] = []
     for t in closed_sorted:
-        r = str(t.get("reason") or "unknown").upper()
-        if "STOP" in r and "TRAIL" not in r:
-            key = "STOP_LOSS"
-        elif "TRAIL" in r:
-            key = "TRAILING_STOP"
-        elif "TAKE" in r or "PROFIT" in r:
-            key = "TAKE_PROFIT"
-        elif "RSI" in r:
-            key = "RSI_EXIT"
-        elif "MAX_HOLD" in r or "HOLD" in r:
-            key = "MAX_HOLD"
-        else:
-            key = r
-        reasons.append(key)
+        candidates = [
+            t.get("exit_reason"),
+            t.get("reason"),
+            t.get("reason_display"),
+        ]
+        canonical: str | None = None
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            lowered = text.lower().replace(" ", "_")
+            if lowered in EXIT_REASON_LABELS:
+                canonical = lowered
+                break
+            mapped = LEGACY_EXIT_REASON_MAP.get(text.upper())
+            if mapped:
+                canonical = mapped
+                break
+        reasons.append(canonical or "unknown")
     reason_counts = dict(Counter(reasons).most_common())
 
     return {
@@ -196,7 +221,7 @@ def print_table(stats: Dict[str, Any], warnings: List[str]):
             print("\n📌 Exit Reasons")
             print(
                 tabulate(  # type: ignore[misc]
-                    [[k, v] for k, v in rc.items()],
+                    [[EXIT_REASON_LABELS.get(k, k), v] for k, v in rc.items()],
                     headers=["Reason", "Count"],
                     tablefmt="github",
                 )
@@ -204,7 +229,8 @@ def print_table(stats: Dict[str, Any], warnings: List[str]):
         else:
             print("\n📌 Exit Reasons")
             for k, v in rc.items():
-                print(f"- {k}: {v}")
+                label = EXIT_REASON_LABELS.get(k, k)
+                print(f"- {label}: {v}")
 
     # Warnings
     for w in warnings:

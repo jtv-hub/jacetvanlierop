@@ -88,14 +88,14 @@ def main() -> int:
             ledger = ledger_module.TradeLedger(pm)
 
             trade_id = ledger.log_trade(
-                "BTC/USD",
+                "BTC/USDC",
                 trade_size=0.01,
                 strategy_name="DemoStrategy",
                 confidence=0.75,
                 entry_price=20_000.0,
             )
             pm.positions[trade_id] = {
-                "pair": "BTC/USD",
+                "pair": "BTC/USDC",
                 "size": 0.01,
                 "strategy": "DemoStrategy",
                 "entry_price": 20_000.0,

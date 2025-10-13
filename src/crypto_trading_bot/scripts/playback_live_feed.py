@@ -204,10 +204,10 @@ def tick(cfg: PlaybackConfig, state: SimState, price: float, rsi: Optional[float
 
 def infer_pair_from_path(p: Path) -> Optional[str]:
     """
-    Infer pair from filename like 'kraken_BTCUSD_20250812.jsonl' -> 'BTC/USD'.
+    Infer pair from filename like 'kraken_BTCUSDC_20250812.jsonl' -> 'BTC/USDC'.
 
     Returns:
-        The inferred pair (e.g., 'BTC/USD') or None if it cannot be inferred.
+        The inferred pair (e.g., 'BTC/USDC') or None if it cannot be inferred.
     """
     name = p.name
     try:

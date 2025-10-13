@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Simple in-memory cache to reduce rate-limit pressure.
 _CACHE_TTL_SECONDS = 2.0
+_MAX_PRICE_RETRIES = 3
+_RETRY_DELAY_SECONDS = 0.35
 _cache: Dict[str, Tuple[float, float]] = {}  # key: "BASE/QUOTE" -> (ts, price)
 
 
@@ -56,10 +58,37 @@ def _get_with_cache(app_pair: str) -> float:
         logger.debug("price_feed cache hit for %s: %s", app_pair, cached[1])
         return cached[1]
 
-    price = get_ticker_price(app_pair)
-    _cache[app_pair] = (ts_now, price)
-    logger.debug("price_feed fetched %s -> %s", app_pair, price)
-    return price
+    last_error: Exception | None = None
+    for attempt in range(_MAX_PRICE_RETRIES):
+        try:
+            price = get_ticker_price(app_pair)
+            if price <= 0:
+                raise ValueError(f"Non-positive price returned for {app_pair}: {price}")
+            _cache[app_pair] = (ts_now, price)
+            logger.debug("price_feed fetched %s -> %s", app_pair, price)
+            return price
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = exc
+            logger.warning(
+                "price_feed fetch failed for %s (attempt %d/%d): %s",
+                app_pair,
+                attempt + 1,
+                _MAX_PRICE_RETRIES,
+                exc,
+            )
+            if attempt < _MAX_PRICE_RETRIES - 1:
+                time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if cached:
+        logger.error(
+            "price_feed using cached price after failures | pair=%s price=%s error=%s",
+            app_pair,
+            cached[1],
+            last_error,
+        )
+        return cached[1]
+
+    raise RuntimeError(f"Failed to fetch price for {app_pair}") from last_error
 
 
 def get_kraken_price(pair: str = "XBTUSDC") -> float:
