@@ -5,7 +5,7 @@ Evaluates signals using predefined strategies, executes mock trades,
 manages open positions, and checks exit conditions.
 """
 
-# pylint: disable=too-many-lines
+# pylint: disable=too-many-lines,line-too-long
 
 import datetime
 import json
@@ -17,7 +17,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, getcontext
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Mapping, Optional
 
 # Optional dependency for correlation checks
 try:
@@ -26,10 +27,18 @@ except ImportError:  # pragma: no cover - optional dependency
     np = None
 
 from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
-from crypto_trading_bot.bot.utils.alert import send_alert
-from crypto_trading_bot.config import CONFIG, get_mode_label, is_live, set_live_mode
+from crypto_trading_bot.bot.utils.alerts import send_alert
+from crypto_trading_bot.config import (
+    CANARY_MAX_FRACTION,
+    CONFIG,
+    DEPLOY_PHASE,
+    get_mode_label,
+    is_live,
+    set_live_mode,
+)
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
@@ -72,6 +81,11 @@ KILL_SWITCH_FILE = os.getenv("CRYPTO_TRADING_BOT_KILL_SWITCH_FILE", "logs/kill_s
 
 _DISK_GUARD_THRESHOLD_MB = float(os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_MB", "500"))
 _DISK_GUARD_PATH = os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_PATH", os.getcwd())
+
+STATE_SNAPSHOT_PATH = Path("logs/state_snapshot.json")
+_STATE_SNAPSHOT_INTERVAL = float(os.getenv("CRYPTO_TRADING_BOT_STATE_SNAPSHOT_SECONDS", "3600") or "3600")
+_LAST_STATE_SNAPSHOT = 0.0
+_STARTUP_SNAPSHOT_LOGGED = False
 
 TRADE_INTERVAL = 300
 MAX_PORTFOLIO_RISK = CONFIG.get("max_portfolio_risk", 0.10)
@@ -223,6 +237,114 @@ def _get_locked_strategy_pipeline(
     return cache[pair]
 
 
+def _ensure_startup_snapshot() -> None:
+    """Log a one-time snapshot of deployment configuration at startup."""
+
+    global _STARTUP_SNAPSHOT_LOGGED  # pylint: disable=global-statement
+    if _STARTUP_SNAPSHOT_LOGGED:
+        return
+
+    try:
+        strategy_instances = _build_strategy_pipeline()
+        strategy_names = [s.__class__.__name__ for s in strategy_instances]
+    except Exception:  # pylint: disable=broad-exception-caught
+        strategy_names = []
+
+    risk_state = risk_guard.load_state()
+    snapshot = {
+        "deployment_phase": DEPLOY_PHASE,
+        "canary_max_fraction": CANARY_MAX_FRACTION,
+        "is_live": is_live,
+        "kraken_endpoint": CONFIG.get("kraken", {}).get("api_base") or "https://api.kraken.com",
+        "strategies": strategy_names,
+        "tradable_pairs": CONFIG.get("tradable_pairs", []),
+        "initial_balance": PAPER_STARTING_BALANCE,
+        "risk_paused": bool(risk_state.get("paused")),
+        "risk_reason": risk_state.get("pause_reason"),
+    }
+    logger.info("[startup] configuration snapshot: %s", snapshot)
+    send_alert("Startup snapshot emitted", level="INFO", context=snapshot)
+    _STARTUP_SNAPSHOT_LOGGED = True
+
+
+def _maybe_write_state_checkpoint(snapshot_context: Optional[dict[str, Any]] = None) -> None:
+    """Persist a lightweight state snapshot periodically."""
+
+    global _LAST_STATE_SNAPSHOT  # pylint: disable=global-statement
+    if _STATE_SNAPSHOT_INTERVAL <= 0:
+        return
+    now = time.time()
+    if now - _LAST_STATE_SNAPSHOT < _STATE_SNAPSHOT_INTERVAL:
+        return
+    checkpoint = {
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        "mode": get_mode_label(),
+        "is_live": is_live,
+        "deployment_phase": DEPLOY_PHASE,
+        "risk_state": risk_guard.load_state(),
+        "context": snapshot_context or {},
+    }
+    try:
+        STATE_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with STATE_SNAPSHOT_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(checkpoint, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _LAST_STATE_SNAPSHOT = now
+    except OSError as exc:
+        logger.error("Failed to write state snapshot: %s", exc)
+
+
+def _apply_deploy_phase_limits(
+    pair: str,
+    size: float,
+    price: float,
+    *,
+    emit_alert: bool = True,
+) -> tuple[float, Optional[dict[str, Any]]]:
+    """Scale trade size when running in canary deployment mode."""
+
+    if DEPLOY_PHASE != "canary":
+        return size, None
+    trade_size_cfg = CONFIG.get("trade_size", {}) or {}
+    base_max = float(trade_size_cfg.get("max", max(size, 0.0)) or max(size, 0.0))
+    allowed_size = max(base_max * CANARY_MAX_FRACTION, 0.0)
+    limit_context = {
+        "phase": DEPLOY_PHASE,
+        "pair": pair,
+        "requested_size": size,
+        "allowed_size": allowed_size,
+        "price": price,
+        "max_fraction": CANARY_MAX_FRACTION,
+    }
+    if allowed_size <= 0:
+        if emit_alert:
+            send_alert(
+                f"[canary] Trade blocked for {pair} — effective canary limit is zero.",
+                level="WARNING",
+                context=limit_context,
+            )
+        return 0.0, limit_context
+    if size <= allowed_size:
+        return size, None
+    scaled = allowed_size
+    limit_context["scaled_size"] = scaled
+    logger.warning(
+        "Canary deployment limiting trade size for %s: %.8f -> %.8f (fraction %.2f%%)",
+        pair,
+        size,
+        scaled,
+        CANARY_MAX_FRACTION * 100,
+    )
+    if emit_alert:
+        send_alert(
+            f"[canary] Trade size limited for {pair}",
+            level="WARNING",
+            context=limit_context,
+        )
+    return scaled, limit_context
+
+
 def _coerce_strategy_param(value: Any, seen: set[int]) -> Any:
     """Return a stable, serializable representation of strategy state values."""
 
@@ -237,7 +359,7 @@ def _coerce_strategy_param(value: Any, seen: set[int]) -> Any:
     if isinstance(value, (set, frozenset)):
         coerced_items = [_coerce_strategy_param(item, seen) for item in value]
         try:
-            return sorted(coerced_items, key=lambda item: repr(item))
+            return sorted(coerced_items, key=repr)
         except TypeError:
             return coerced_items
     if callable(getattr(value, "generate_signal", None)):
@@ -385,7 +507,7 @@ def _submit_live_trade(
     if not is_live:
         if not _STATE.live_block_logged:
             logger.warning(
-                "🚫 Live trade blocked (paper) pair=%s side=%s size=%.6f price=%.4f " "strat=%s conf=%.3f",
+                "🚫 Live trade blocked (paper) pair=%s side=%s size=%.6f price=%.4f strat=%s conf=%.3f",
                 pair,
                 side,
                 size,
@@ -402,6 +524,24 @@ def _submit_live_trade(
                 size,
             )
         return False
+
+    if risk_guard.is_paused():
+        _, pause_reason = risk_guard.check_pause()
+        message = f"Kill-switch active — skipping live trade for {pair} ({pause_reason or 'paused'})"
+        logger.critical(message)
+        send_alert(
+            message,
+            level="CRITICAL",
+            context={"pair": pair, "strategy": strategy, "phase": DEPLOY_PHASE},
+        )
+        return False
+
+    limited_size, _ = _apply_deploy_phase_limits(pair, size, price, emit_alert=False)
+    if limited_size <= 0:
+        logger.warning("Skipping live trade for %s — canary limit reduced size to zero.", pair)
+        return False
+    if limited_size != size:
+        size = limited_size
 
     now = _monotonic_now()
     pause_deadline = _STATE.kraken_failure_pause_until or _STATE.kraken_pause_until
@@ -513,6 +653,11 @@ def _submit_live_trade(
             side,
             exc,
         )
+        send_alert(
+            "[kraken] Order submission error (auth/api)",
+            level="ERROR",
+            context={"pair": pair, "side": side, "strategy": strategy, "error": str(exc)},
+        )
         return False
     except Exception:  # pylint: disable=broad-exception-caught
         pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
@@ -522,6 +667,11 @@ def _submit_live_trade(
             _KRAKEN_FAILURE_PAUSE_SECONDS,
             pair,
             side,
+        )
+        send_alert(
+            "[kraken] Unexpected exception during order placement",
+            level="CRITICAL",
+            context={"pair": pair, "side": side, "strategy": strategy},
         )
         return False
 
@@ -534,6 +684,11 @@ def _submit_live_trade(
             pair,
             side,
             response,
+        )
+        send_alert(
+            "[kraken] Non-dict response from order placement",
+            level="ERROR",
+            context={"pair": pair, "side": side, "strategy": strategy, "response": str(response)},
         )
         return False
 
@@ -564,6 +719,17 @@ def _submit_live_trade(
                 float(pair_meta.get("ordermin", min_volume)),
                 response_error,
             )
+            send_alert(
+                "[kraken] Volume minimum not met",
+                level="WARNING",
+                context={
+                    "pair": pair,
+                    "side": side,
+                    "size": size,
+                    "min": float(pair_meta.get("ordermin", min_volume)),
+                    "error": response_error,
+                },
+            )
             return False
 
         if response_code == "rate_limit":
@@ -574,6 +740,11 @@ def _submit_live_trade(
                 "Kraken rate limit encountered; pausing live trading for 90s | pair=%s side=%s",
                 pair,
                 side,
+            )
+            send_alert(
+                "[kraken] Rate limit encountered",
+                level="CRITICAL",
+                context={"pair": pair, "side": side, "strategy": strategy},
             )
             return False
 
@@ -586,6 +757,17 @@ def _submit_live_trade(
             side,
             response_error,
             response_code,
+        )
+        send_alert(
+            "[kraken] Order rejected",
+            level="ERROR",
+            context={
+                "pair": pair,
+                "side": side,
+                "strategy": strategy,
+                "code": response_code,
+                "error": response_error,
+            },
         )
         return False
 
@@ -1074,6 +1256,8 @@ def evaluate_signals_and_trade(
     except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
 
+    _ensure_startup_snapshot()
+
     executed_trades = 0  # ensure initialized for check_exits_only
     position_manager.load_positions_from_file()
     _ensure_kill_switch_cleared()
@@ -1103,6 +1287,23 @@ def evaluate_signals_and_trade(
         if is_live:
             set_live_mode(False)
         check_exits_only = True
+
+    paused, pause_reason = risk_guard.check_pause()
+    if paused:
+        if _STATE.auto_paused_reason != pause_reason:
+            message = f"Kill-switch: risk guard paused. {pause_reason or 'No reason provided'}"
+            logger.critical(message)
+            send_alert(
+                message,
+                level="CRITICAL",
+                context={"phase": DEPLOY_PHASE, "reason": pause_reason},
+            )
+        _STATE.auto_paused_reason = pause_reason
+        check_exits_only = True
+    else:
+        if _STATE.auto_paused_reason:
+            _STATE.auto_paused_reason = None
+
     # Resolve the list of tradable pairs centrally (config-driven)
     # Added to ensure the engine scans all requested assets with no hardcoding.
     pairs: list[str] = tradable_pairs or CONFIG.get("tradable_pairs", [])
@@ -1505,6 +1706,18 @@ def evaluate_signals_and_trade(
                     print(f"⚠️ Skipping {pair} — Not enough capital for minimum position size")
                     continue
 
+                limited_size, limit_context = _apply_deploy_phase_limits(
+                    pair,
+                    adjusted_size,
+                    float(current_price),
+                )
+                if limited_size <= 0:
+                    print(f"[canary] Skipping {pair} — trade size reduced to zero by canary limits.")
+                    continue
+                if limited_size != adjusted_size:
+                    adjusted_size = limited_size
+                    position_notional = adjusted_size * float(current_price)
+
                 trade_data = {
                     "asset": asset,
                     "size": adjusted_size,
@@ -1515,6 +1728,8 @@ def evaluate_signals_and_trade(
                     "regime": regime,
                     "notional": round(position_notional, 2),
                 }
+                if limit_context:
+                    trade_data["deploy_limit"] = limit_context
 
                 proposed_trades.append(trade_data)
                 total_risk = calculate_total_risk(proposed_trades)
@@ -1595,6 +1810,7 @@ def evaluate_signals_and_trade(
                 print(trade_data)
 
                 trade_side = signal
+                start_latency = time.perf_counter()
                 submitted_live = _submit_live_trade(
                     pair=pair,
                     side=trade_side,
@@ -1603,6 +1819,7 @@ def evaluate_signals_and_trade(
                     strategy=strategy_name,
                     confidence=confidence,
                 )
+                live_latency = time.perf_counter() - start_latency if is_live else None
 
                 if is_live and not submitted_live:
                     print(f"🚫 Live trade suppressed for {pair} — toggle is_live=False")
@@ -1675,6 +1892,33 @@ def evaluate_signals_and_trade(
                     print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
                     print(f"📝 Strategy: {strategy_name}")
 
+                trade_summary_context = {
+                    "trade_id": trade_id,
+                    "pair": pair,
+                    "strategy": strategy_name,
+                    "size": adjusted_size,
+                    "confidence": confidence,
+                    "phase": DEPLOY_PHASE,
+                    "live_latency_seconds": live_latency,
+                    "submitted_live": bool(submitted_live),
+                }
+                if limit_context:
+                    trade_summary_context["deploy_limit"] = limit_context
+                send_alert(
+                    f"[trade] Position opened for {pair}",
+                    level="INFO",
+                    context=trade_summary_context,
+                )
+                logger.info(
+                    "Trade opened | id=%s pair=%s size=%.6f strategy=%s live_latency=%.3fs phase=%s",
+                    trade_id,
+                    pair,
+                    adjusted_size,
+                    strategy_name,
+                    0.0 if live_latency is None else live_latency,
+                    DEPLOY_PHASE,
+                )
+
                 # Summary per asset
                 print(
                     f"[SUMMARY] {asset}: signals={signals_count} "
@@ -1701,6 +1945,41 @@ def evaluate_signals_and_trade(
             reason=reason,
             exit_reason=reason,
         )
+        trade_record = ledger.trade_index.get(trade_id)
+        roi_value = None
+        slippage_amount = None
+        if trade_record:
+            roi_value = trade_record.get("roi")
+            slippage_amount = trade_record.get("exit_slippage_amount")
+        level = "INFO"
+        try:
+            if roi_value is not None and float(roi_value) < 0:
+                level = "WARNING"
+        except (TypeError, ValueError):
+            level = "INFO"
+        exit_summary = {
+            "trade_id": trade_id,
+            "pair": (trade_position or {}).get("pair"),
+            "strategy": (trade_position or {}).get("strategy"),
+            "exit_price": exit_price,
+            "reason": reason,
+            "roi": roi_value,
+            "slippage_amount": slippage_amount,
+            "phase": DEPLOY_PHASE,
+        }
+        send_alert(
+            f"[trade] Position closed for {(trade_position or {}).get('pair', trade_id)}",
+            level=level,
+            context=exit_summary,
+        )
+        logger.info(
+            "Trade closed | id=%s pair=%s roi=%s reason=%s phase=%s",
+            trade_id,
+            (trade_position or {}).get("pair"),
+            roi_value,
+            reason,
+            DEPLOY_PHASE,
+        )
         with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
             f.flush()
             os.fsync(f.fileno())  # Sync after update
@@ -1721,6 +2000,14 @@ def evaluate_signals_and_trade(
             )
             + "\n"
         )
+
+    _maybe_write_state_checkpoint(
+        {
+            "executed_trades": executed_trades,
+            "check_exits_only": check_exits_only,
+            "phase": DEPLOY_PHASE,
+        }
+    )
 
 
 def gather_signals(prices, volumes, ctx=None, **kwargs):

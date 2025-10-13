@@ -28,6 +28,7 @@ def test_confirmation_not_required_in_paper_mode(monkeypatch, live_mode_config, 
     _reset_confirmation_state(live_mode_config)
 
     monkeypatch.setattr(bot_config, "is_live", False, raising=False)
+    monkeypatch.setattr(bot_config, "IS_LIVE", False, raising=False)
 
     assert require_live_confirmation()
 
@@ -40,6 +41,7 @@ def test_live_mode_allows_when_file_present(monkeypatch, live_mode_config, tmp_p
     _reset_confirmation_state(live_mode_config)
 
     monkeypatch.setattr(bot_config, "is_live", True, raising=False)
+    monkeypatch.setattr(bot_config, "IS_LIVE", True, raising=False)
 
     assert require_live_confirmation()
 
@@ -51,6 +53,7 @@ def test_live_mode_blocks_without_confirmation(monkeypatch, live_mode_config, tm
     _reset_confirmation_state(live_mode_config)
 
     monkeypatch.setattr(bot_config, "is_live", True, raising=False)
+    monkeypatch.setattr(bot_config, "IS_LIVE", True, raising=False)
 
     with pytest.raises(ConfigurationError):
         require_live_confirmation()
@@ -63,5 +66,6 @@ def test_live_force_override_allows_without_file(monkeypatch, live_mode_config, 
     _reset_confirmation_state(live_mode_config)
 
     monkeypatch.setattr(bot_config, "is_live", True, raising=False)
+    monkeypatch.setattr(bot_config, "IS_LIVE", True, raising=False)
 
     assert require_live_confirmation()

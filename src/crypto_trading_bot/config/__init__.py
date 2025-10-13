@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -28,9 +30,11 @@ logger = logging.getLogger(__name__)
 
 LIVE_MODE_LABEL = "\U0001f6a8 LIVE MODE \U0001f6a8"
 PAPER_MODE_LABEL = "PAPER MODE"
-is_live: bool = False
+IS_LIVE: bool = False
+is_live: bool = IS_LIVE
 CONFIG: dict = {}
 _DEFAULT_LIVE_CONFIRMATION_FILE = ".confirm_live_trade"
+_TRADE_SIZE_FALLBACK_WARNED = False
 
 
 class ConfigurationError(RuntimeError):
@@ -51,6 +55,69 @@ else:  # pragma: no cover - fallback when client is unavailable
 
 
 _WITHDRAW_WARNING_LOGGED = False
+
+
+_DEPLOY_PHASE_ALLOWED = {"canary", "full"}
+_DEPLOY_PHASE_DEFAULT = "canary"
+_DEPLOY_PHASE_FILE = Path("logs/deploy_phase.json")
+_DEPLOY_PHASE_MAX_AGE_HOURS = int(os.getenv("CRYPTO_TRADING_BOT_DEPLOY_MAX_AGE_HOURS", "24") or "24")
+CANARY_MAX_FRACTION = float(os.getenv("CRYPTO_TRADING_BOT_CANARY_MAX_FRACTION", "0.05") or "0.05")
+
+
+def _parse_iso_datetime(raw: Any) -> Optional[datetime]:
+    if not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _load_deploy_phase() -> tuple[str, Optional[datetime], str, str]:
+    """Return (phase, updated_at, status, source) with validation."""
+
+    phase = _DEPLOY_PHASE_DEFAULT
+    updated_at: Optional[datetime] = None
+    status = "pending"
+    source = "default"
+
+    env_phase = os.getenv("DEPLOY_PHASE")
+    if env_phase:
+        candidate = env_phase.strip().lower()
+        if candidate in _DEPLOY_PHASE_ALLOWED:
+            phase = candidate
+            source = "env"
+
+    if source == "default" and _DEPLOY_PHASE_FILE.exists():
+        try:
+            with _DEPLOY_PHASE_FILE.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            candidate = str(data.get("phase", phase)).strip().lower()
+            if candidate in _DEPLOY_PHASE_ALLOWED:
+                phase = candidate
+                source = data.get("source", "file")
+            updated_at = _parse_iso_datetime(data.get("updated_at"))
+            status = str(data.get("status", status)).lower()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read deploy phase file %s: %s", _DEPLOY_PHASE_FILE, exc)
+
+    if phase not in _DEPLOY_PHASE_ALLOWED:
+        phase = _DEPLOY_PHASE_DEFAULT
+
+    if phase == "full":
+        max_age = timedelta(hours=max(1, _DEPLOY_PHASE_MAX_AGE_HOURS))
+        now = datetime.now(timezone.utc)
+        recent_enough = updated_at is not None and (now - updated_at) <= max_age
+        if status != "pass" or not recent_enough:
+            logger.warning(
+                "DEPLOY_PHASE 'full' requires a successful final health audit within "
+                "the last %d hours; reverting to 'canary'.",
+                _DEPLOY_PHASE_MAX_AGE_HOURS,
+            )
+            phase = _DEPLOY_PHASE_DEFAULT
+
+    return phase, updated_at, status, source
 
 
 def query_api_key_permissions() -> dict[str, dict[str, bool]]:
@@ -179,6 +246,7 @@ def _load_dotenv_into_env() -> Dict[str, str]:
     Existing environment variables are never overwritten. Returns the mapping
     of keys loaded from the file so callers can perform follow-up validation.
     """
+    # pylint: disable=too-many-branches
 
     candidates = []
     root_env = os.getenv("CRYPTO_TRADING_BOT_ROOT")
@@ -199,6 +267,21 @@ def _load_dotenv_into_env() -> Dict[str, str]:
             raw_values = dotenv_values(env_path)
         except (OSError, ValueError):  # pragma: no cover - dotenv internals
             continue
+        if not raw_values:
+            fallback: Dict[str, str] = {}
+            try:
+                with env_path.open("r", encoding="utf-8") as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        fallback[key.strip()] = value.strip().strip('"')
+            except OSError:
+                fallback = {}
+            raw_values = fallback
         for key, value in (raw_values or {}).items():
             if value is None or key in loaded:
                 continue
@@ -247,7 +330,7 @@ def _resolve_env_or_file(name: str, file_env: str) -> tuple[str, str]:
 
 
 def _ensure_env_credentials() -> None:
-    """Ensure Kraken credentials are present in ``os.environ`` after dotenv load."""
+    """Best-effort loading of Kraken credentials into the environment."""
 
     api_key, key_origin = _resolve_env_or_file("KRAKEN_API_KEY", "KRAKEN_API_KEY_FILE")
     api_secret, secret_origin = _resolve_env_or_file("KRAKEN_API_SECRET", "KRAKEN_API_SECRET_FILE")
@@ -272,14 +355,10 @@ def _ensure_env_credentials() -> None:
             )
 
     if not api_key or not api_secret:
-        message = " ".join(
-            [
-                "Kraken API credentials missing:",
-                "ensure KRAKEN_API_KEY and KRAKEN_API_SECRET are set",
-            ]
-        )
-        logger.critical(message)
-        raise ConfigurationError(message)
+        logger.error("Kraken API credentials are missing: ensure " "KRAKEN_API_KEY and KRAKEN_API_SECRET are set.")
+        CONFIG.setdefault("kraken_api_key", api_key or "")
+        CONFIG.setdefault("kraken_api_secret", api_secret or "")
+        return
 
     logger.debug(
         "Kraken API credentials available (sources: %s/%s)",
@@ -290,6 +369,7 @@ def _ensure_env_credentials() -> None:
 
 def _validate_credentials() -> Tuple[str, str]:
     """Ensure Kraken key/secret are present and secret is valid base64."""
+    # pylint: disable=too-many-branches,too-many-locals,too-many-statements
 
     direct_key, direct_key_origin = _resolve_env_or_file(
         "KRAKEN_API_KEY",
@@ -343,9 +423,9 @@ def _validate_credentials() -> Tuple[str, str]:
             secret_source = "config"
 
     if not key or not secret_raw:
-        message = "Kraken API key/secret missing for live mode."
-        logger.error(message)
-        raise ConfigurationError(message)
+        error_message = "Kraken API key/secret missing for live mode."
+        logger.error(error_message)
+        raise ConfigurationError(error_message)
 
     try:
         secret = _sanitize_base64_secret(secret_raw, strict=True)
@@ -357,9 +437,9 @@ def _validate_credentials() -> Tuple[str, str]:
         raise ConfigurationError("Kraken API secret is not valid base64.") from exc
 
     if not secret:
-        message = "Kraken API secret must be provided for live mode."
-        logger.error(message)
-        raise ConfigurationError(message)
+        error_message = "Kraken API secret must be provided for live mode."
+        logger.error(error_message)
+        raise ConfigurationError(error_message)
 
     try:
         base64.b64decode(secret, validate=True)
@@ -409,6 +489,7 @@ def set_live_mode(flag: bool) -> None:
             raise
         _assert_no_withdraw_rights()
     globals()["is_live"] = bool(flag)
+    globals()["IS_LIVE"] = bool(flag)
 
 
 def get_mode_label() -> str:
@@ -554,14 +635,20 @@ def _build_trade_size_config(pairs: list[str]) -> dict:
         try:
             meta = _kraken_pair_meta(pair)
         except error_types as exc:  # pragma: no cover
-            logger.warning(
-                "Failed to load trade size metadata for %s: %s — using defaults",
-                pair,
-                exc,
-            )
+            if not _TRADE_SIZE_FALLBACK_WARNED:
+                logger.warning(
+                    "Kraken metadata unavailable; using fallback trade sizes (%s)",
+                    exc,
+                )
+                globals()["_TRADE_SIZE_FALLBACK_WARNED"] = True
             continue
         if meta is None:
-            logger.warning("Kraken metadata unavailable; using fallback trade sizes for %s", pair)
+            if not _TRADE_SIZE_FALLBACK_WARNED:
+                logger.warning(
+                    "Kraken metadata unavailable; using fallback trade sizes for %s",
+                    pair,
+                )
+                globals()["_TRADE_SIZE_FALLBACK_WARNED"] = True
             continue
         min_volume = float(meta.get("ordermin", default_min) or default_min)
         min_cost = float(meta.get("costmin", 0.0) or 0.0)
@@ -583,9 +670,10 @@ _ensure_env_credentials()
 
 _TRADABLE_PAIRS = _load_tradable_pairs()
 
+_PRELOADED_KEY = _sanitize_value(CONFIG.get("kraken_api_key") or os.getenv("KRAKEN_API_KEY") or "")
+_PRELOADED_SECRET = _sanitize_value(CONFIG.get("kraken_api_secret") or os.getenv("KRAKEN_API_SECRET") or "")
 
-# Load environment variables from a .env file in the project root
-CONFIG: dict = {
+_config_template: dict[str, Any] = {
     "tradable_pairs": list(_TRADABLE_PAIRS),
     "rsi": {
         "period": 14,
@@ -647,8 +735,23 @@ CONFIG: dict = {
         "balance_asset": (os.getenv("KRAKEN_BALANCE_ASSET") or "USDC").upper(),
         "validate_orders": _to_bool(os.getenv("KRAKEN_VALIDATE_ORDERS"), False),
         "time_in_force": os.getenv("KRAKEN_TIME_IN_FORCE"),
+        "api_base": os.getenv("KRAKEN_API_BASE", "https://api.kraken.com"),
+        "api_key": _read_env_trimmed("KRAKEN_API_KEY"),
+        "api_secret": _read_env_trimmed("KRAKEN_API_SECRET"),
     },
 }
+
+CONFIG.clear()
+CONFIG.update(_config_template)
+
+if _PRELOADED_KEY:
+    CONFIG["kraken_api_key"] = _PRELOADED_KEY
+if _PRELOADED_SECRET:
+    CONFIG["kraken_api_secret"] = _PRELOADED_SECRET
+
+kraken_cfg = CONFIG.setdefault("kraken", {})
+kraken_cfg["api_key"] = CONFIG.get("kraken_api_key", "")
+kraken_cfg["api_secret"] = CONFIG.get("kraken_api_secret", "")
 
 if logger.isEnabledFor(logging.DEBUG):
     logger.debug(
@@ -677,13 +780,24 @@ if _env_live_flag is not None:
 
 CONFIG.setdefault("prelaunch_guard", {})
 CONFIG["prelaunch_guard"].setdefault(
-    "alert_window_hours", int(os.getenv("CRYPTO_TRADING_BOT_ALERT_WINDOW_HOURS", "72"))
+    "alert_window_hours",
+    int(os.getenv("CRYPTO_TRADING_BOT_ALERT_WINDOW_HOURS", "72")),
 )
 CONFIG["prelaunch_guard"].setdefault(
-    "max_recent_high_severity", int(os.getenv("CRYPTO_TRADING_BOT_MAX_RECENT_HIGH_SEVERITY", "50"))
+    "max_recent_high_severity",
+    int(os.getenv("CRYPTO_TRADING_BOT_MAX_RECENT_HIGH_SEVERITY", "50")),
 )
 
 CONFIG["test_mode"] = _to_bool(os.getenv("CRYPTO_TRADING_BOT_TEST_MODE"), False)
+
+_DEPLOY_PHASE_VALUE, _PHASE_UPDATED_AT, _PHASE_STATUS, _PHASE_SOURCE = _load_deploy_phase()
+DEPLOY_PHASE = _DEPLOY_PHASE_VALUE
+deployment_cfg = CONFIG.setdefault("deployment", {})
+deployment_cfg["phase"] = DEPLOY_PHASE
+deployment_cfg["phase_source"] = _PHASE_SOURCE
+deployment_cfg["phase_status"] = _PHASE_STATUS
+deployment_cfg["phase_updated_at"] = _PHASE_UPDATED_AT.isoformat() if _PHASE_UPDATED_AT else None
+deployment_cfg["canary_max_fraction"] = CANARY_MAX_FRACTION
 
 _confirmation_env = os.getenv("LIVE_CONFIRMATION_FILE")
 if _confirmation_env:
@@ -697,6 +811,7 @@ CONFIRMATION_PATH = str(Path(CONFIRMATION_CANDIDATE).expanduser())
 
 live_mode_cfg = CONFIG.setdefault("live_mode", {})
 live_mode_cfg["confirmation_file"] = CONFIRMATION_PATH
+_CONFIRMATION_SENTINEL = Path(CONFIRMATION_PATH).expanduser()
 
 _LIVE_FORCE_ENV = _to_bool(os.getenv("LIVE_FORCE"), False)
 if _LIVE_FORCE_ENV:
@@ -714,7 +829,6 @@ else:
 
 RISK_STATE_PATH = str(Path(RISK_CANDIDATE).expanduser())
 live_mode_cfg["risk_state_file"] = RISK_STATE_PATH
-
 _risk_drawdown_env = os.getenv("LIVE_RISK_DRAWDOWN_THRESHOLD")
 _risk_failure_env = os.getenv("LIVE_RISK_FAILURE_LIMIT")
 
@@ -733,11 +847,21 @@ if _LIVE_MODE_ENV:
         logger.warning("LIVE_MODE enabled via environment variable.")
     except ConfigurationError as exc:
         logger.critical("Failed to enable LIVE_MODE from environment: %s", exc)
-        raise
+
+if IS_LIVE and not _LIVE_FORCE_ENV:
+    if not _CONFIRMATION_SENTINEL.exists():
+        ERROR_CONFIRMATION_SENTINEL = (
+            "Live mode is locked on but confirmation sentinel is missing. "
+            "Create `.confirm_live_trade` or set `LIVE_FORCE=1` to proceed."
+        )
+        raise ConfigurationError(ERROR_CONFIRMATION_SENTINEL)
 
 
 __all__ = [
     "CONFIG",
+    "IS_LIVE",
+    "DEPLOY_PHASE",
+    "CANARY_MAX_FRACTION",
     "LIVE_MODE_LABEL",
     "PAPER_MODE_LABEL",
     "get_mode_label",

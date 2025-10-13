@@ -56,6 +56,43 @@ def test_trade_ledger_update_trade_idempotent(tmp_path, monkeypatch):
     tl.update_trade(trade_id=tid, exit_price=20500.0, reason="TAKE_PROFIT")  # idempotent
 
 
+def test_trade_ledger_detects_duplicate(monkeypatch):
+    ledger_mod = pytest.importorskip("crypto_trading_bot.ledger.trade_ledger")
+
+    class DummyPM:
+        positions = {}
+
+    tl = ledger_mod.TradeLedger(DummyPM())
+    original_window = ledger_mod._DUPLICATE_WINDOW_SECONDS
+    ledger_mod._DUPLICATE_WINDOW_SECONDS = 300
+    tl.trades.clear()
+    tl.trade_index.clear()
+
+    try:
+        trade_id = tl.log_trade(
+            trading_pair="BTC/USDC",
+            trade_size=0.002,
+            strategy_name="DuplicateCheckStrategy",
+            confidence=0.75,
+            entry_price=21000.0,
+            side="buy",
+        )
+
+        duplicate_id = tl.log_trade(
+            trading_pair="BTC/USDC",
+            trade_size=0.002,
+            strategy_name="DuplicateCheckStrategy",
+            confidence=0.75,
+            entry_price=21000.0,
+            side="buy",
+        )
+    finally:
+        ledger_mod._DUPLICATE_WINDOW_SECONDS = original_window
+
+    assert duplicate_id == trade_id
+    assert len(tl.trades) == 1
+
+
 def test_portfolio_risk_correlation_threshold_precedence():
     pr_mod = pytest.importorskip("crypto_trading_bot.bot.utils.portfolio_risk")
     signals = [

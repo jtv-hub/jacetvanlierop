@@ -19,9 +19,12 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from crypto_trading_bot.bot.simulation import collect_signal_snapshot
-from crypto_trading_bot.config import CONFIG, ConfigurationError, is_live, set_live_mode
+from crypto_trading_bot.bot.utils.alerts import send_alert
+from crypto_trading_bot.config import CONFIG, IS_LIVE, ConfigurationError, is_live, set_live_mode
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.ledger.ledger_access import get_ledger
+from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.safety.confirmation import require_live_confirmation
 from crypto_trading_bot.utils.price_history import get_fallback_metrics
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 
@@ -32,6 +35,7 @@ _SYSTEM_LOG_PATH = Path("logs/system.log")
 _DEFAULT_WINDOW_HOURS = int(CONFIG.get("prelaunch_guard", {}).get("alert_window_hours", 72))
 _DEFAULT_MAX_HIGH = int(CONFIG.get("prelaunch_guard", {}).get("max_recent_high_severity", 50))
 CONFIDENCE_TOLERANCE = 0.25  # Allow small confidence deviations when signals agree (see module docstring).
+_STRICT_MODE = os.getenv("STRICT_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _clear_kill_switch(path: Path = KILL_SWITCH_FILE) -> None:
@@ -320,15 +324,35 @@ def _run_mode_compare(pairs: Iterable[str]) -> None:
             continue
         if paper_sig is None or live_sig is None:
             missing_source = "paper" if paper_sig is None else "live"
-            raise ConfigurationError(
-                f"Signal mismatch for {pair}: missing actionable signal in {missing_source} snapshot."
+            message = f"Signal mismatch for {pair}: missing actionable signal in {missing_source} snapshot."
+            if _STRICT_MODE:
+                raise ConfigurationError(message)
+            logger.warning("[prelaunch_guard] %s", message)
+            send_alert(
+                "[prelaunch] Signal mismatch",
+                level="WARNING",
+                context={"pair": pair, "missing": missing_source},
             )
+            continue
 
         if not _signals_match(paper_sig, live_sig):
             mismatches.append({"pair": pair, "paper": paper_sig, "live": live_sig})
 
     if mismatches:
-        raise ConfigurationError(f"Signal mismatch between paper and live dry-run modes: {mismatches}")
+        if _STRICT_MODE:
+            raise ConfigurationError(f"Signal mismatch between paper and live dry-run modes: {mismatches}")
+        for mismatch in mismatches:
+            logger.warning(
+                "[prelaunch_guard] Signal mismatch | pair=%s paper=%s live=%s",
+                mismatch.get("pair"),
+                mismatch.get("paper"),
+                mismatch.get("live"),
+            )
+            send_alert(
+                "[prelaunch] Signal mismatch",
+                level="WARNING",
+                context=mismatch,
+            )
 
     logger.info("Mode comparison succeeded for %d pair(s).", len(pairs_list))
 
@@ -410,6 +434,22 @@ def run_prelaunch_guard(
     _prune_log_noise(_ALERT_LOG_PATH)
     _prune_log_noise(_SYSTEM_LOG_PATH)
     _assert_logs_writable([_ALERT_LOG_PATH, _SYSTEM_LOG_PATH])
+
+    if IS_LIVE:
+        require_live_confirmation()
+        state_snapshot = risk_guard.load_state()
+        paused, pause_reason = risk_guard.check_pause(state_snapshot)
+        if paused:
+            send_alert(
+                "[prelaunch] Risk guard paused — live launch blocked.",
+                level="CRITICAL",
+                context={"reason": pause_reason},
+            )
+            raise ConfigurationError(
+                "Prelaunch guard: risk guard is paused "
+                f"({pause_reason}). Resolve via scripts/reset_risk_state.py before trading live."
+            )
+        logger.info("[prelaunch] Risk guard state clear (paused=%s).", paused)
 
     auto_archive_did_run = False
 

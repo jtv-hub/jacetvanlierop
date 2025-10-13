@@ -6,16 +6,32 @@ can pause live trading until an operator explicitly clears the condition.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Protocol, Tuple, cast
 
 from crypto_trading_bot.config import CONFIG
 
 logger = logging.getLogger(__name__)
+
+_STATE_CACHE: dict[str, Any] | None = None
+_STATE_CACHE_MTIME: int | None = None
+_ALERT_MODULE = None
+
+
+class _SendAlertCallable(Protocol):  # pylint: disable=too-few-public-methods
+    def __call__(
+        self,
+        message: str,
+        *,
+        level: str = "INFO",
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Protocol describing the alerts helper signature."""
 
 
 def _now() -> str:
@@ -56,13 +72,42 @@ def _write_state(state: dict[str, Any]) -> dict[str, Any]:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, path)
+    global _STATE_CACHE, _STATE_CACHE_MTIME  # pylint: disable=global-statement
+    _STATE_CACHE = dict(snapshot)
+    try:
+        _STATE_CACHE_MTIME = path.stat().st_mtime_ns
+    except OSError:
+        _STATE_CACHE_MTIME = None
     return snapshot
 
 
-def load_state() -> dict[str, Any]:
+def _current_state_mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def load_state(*, force_reload: bool = False) -> dict[str, Any]:
+    """Return the persisted risk guard state, reloading when requested."""
+
+    global _STATE_CACHE, _STATE_CACHE_MTIME  # pylint: disable=global-statement
     path = _state_path()
+    if (
+        not force_reload
+        and _STATE_CACHE is not None
+        and _STATE_CACHE_MTIME is not None
+        and _STATE_CACHE_MTIME == _current_state_mtime(path)
+    ):
+        return dict(_STATE_CACHE)
+
+    if not force_reload and _STATE_CACHE is not None and not path.exists():
+        return dict(_STATE_CACHE)
+
     if not path.exists():
-        return _default_state()
+        _STATE_CACHE = _default_state()
+        _STATE_CACHE_MTIME = None
+        return dict(_STATE_CACHE)
     try:
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -74,10 +119,14 @@ def load_state() -> dict[str, Any]:
             path,
             exc,
         )
-        return _default_state()
+        _STATE_CACHE = _default_state()
+        _STATE_CACHE_MTIME = _current_state_mtime(path)
+        return dict(_STATE_CACHE)
     state = _default_state()
     state.update(data)
-    return state
+    _STATE_CACHE = state
+    _STATE_CACHE_MTIME = _current_state_mtime(path)
+    return dict(_STATE_CACHE)
 
 
 def clear_state() -> dict[str, Any]:
@@ -93,6 +142,12 @@ def state_path() -> Path:
     """Return the resolved filesystem path backing the risk state."""
 
     return _state_path()
+
+
+def default_state() -> dict[str, Any]:
+    """Return a fresh default risk guard state."""
+
+    return _default_state()
 
 
 def _failure_limit() -> int:
@@ -113,6 +168,21 @@ def _drawdown_limit() -> float:
     return max(value, 0.0)
 
 
+def invalidate_cache() -> None:
+    """Clear the in-memory cache so the next load reads from disk."""
+
+    global _STATE_CACHE, _STATE_CACHE_MTIME  # pylint: disable=global-statement
+    _STATE_CACHE = None
+    _STATE_CACHE_MTIME = None
+
+
+def is_paused(state: dict[str, Any] | None = None, *, refresh: bool = False) -> bool:
+    """Return ``True`` when the guard is actively paused."""
+
+    snapshot = state if state is not None else load_state(force_reload=refresh)
+    return bool(snapshot.get("paused"))
+
+
 def check_pause(state: dict[str, Any] | None = None) -> Tuple[bool, str | None]:
     """Return ``(paused, reason)`` for the current guard state."""
 
@@ -128,6 +198,86 @@ def check_pause(state: dict[str, Any] | None = None) -> Tuple[bool, str | None]:
             return True, "drawdown threshold exceeded"
         return True, "risk guard active"
     return False, None
+
+
+def _resolve_alert_callable() -> _SendAlertCallable | None:
+    """Return the alerts helper callable when available."""
+
+    global _ALERT_MODULE  # pylint: disable=global-statement
+    try:
+        if _ALERT_MODULE is None:
+            alerts_path = Path(__file__).resolve().parents[2] / "bot" / "utils" / "alerts.py"
+            spec = importlib.util.spec_from_file_location("_alerts", alerts_path)
+            if not spec or not spec.loader:
+                raise ImportError("Unable to locate alerts module")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # type: ignore[arg-type]
+            _ALERT_MODULE = module
+        send_alert_fn = getattr(_ALERT_MODULE, "send_alert", None)
+        if callable(send_alert_fn):
+            return cast(_SendAlertCallable, send_alert_fn)
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("alerts module unavailable.", exc_info=True)
+        return None
+    return None
+
+
+def _send_alert(
+    message: str,
+    *,
+    level: str = "INFO",
+    context: dict[str, Any] | None = None,
+) -> None:
+    """Send an alert if the optional alerts helper is importable."""
+
+    send_alert_fn: _SendAlertCallable | None = _resolve_alert_callable()
+    if send_alert_fn is None:
+        logger.debug("Skipping alert (helper unavailable): %s", message)
+        return
+    send_alert_fn(message, level=level, context=context)  # pylint: disable=not-callable
+
+
+def activate_pause(
+    reason: str,
+    *,
+    trigger: str = "manual",
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Force a pause and persist the state."""
+
+    state = load_state()
+    state["paused"] = True
+    state["pause_reason"] = reason
+    state["pause_trigger"] = trigger
+    snapshot = _write_state(state)
+    _send_alert(
+        f"[risk_guard] Pause activated — {reason}",
+        level="CRITICAL",
+        context={**(context or {}), "trigger": trigger},
+    )
+    return snapshot
+
+
+def resume_trading(
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Clear the pause flag so trading can resume."""
+
+    state = load_state()
+    state["paused"] = False
+    state["pause_reason"] = None
+    state["pause_trigger"] = None
+    state["consecutive_failures"] = 0
+    state["last_drawdown"] = 0.0
+    state["max_drawdown"] = 0.0
+    snapshot = _write_state(state)
+    _send_alert(
+        "[risk_guard] Pause cleared — trading may resume.",
+        level="WARNING",
+        context=context,
+    )
+    return snapshot
 
 
 def update_drawdown(drawdown_pct: float | None) -> dict[str, Any]:
@@ -149,7 +299,7 @@ def update_drawdown(drawdown_pct: float | None) -> dict[str, Any]:
         state["max_drawdown"] = magnitude
 
     limit = _drawdown_limit()
-    if magnitude >= limit and limit > 0:
+    if 0 < limit <= magnitude:
         already_paused = bool(state.get("paused")) and state.get("pause_trigger") == "drawdown"
         if not already_paused:
             message = (
@@ -159,6 +309,11 @@ def update_drawdown(drawdown_pct: float | None) -> dict[str, Any]:
             state["paused"] = True
             state["pause_trigger"] = "drawdown"
             state["pause_reason"] = f"drawdown {magnitude:.2%} ≥ {limit:.2%}"
+            _send_alert(
+                "[risk_guard] Drawdown threshold breached.",
+                level="CRITICAL",
+                context={"drawdown": magnitude, "limit": limit},
+            )
         else:
             state["pause_reason"] = state.get("pause_reason") or f"drawdown {magnitude:.2%} ≥ {limit:.2%}"
     state = _write_state(state)
@@ -195,18 +350,31 @@ def update_trade_outcome(
             already_paused = bool(state.get("paused")) and state.get("pause_trigger") == "consecutive_failures"
             if not already_paused:
                 logger.warning(
-                    "[risk_guard] consecutive loss limit reached (%s failures) — pausing live trading.",
+                    "[risk_guard] consecutive loss limit reached (%s failures) — " "pausing live trading.",
                     streak,
                 )
                 if trade_id:
-                    logger.debug("[risk_guard] last failure trade_id=%s exit_reason=%s", trade_id, exit_reason)
+                    logger.debug(
+                        "[risk_guard] last failure trade_id=%s exit_reason=%s",
+                        trade_id,
+                        exit_reason,
+                    )
                 state["paused"] = True
                 state["pause_trigger"] = "consecutive_failures"
                 state["pause_reason"] = f"{streak} consecutive losses"
+                _send_alert(
+                    "[risk_guard] Consecutive loss limit reached — trading paused.",
+                    level="CRITICAL",
+                    context={
+                        "streak": streak,
+                        "trade_id": trade_id,
+                        "exit_reason": exit_reason,
+                    },
+                )
     else:
         if state.get("consecutive_failures"):
             state["consecutive_failures"] = 0
-        if bool(state.get("paused")) and state.get("pause_trigger") == "consecutive_failures":
+        if bool(state.get("paused")) and (state.get("pause_trigger") == "consecutive_failures"):
             state["paused"] = False
             state["pause_trigger"] = None
             state["pause_reason"] = None
@@ -217,9 +385,14 @@ def update_trade_outcome(
 
 
 __all__ = [
+    "default_state",
+    "activate_pause",
     "check_pause",
     "clear_state",
+    "invalidate_cache",
+    "is_paused",
     "load_state",
+    "resume_trading",
     "state_path",
     "update_drawdown",
     "update_trade_outcome",

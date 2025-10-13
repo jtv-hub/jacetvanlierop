@@ -11,6 +11,7 @@ import pytest
 from crypto_trading_bot import config as config_module
 from crypto_trading_bot.bot import market_data, trading_logic
 from crypto_trading_bot.config import ConfigurationError, set_live_mode
+from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.utils import kraken_client
 
 
@@ -283,6 +284,9 @@ def _reset_trading_state():
     trading_logic.is_live = True
     trading_logic._live_block_logged = False  # type: ignore[attr-defined]
     trading_logic._KRAKEN_FAILURE_PAUSE_UNTIL = None  # type: ignore[attr-defined]
+    trading_logic.DEPLOY_PHASE = "full"
+    risk_guard.invalidate_cache()
+    risk_guard.resume_trading(context={"test": "reset"})
 
 
 def test_submit_live_trade_skips_volume_min(monkeypatch):
@@ -463,4 +467,5 @@ def test_submit_live_trade_rate_limit_pause(monkeypatch):
     )
 
     assert result is False
-    assert trading_logic._KRAKEN_FAILURE_PAUSE_UNTIL == pytest.approx(1090.0)  # type: ignore[attr-defined]
+    pause_until = getattr(trading_logic, "_KRAKEN_FAILURE_PAUSE_UNTIL")
+    assert pause_until == pytest.approx(1090.0)

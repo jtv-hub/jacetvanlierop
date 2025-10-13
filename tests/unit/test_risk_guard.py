@@ -1,14 +1,21 @@
+"""Tests covering the persistent risk guard state helpers."""
+
 from __future__ import annotations
 
 import importlib
+import json
+import time
 
 import pytest
 
+import crypto_trading_bot.safety.risk_guard as risk_guard_pkg
 from crypto_trading_bot.config import CONFIG
 
+# pylint: disable=missing-function-docstring
 
-@pytest.fixture
-def risk_guard(tmp_path, monkeypatch):
+
+@pytest.fixture(name="risk_guard")
+def fixture_risk_guard(tmp_path, monkeypatch):
     state_path = tmp_path / "risk_guard_state.json"
     monkeypatch.setenv("RISK_GUARD_STATE_FILE", str(state_path))
 
@@ -22,12 +29,10 @@ def risk_guard(tmp_path, monkeypatch):
         }
     )
 
-    import crypto_trading_bot.safety.risk_guard as risk_guard_module
-
-    module = importlib.reload(risk_guard_module)
+    module = importlib.reload(risk_guard_pkg)
     yield module
 
-    importlib.reload(risk_guard_module)
+    importlib.reload(risk_guard_pkg)
     monkeypatch.delenv("RISK_GUARD_STATE_FILE", raising=False)
     live_cfg.clear()
     live_cfg.update(original_live_cfg)
@@ -85,3 +90,22 @@ def test_clear_state_resets_file(risk_guard):
     reloaded = risk_guard.load_state()
     assert reloaded["consecutive_failures"] == 0
     assert not reloaded["paused"]
+
+
+def test_is_paused_refreshes_after_external_reset(risk_guard):
+    risk_guard.clear_state()
+    risk_guard.activate_pause("manual override", trigger="manual")
+    assert risk_guard.is_paused()
+
+    path = risk_guard.state_path()
+    # Ensure filesystem timestamp moves forward before overwriting.
+    time.sleep(0.01)
+    external_state = risk_guard.default_state()
+    external_state["paused"] = False
+    external_state["pause_trigger"] = None
+    external_state["pause_reason"] = None
+    path.write_text(json.dumps(external_state), encoding="utf-8")
+
+    assert not risk_guard.is_paused()
+    # Explicit refresh flag should also re-read from disk without relying on cache.
+    assert not risk_guard.is_paused(refresh=True)

@@ -40,7 +40,8 @@ from crypto_trading_bot.utils.kraken_client import (
 # Tail at most this many lines from each log file.
 _LOG_TAIL_LIMIT = 200
 _TRADELN_MARKER = "Submitting live trade | pair="
-_ERROR_KEYWORDS = ("error", "warning", "critical", "exception", "traceback")
+_ERROR_KEYWORDS = ("error", "critical", "exception", "traceback")
+_WARNING_KEYWORDS = ("warning",)
 _DEFAULT_VALIDATE_SIZE = 0.001
 
 
@@ -121,6 +122,7 @@ def _scan_logs(summary: Dict[str, Any]) -> None:
     _print_header("Log Inspection")
     trade_lines: list[str] = []
     error_lines: list[str] = []
+    warning_lines: list[str] = []
     log_files = [Path("logs/daemon.out"), Path("logs/system.log")]
     for log_path in log_files:
         print(f"-- {log_path} --")
@@ -139,6 +141,9 @@ def _scan_logs(summary: Dict[str, Any]) -> None:
                 entry = f"{log_path}: {line}"
                 error_lines.append(entry)
                 local_error_lines.append(entry)
+            elif any(keyword in lower for keyword in _WARNING_KEYWORDS):
+                entry = f"{log_path}: {line}"
+                warning_lines.append(entry)
         if local_trade_lines:
             print("Live trade submissions detected:")
             for entry in local_trade_lines:
@@ -153,11 +158,13 @@ def _scan_logs(summary: Dict[str, Any]) -> None:
             print("No errors or warnings detected in tail segment.")
     summary["trade_lines"] = bool(trade_lines)
     summary["log_errors"] = bool(error_lines)
+    summary["log_warnings"] = bool(warning_lines)
+    summary["log_warning_entries"] = warning_lines
 
 
 def _check_risk_guard(summary: Dict[str, Any]) -> None:
     _print_header("Risk Guard")
-    state = risk_guard_load_state()
+    state = risk_guard_load_state(force_reload=True)
     paused, reason = risk_guard_check_pause(state)
     path = risk_guard_state_path()
     print(f"State file: {path}")

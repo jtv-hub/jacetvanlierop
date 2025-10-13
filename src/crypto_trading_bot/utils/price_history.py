@@ -25,7 +25,7 @@ try:
 except Exception:  # pragma: no cover - optional import
     generate_mock_data = None  # type: ignore
 
-from crypto_trading_bot.bot.utils.alert import send_alert
+from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import CONFIG, is_live
 from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 
