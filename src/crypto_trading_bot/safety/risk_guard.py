@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,12 +18,14 @@ from crypto_trading_bot.config.constants import (
     DEFAULT_RISK_DRAWDOWN_THRESHOLD,
     DEFAULT_RISK_FAILURE_LIMIT,
 )
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
-logger = logging.getLogger(__name__)
+logger = get_system_logger().getChild("risk_guard")
 
 _STATE_CACHE: dict[str, Any] | None = None
 _STATE_CACHE_MTIME: int | None = None
 _ALERT_MODULE = None
+_LAST_PAUSED_STATE: bool | None = None
 
 
 class _SendAlertCallable(Protocol):  # pylint: disable=too-few-public-methods
@@ -66,8 +67,14 @@ def _default_state() -> dict[str, Any]:
 
 
 def _write_state(state: dict[str, Any]) -> dict[str, Any]:
+    global _STATE_CACHE, _STATE_CACHE_MTIME, _LAST_PAUSED_STATE  # pylint: disable=global-statement
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous_paused: bool | None = None
+    if _STATE_CACHE is not None:
+        previous_paused = bool(_STATE_CACHE.get("paused"))
+    elif _LAST_PAUSED_STATE is not None:
+        previous_paused = _LAST_PAUSED_STATE
     snapshot = dict(state)
     snapshot["updated_at"] = _now()
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -76,12 +83,21 @@ def _write_state(state: dict[str, Any]) -> dict[str, Any]:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, path)
-    global _STATE_CACHE, _STATE_CACHE_MTIME  # pylint: disable=global-statement
     _STATE_CACHE = dict(snapshot)
     try:
         _STATE_CACHE_MTIME = path.stat().st_mtime_ns
     except OSError:
         _STATE_CACHE_MTIME = None
+    current_paused = bool(snapshot.get("paused"))
+    _LAST_PAUSED_STATE = current_paused
+    if previous_paused and not current_paused:
+        logger.info(
+            "[risk_guard] Pause cleared via state update — trading may resume",
+            extra={
+                "pause_reason": snapshot.get("pause_reason"),
+                "pause_trigger": snapshot.get("pause_trigger"),
+            },
+        )
     return snapshot
 
 

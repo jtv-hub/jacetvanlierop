@@ -9,7 +9,6 @@ manages open positions, and checks exit conditions.
 
 import datetime
 import json
-import logging
 import math
 import os
 import shutil
@@ -26,7 +25,10 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
-from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
+from crypto_trading_bot.bot.state.portfolio_state import (
+    load_portfolio_state,
+    refresh_portfolio_state,
+)
 from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import (
     CANARY_MAX_FRACTION,
@@ -55,6 +57,7 @@ from crypto_trading_bot.utils.price_history import (
     append_live_price,
     get_history_prices,
 )
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
 # Optional RSI calculator (import may vary by environment)
 try:
@@ -75,7 +78,7 @@ from .strategies.dual_threshold_strategies import DualThresholdStrategy
 from .strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
-logger = logging.getLogger(__name__)
+logger = get_system_logger().getChild("trading_logic")
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
@@ -823,7 +826,6 @@ def _ensure_kill_switch_cleared() -> None:
         message = "[EMERGENCY STOP] Kill-switch file " f"{KILL_SWITCH_FILE} detected at startup — auto-cleared."
         logger.warning(message)
         send_alert(message, level="WARNING")
-        print(message)
         _STATE.kill_switch_auto_cleared = True
         _STATE.emergency_stop_triggered = False
     except OSError as exc:
@@ -857,13 +859,12 @@ def _guard_low_disk_space() -> bool:
                 context={"free_mb": round(free_mb, 2), "threshold_mb": _DISK_GUARD_THRESHOLD_MB},
                 level="CRITICAL",
             )
-            print(message)
+            logger.critical(message)
         _STATE.disk_space_block_active = True
         return True
 
     if _STATE.disk_space_block_active:
         logger.info("Disk space recovered (%.1f MB free); resuming trade evaluation.", free_mb)
-        print(f"[DISK] Space recovered: {free_mb:.1f} MB free")
         _STATE.disk_space_block_active = False
     return False
 
@@ -1025,9 +1026,9 @@ class PositionManager:
                 f.write(json.dumps(self.positions[trade_id]) + "\n")
                 f.flush()  # Ensure write
                 os.fsync(f.fileno())  # Sync to disk
-            print(f"[DEBUG] Position {trade_id} written to positions.jsonl")
+            logger.debug("Position persisted", extra={"trade_id": trade_id, "pair": pair, "size": size})
         except (OSError, IOError) as e:
-            print(f"[PositionManager] Error writing to positions.jsonl: {e}")
+            logger.error("Failed writing positions.jsonl", extra={"error": str(e)})
 
     def check_exits(
         self,
@@ -1080,14 +1081,23 @@ class PositionManager:
                         if rsi_val is not None and float(rsi_val) >= float(exit_upper):
                             exit_price = price
                             reason = "RSI_EXIT"
-                            print(f"[EXIT] RSI_EXIT for {trade_id} pair={pair} " f"rsi={float(rsi_val):.2f}")
+                            logger.info(
+                                "RSI exit triggered",
+                                extra={"trade_id": trade_id, "pair": pair, "rsi": float(rsi_val)},
+                            )
                             exits.append((trade_id, exit_price, reason))
                             keys_to_delete.append(trade_id)
                             continue
                 else:
-                    print(f"⚠️ RSI calculator unavailable — skipping RSI exit for {trade_id}")
+                    logger.warning(
+                        "RSI calculator unavailable; skipping RSI exit check",
+                        extra={"trade_id": trade_id, "pair": pos["pair"]},
+                    )
             except (HistoryUnavailable, KeyError, ValueError, TypeError, IndexError) as e:
-                print(f"[EXIT] RSI check error for {trade_id}: {e}")
+                logger.error(
+                    "RSI exit check encountered error",
+                    extra={"trade_id": trade_id, "pair": pos["pair"], "error": str(e)},
+                )
 
             if ret <= -sl:
                 exit_price = price
@@ -1128,13 +1138,16 @@ class PositionManager:
                                     pos["high_water_mark"] = pos["entry_price"]
                                 pos["timestamp"] = pos.get("timestamp")
                                 self.positions[trade_id] = pos
-                                print(f"[DEBUG] Loaded position {trade_id} from positions.jsonl")
+                                logger.debug(
+                                    "Loaded position from disk",
+                                    extra={"trade_id": trade_id, "pair": pos.get("pair")},
+                                )
                         except json.JSONDecodeError:
-                            print("⚠️ Failed to parse position.")
+                            logger.warning("Failed to parse position entry from positions.jsonl")
             except (OSError, IOError) as e:
-                print(f"[PositionManager] Error reading positions.jsonl: {e}")
+                logger.error("Error reading positions.jsonl", extra={"error": str(e)})
         else:
-            print("ℹ️ No positions file found.")
+            logger.info("Positions file not found; starting with empty state")
 
 
 position_manager = PositionManager()
@@ -1232,7 +1245,7 @@ def save_portfolio_state(ctx):
         json.dump(ctx.get_snapshot(), f, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    print(f"[PORTFOLIO] Saved state to {PORTFOLIO_STATE_PATH}")
+    logger.info("Portfolio state saved", extra={"path": str(PORTFOLIO_STATE_PATH)})
 
 
 def evaluate_signals_and_trade(
@@ -1255,7 +1268,7 @@ def evaluate_signals_and_trade(
             check_and_close_exits(ctx=None),  # type: ignore[name-defined]
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
-        print(f"[evaluate_signals_and_trade] Non-fatal helper error: {e}")
+        logger.exception("evaluate_signals_and_trade helper error", extra={"error": str(e)})
 
     _ensure_startup_snapshot()
 
@@ -1269,13 +1282,11 @@ def evaluate_signals_and_trade(
     if pause_new_trades:
         pause_msg = pause_reason or "[PAUSE] skipping new trades this cycle (ledger check)."
         logger.warning(pause_msg)
-        print(pause_msg)
         if not check_exits_only:
             check_exits_only = True
     if CONFIG.get("live_mode", {}).get("dry_run") and not _STATE.dry_run_logged:
         msg = "[DRY-RUN] Validate-only trades active; live orders use validate=True."
         logger.warning(msg)
-        print(msg)
         _STATE.dry_run_logged = True
 
     if os.path.exists(KILL_SWITCH_FILE):
@@ -1283,7 +1294,6 @@ def evaluate_signals_and_trade(
             alert_message = f"EMERGENCY STOP enabled via kill-switch file ({KILL_SWITCH_FILE})."
             send_alert(alert_message, level="CRITICAL")
             logger.critical(alert_message)
-            print(alert_message)
             _STATE.emergency_stop_triggered = True
         if is_live:
             set_live_mode(False)
@@ -1309,7 +1319,7 @@ def evaluate_signals_and_trade(
     # Added to ensure the engine scans all requested assets with no hardcoding.
     pairs: list[str] = tradable_pairs or CONFIG.get("tradable_pairs", [])
     if not pairs:
-        print("⚠️ No tradable_pairs configured; skipping evaluation.")
+        logger.warning("No tradable_pairs configured; skipping evaluation.")
         return
 
     mode_label = get_mode_label()
@@ -1351,7 +1361,6 @@ def evaluate_signals_and_trade(
         if paused:
             if _STATE.auto_paused_reason != reason:
                 logger.error("[AUTO-PAUSE] %s", reason)
-                print(f"[AUTO-PAUSE] {reason}")
             else:
                 logger.debug("Auto-pause active: %s", reason)
             _STATE.auto_paused_reason = reason
@@ -1373,15 +1382,14 @@ def evaluate_signals_and_trade(
         asset = pair.split("/")[0]
         if price_now is not None and price_now > 0:
             current_prices[pair] = price_now
-            print(f"[FEED] {asset} price OK: {price_now}")
+            logger.debug("Price feed update", extra={"asset": asset, "pair": pair, "price": price_now})
             volume_estimate = _fetch_recent_volume(pair, fallback=float(MIN_VOLUME))
             if volume_estimate is not None and volume_estimate > 0:
                 current_volumes[pair] = volume_estimate
             else:
                 logger.warning("No volume data for %s; skipping volume map entry", pair)
-                print(f"⚠️ No volume data for {pair}; skipping volume-driven checks")
         else:
-            print(f"⚠️ No current price for {pair}; skipping price map entry")
+            logger.warning("No current price available; skipping price map entry", extra={"pair": pair})
 
     # Preload seeded history for all pairs (startup fallback)
     try:
@@ -1397,7 +1405,14 @@ def evaluate_signals_and_trade(
     context.update_context()
     base_buffer = context.get_buffer()
     composite_buffer = context.get_buffer_for_strategy("CompositeStrategy")
-    print(f"[CONTEXT] Regime: {context.get_regime()} | Buffer: {base_buffer} | " f"CompositeBuffer: {composite_buffer}")
+    logger.info(
+        "Context refreshed",
+        extra={
+            "regime": context.get_regime(),
+            "buffer": base_buffer,
+            "composite_buffer": composite_buffer,
+        },
+    )
     save_portfolio_state(context)
 
     # Daily trade limit (configurable; ENV override allowed)
@@ -1466,29 +1481,29 @@ def evaluate_signals_and_trade(
     if len(recent) >= loss_streak_stop:
         last_n = recent[-loss_streak_stop:]
         if all((t.get("roi") or 0) < 0 for t in last_n):
-            print("[STREAK HALT] 3-loss streak detected — Trading paused for the day")
+            logger.warning("Loss streak detected — trading paused for the remainder of the day")
             return
 
     # Winning streak: last 5 closed trades all winners
     if len(recent) >= 5 and all((t.get("roi") or 0) > 0 for t in recent[-5:]):
         if current_daily_cap < bonus_cap:
             current_daily_cap = bonus_cap
-            print("[STREAK BONUS] 5-win streak detected — Daily trade cap raised to 7")
+            logger.info("Winning streak detected — daily trade cap increased", extra={"cap": current_daily_cap})
 
     # Enforce daily cap before scanning assets
     if today_count >= current_daily_cap:
-        print(f"[LIMIT] Daily trade limit reached ({today_count})")
+        logger.info("Daily trade limit reached", extra={"count": today_count, "limit": current_daily_cap})
         return
 
     total_capital = resolved_capital
     if not check_exits_only and total_capital <= 0:
-        print("⚠️ Available capital is zero — skipping new trade evaluation.")
+        logger.warning("Available capital is zero — skipping new trade evaluation")
         check_exits_only = True
 
     if not check_exits_only:
         proposed_trades = []
         executed_trades = 0
-        print(f"[ASSETS] Scanning {len(pairs)} pairs: {pairs}")
+        logger.info("Scanning assets", extra={"pairs": pairs, "count": len(pairs)})
         for pair in pairs:
             try:
                 # Derive asset symbol from pair (e.g., "BTC" from "BTC/USDC")
@@ -1498,7 +1513,7 @@ def evaluate_signals_and_trade(
                 if current_price is None:
                     current_price = get_current_price(pair)
                 if current_price is None or current_price <= 0:
-                    print(f"[SKIP] No valid current price for {pair}")
+                    logger.warning("Skipping asset due to invalid price", extra={"pair": pair})
                     continue
 
                 # Ensure seeded history is available, then append live price
@@ -1509,7 +1524,6 @@ def evaluate_signals_and_trade(
                     _ = get_history_prices(pair, min_len=min_needed)
                 except HistoryUnavailable as exc:
                     logger.error("Skipping %s: %s", pair, exc)
-                    print(f"[SKIP] {pair}: {exc}")
                     continue
 
                 append_live_price(pair, float(current_price))
@@ -1518,15 +1532,22 @@ def evaluate_signals_and_trade(
                     safe_prices = get_history_prices(pair, min_len=min_needed)
                 except HistoryUnavailable as exc:
                     logger.error("Skipping %s after live price append: %s", pair, exc)
-                    print(f"[SKIP] {pair}: {exc}")
                     continue
                 # Filter out None values before strategy evaluation
                 safe_prices = [p for p in safe_prices if p is not None]
                 historical_price_cache[pair] = safe_prices
                 # Pre-pair debug trace
-                print(f"[TEST] Generating signal for {pair} with {len(safe_prices)} valid candles")
+                logger.info(
+                    "Generating signal",
+                    extra={
+                        "pair": pair,
+                        "asset": asset,
+                        "valid_candles": len(safe_prices),
+                        "latest_close": safe_prices[-1] if safe_prices else None,
+                    },
+                )
                 last5 = safe_prices[-5:]
-                print(f"[DEBUG] {pair} prices: {last5} (last 5)")
+                logger.debug("Recent prices", extra={"pair": pair, "last5": last5})
 
                 # Pre-compute RSI for diagnostics/logging
                 rsi_val = None
@@ -1537,12 +1558,15 @@ def evaluate_signals_and_trade(
                     rsi_val = None
                 # Skip if insufficient history
                 if len(safe_prices) < min_needed:
-                    print(f"[SKIP] Not enough price history for {pair} " f"(only {len(safe_prices)} prices)")
+                    logger.warning(
+                        "Skipping due to insufficient price history",
+                        extra={"pair": pair, "available": len(safe_prices), "required": min_needed},
+                    )
                     continue
                 # Compute ADX gate using recent prices
                 adx_val = context.get_adx(pair, safe_prices)
                 if adx_val is not None:
-                    print(f"[ADX] {pair} ADX={adx_val:.2f}")
+                    logger.debug("ADX computed", extra={"pair": pair, "adx": adx_val})
                 volume = current_volumes.get(pair)
                 if volume is None:
                     volume = _fetch_recent_volume(pair, fallback=float(MIN_VOLUME))
@@ -1551,13 +1575,33 @@ def evaluate_signals_and_trade(
                 if volume is None or volume <= 0:
                     if TEST_MODE:
                         volume = float(MIN_VOLUME)
-                        print(f"[TEST MODE] Falling back to MIN_VOLUME for {pair}: {volume}")
+                        logger.debug(
+                            "Test mode volume fallback applied",
+                            extra={"pair": pair, "volume": volume},
+                        )
                     else:
-                        print(f"[SKIP] {asset}: volume unavailable; skipping")
+                        logger.warning(
+                            "Skipping asset due to missing volume",
+                            extra={"asset": asset, "pair": pair, "rsi": rsi_val},
+                        )
                         continue
                 if volume < MIN_VOLUME:
-                    print(f"[SKIP] {asset}: volume {volume:.2f} < MIN_VOLUME {MIN_VOLUME}")
+                    logger.warning(
+                        "Skipping asset due to low volume",
+                        extra={"asset": asset, "pair": pair, "volume": volume, "min_volume": MIN_VOLUME},
+                    )
                     continue
+                logger.info(
+                    "Signal context inputs",
+                    extra={
+                        "pair": pair,
+                        "asset": asset,
+                        "price": current_price,
+                        "rsi": rsi_val,
+                        "volume": volume,
+                        "adx": adx_val,
+                    },
+                )
                 # Reinitialize strategies per iteration to reset state
                 per_asset_params = CONFIG.get("strategy_params", {})
                 strategies = _get_locked_strategy_pipeline(
@@ -1587,11 +1631,14 @@ def evaluate_signals_and_trade(
                                 safe_prices,
                                 volume=volume,
                             )
-                        scan_msg = (
-                            f"[SCAN] {asset} strat={strategy.__class__.__name__} "
-                            f"price={current_price:.4f} vol={volume} -> {signal_result}"
-                        )
-                        print(scan_msg)
+                        scan_msg = {
+                            "asset": asset,
+                            "strategy": strategy.__class__.__name__,
+                            "price": round(float(current_price), 4),
+                            "volume": volume,
+                            "signal": signal_result,
+                        }
+                        logger.debug("Strategy scan result", extra=scan_msg)
                     except (ValueError, RuntimeError) as e:
                         log_path = "logs/anomalies.log"
                         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1614,13 +1661,19 @@ def evaluate_signals_and_trade(
                                 pass
                         continue
 
-                    print(f"🧪 {strategy.__class__.__name__} generated: {signal_result}")
+                    logger.debug(
+                        "Strategy output",
+                        extra={"strategy": strategy.__class__.__name__, "signal": signal_result},
+                    )
                     candidate_signal = signal_result.get("signal") or signal_result.get("side")
                     candidate_confidence = float(signal_result.get("confidence", 0.0) or 0.0)
                     strategy_name = strategy.__class__.__name__
 
                     if candidate_signal in {"buy", "sell"}:
-                        print(f"[RSI DEBUG] Signal for {pair} -> {candidate_signal}")
+                        logger.info(
+                            "Candidate signal selected",
+                            extra={"pair": pair, "signal": candidate_signal, "confidence": candidate_confidence},
+                        )
                         strategy_candidates.append(
                             {
                                 "strategy": strategy_name,
@@ -1638,12 +1691,22 @@ def evaluate_signals_and_trade(
                             sell_count += 1
                     else:
                         skipped_none += 1
-                        print(f"⚠️ Skipping {pair} — No actionable signal")
+                        logger.debug("No actionable signal produced", extra={"pair": pair})
 
                 actionable_candidates = [
                     candidate for candidate in strategy_candidates if candidate["signal"] in {"buy", "sell"}
                 ]
                 if not actionable_candidates:
+                    logger.info(
+                        "No actionable signals",
+                        extra={
+                            "pair": pair,
+                            "asset": asset,
+                            "generated_signals": signals_count,
+                            "skipped_none": skipped_none,
+                            "skipped_low_conf": skipped_low_conf,
+                        },
+                    )
                     continue
 
                 selected = max(actionable_candidates, key=lambda c: c["confidence"])
@@ -1657,23 +1720,37 @@ def evaluate_signals_and_trade(
                 if adx_val is not None:
                     if adx_val < 20.0:
                         skipped_none += 1
-                        print(f"[SKIP] {pair}: ADX too weak ({adx_val:.2f})")
-                        print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, " "adjusted confidence=0.0")
+                        logger.info(
+                            "ADX below threshold; skipping candidate",
+                            extra={"pair": pair, "adx": adx_val},
+                        )
                         continue
                     if adx_val > 40.0:
                         before = confidence
                         confidence = min(1.0, confidence * 1.2)
-                        print(f"[ADX] Boosted confidence {before:.3f} → {confidence:.3f} " "(strong trend)")
-                    print(f"[ADX DEBUG] {pair}: ADX={adx_val:.2f}, " f"adjusted confidence={confidence:.3f}")
+                        logger.info(
+                            "ADX strong trend adjustment",
+                            extra={"pair": pair, "confidence_before": before, "confidence_after": confidence},
+                        )
+                    logger.info(
+                        "ADX summary",
+                        extra={"pair": pair, "adx": adx_val, "confidence": confidence},
+                    )
 
                 if confidence < 0.4:
                     skipped_low_conf += 1
-                    print(f"⚠️ Skipping {pair} — Confidence too low: {confidence:.3f}")
+                    logger.info(
+                        "Skipping candidate due to low confidence",
+                        extra={"pair": pair, "confidence": confidence},
+                    )
                     continue
                 if volume is None or volume < MIN_VOLUME:
-                    print(f"[{pair}] Skipping due to low volume: {volume}")
+                    logger.info("Skipping candidate due to low volume", extra={"pair": pair, "volume": volume})
                     continue
-                print(f"📊 Volume for {pair}: {volume}")
+                logger.info(
+                    "Candidate volume snapshot",
+                    extra={"pair": pair, "volume": volume, "confidence": confidence},
+                )
                 signals_count += 1
                 if signal == "buy":
                     buy_count += 1
@@ -1683,7 +1760,7 @@ def evaluate_signals_and_trade(
                 committed_capital = _committed_notional(proposed_trades)
                 remaining_capital = max(total_capital - committed_capital, 0.0)
                 if remaining_capital <= 0:
-                    print("⚠️ Capital exhausted for new positions; stopping scans.")
+                    logger.warning("Capital exhausted for new positions; stopping scans")
                     break
 
                 min_sz, max_sz = _resolve_trade_size_bounds(pair)
@@ -1704,7 +1781,10 @@ def evaluate_signals_and_trade(
                 )
 
                 if adjusted_size <= 0:
-                    print(f"⚠️ Skipping {pair} — Not enough capital for minimum position size")
+                    logger.warning(
+                        "Skipping due to insufficient capital for minimum position size",
+                        extra={"pair": pair},
+                    )
                     continue
 
                 limited_size, limit_context = _apply_deploy_phase_limits(
@@ -1713,7 +1793,10 @@ def evaluate_signals_and_trade(
                     float(current_price),
                 )
                 if limited_size <= 0:
-                    print(f"[canary] Skipping {pair} — trade size reduced to zero by canary limits.")
+                    logger.info(
+                        "Trade size reduced to zero by canary limits; skipping",
+                        extra={"pair": pair},
+                    )
                     continue
                 if limited_size != adjusted_size:
                     adjusted_size = limited_size
@@ -1735,8 +1818,8 @@ def evaluate_signals_and_trade(
                 proposed_trades.append(trade_data)
                 total_risk = calculate_total_risk(proposed_trades)
                 if total_risk > MAX_PORTFOLIO_RISK:
-                    msg = f"⚠️ Skipping trade for {asset} — Portfolio risk " f"({total_risk:.2%}) exceeds cap"
-                    print(msg)
+                    msg = f"Skipping trade for {asset} — portfolio risk ({total_risk:.2%}) exceeds cap"
+                    logger.warning(msg)
                     proposed_trades.pop()
                     continue
 
@@ -1801,14 +1884,16 @@ def evaluate_signals_and_trade(
                             f.flush()
                             os.fsync(f.fileno())
                     if skip_due_to_corr:
-                        print(f"[RISK] Skipping {asset} due to high correlation")
+                        logger.info(
+                            "Skipping asset due to correlation threshold",
+                            extra={"asset": asset, "last_corr": last_row.get("corr") if corr_rows else None},
+                        )
                         proposed_trades.pop()
                         continue
                 except (ImportError, ValueError, TypeError, KeyError, IndexError) as e:
-                    print(f"[RISK] Correlation check error for {asset}: {e}")
+                    logger.error("Correlation check error", extra={"asset": asset, "error": str(e)})
 
-                print("✅ Trades to execute:")
-                print(trade_data)
+                logger.info("Proposed trade details", extra=trade_data)
 
                 trade_side = signal
                 start_latency = time.perf_counter()
@@ -1823,7 +1908,7 @@ def evaluate_signals_and_trade(
                 live_latency = time.perf_counter() - start_latency if is_live else None
 
                 if is_live and not submitted_live:
-                    print(f"🚫 Live trade suppressed for {pair} — toggle is_live=False")
+                    logger.warning("Live trade suppressed; running in paper mode", extra={"pair": pair})
                     continue
 
                 if not is_live:
@@ -1840,13 +1925,16 @@ def evaluate_signals_and_trade(
                 # Daily trade limit check (re-evaluate per attempt)
                 if current_daily_cap > 0:
                     today_count = _today_trade_count()
-                    print(f"[LIMIT] Today trade count: {today_count} / {current_daily_cap}")
+                    logger.debug(
+                        "Daily trade count check",
+                        extra={"count": today_count, "limit": current_daily_cap},
+                    )
                     if today_count >= current_daily_cap:
-                        print("[LIMIT] Daily trade limit reached — skipping new trade")
+                        logger.info("Daily trade limit reached during loop; skipping new trade")
                         continue
 
                 trade_id = str(uuid.uuid4())
-                print(f"[DEBUG] Using trade_id for both log_trade and open_position: {trade_id}")
+                logger.debug("Generated trade identifier", extra={"trade_id": trade_id})
 
                 entry_raw = safe_prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
@@ -1863,13 +1951,14 @@ def evaluate_signals_and_trade(
                     rsi=rsi_val,
                     adx=adx_val,
                 )
-                time.sleep(1)
                 # Use the exact entry_price and timestamp
                 # as written by the ledger (after slippage & rounding)
-                logged_trade = next(
-                    (t for t in ledger.trades if t.get("trade_id") == trade_id),
-                    None,
-                )
+                logged_trade = ledger.trade_index.get(trade_id)
+                if logged_trade is None:
+                    logged_trade = next(
+                        (t for t in ledger.trades if t.get("trade_id") == trade_id),
+                        None,
+                    )
                 logged_price = logged_trade.get("entry_price") if logged_trade else None
                 logged_ts = logged_trade.get("timestamp") if logged_trade else None
                 if logged_price is None:
@@ -1887,11 +1976,18 @@ def evaluate_signals_and_trade(
                     timestamp=logged_ts,
                 )
                 executed_trades += 1
-                print(f"🧠 Confidence Score: {confidence}")
+                logger.debug("Trade confidence score", extra={"trade_id": trade_id, "confidence": confidence})
                 # Print confirmation only when a valid trade record exists and size > 0
                 if adjusted_size > 0 and logged_trade:
-                    print(f"📝 Logged trade: {pair} | Size: {adjusted_size}")
-                    print(f"📝 Strategy: {strategy_name}")
+                    logger.info(
+                        "Trade logged",
+                        extra={
+                            "trade_id": trade_id,
+                            "pair": pair,
+                            "size": adjusted_size,
+                            "strategy": strategy_name,
+                        },
+                    )
 
                 trade_summary_context = {
                     "trade_id": trade_id,
@@ -1921,25 +2017,37 @@ def evaluate_signals_and_trade(
                 )
 
                 # Summary per asset
-                print(
-                    f"[SUMMARY] {asset}: signals={signals_count} "
-                    + f"(buy={buy_count}, sell={sell_count}), "
-                    + f"skipped_none={skipped_none}, "
-                    + f"skipped_low_conf={skipped_low_conf}"
+                logger.debug(
+                    "Asset evaluation summary",
+                    extra={
+                        "asset": asset,
+                        "signals": signals_count,
+                        "buy_signals": buy_count,
+                        "sell_signals": sell_count,
+                        "skipped_none": skipped_none,
+                        "skipped_low_conf": skipped_low_conf,
+                    },
                 )
             except Exception as e:  # pylint: disable=broad-exception-caught
-                print(f"[ERROR] Exception while evaluating {pair}: {e}")
+                logger.exception("Exception while evaluating pair", extra={"pair": pair, "error": str(e)})
 
     if executed_trades == 0:
         logger.info("No executable signals produced this cycle; no trades submitted.")
-        print("ℹ️ No executable signals produced this cycle; no trades submitted.")
     # Exit evaluation now relies solely on observed market prices; no synthetic injections.
     exits = position_manager.check_exits(current_prices)
     for trade_id, exit_price, reason in exits:
         trade_position = position_manager.positions.get(trade_id)
         if reason == "TAKE_PROFIT" and trade_position:
             current_prices[trade_position["pair"]] = exit_price  # Apply immediately
-        print(f"🚪 Closing trade {trade_id} at {exit_price:.4f}: {reason}")
+        logger.info(
+            "Closing trade",
+            extra={
+                "trade_id": trade_id,
+                "pair": (trade_position or {}).get("pair"),
+                "exit_price": exit_price,
+                "reason": reason,
+            },
+        )
         ledger.update_trade(
             trade_id=trade_id,
             exit_price=exit_price,
@@ -1989,8 +2097,12 @@ def evaluate_signals_and_trade(
         with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
             f.flush()
             os.fsync(f.fileno())  # Sync after update
+        try:
+            refresh_portfolio_state()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception("Failed to refresh portfolio state after closing trade %s: %s", trade_id, exc)
     if not exits:
-        print("ℹ️ No exit conditions triggered.")
+        logger.info("No exit conditions triggered.")
 
     # Shadow test result logging
     shadow_path = "logs/shadow_test_results.jsonl"
@@ -2060,7 +2172,7 @@ def gather_signals(prices, volumes, ctx=None, **kwargs):
                 # clamp to valid range (some impls need <= n-1)
                 period = max(2, min(int(period), max(2, n - 1)))
                 if calculate_rsi is None:
-                    print("⚠️ RSI calculator unavailable — skipping RSI computation.")
+                    logger.warning("RSI calculator unavailable — skipping RSI computation.")
                 else:
                     try:
                         val = calculate_rsi(prices, period)  # type: ignore[misc]
@@ -2121,7 +2233,7 @@ def risk_screen(signals, ctx=None, **kwargs) -> bool:
             equity = getattr(portfolio, "equity", None)
 
             if equity is None or equity == 0:
-                print("⚠️ Equity missing or zero — skipping trade.")
+                logger.warning("Portfolio equity missing or zero — skipping trade.")
                 return False
 
             equity = float(equity)

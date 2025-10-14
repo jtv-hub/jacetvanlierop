@@ -43,9 +43,9 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "risk",
-                "suggestion": ("Improve risk-adjusted returns by optimizing stop losses " "or trade exits."),
+                "suggestion": "Improve risk-adjusted returns by refining stop losses or exits.",
                 "confidence": 0.6,
-                "reason": (f"Sharpe low ({sharpe:.2f}) while Sortino acceptable " f"({sortino:.2f})."),
+                "reason": f"Sharpe low ({sharpe:.2f}) while Sortino acceptable ({sortino:.2f}).",
             }
         )
 
@@ -54,7 +54,7 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "risk",
-                "suggestion": ("Introduce stricter drawdown limits or reduce position sizing " "in volatile regimes."),
+                "suggestion": "Tighten drawdown limits or cut position size in volatile regimes.",
                 "confidence": 0.8,
                 "reason": f"Max drawdown high ({drawdown:.1f}).",
             }
@@ -65,9 +65,9 @@ def generate_suggestions(report: Dict) -> List[Dict]:
         suggestions.append(
             {
                 "category": "capital_allocation",
-                "suggestion": ("Consider increasing capital allocation for strategies " "in trending regimes."),
+                "suggestion": "Consider increasing capital for strategies in trending regimes.",
                 "confidence": 0.85,
-                "reason": (f"Strong ROI ({roi:.2f}%) with solid win rate " f"({win_rate:.2f})."),
+                "reason": f"Strong ROI ({roi:.2f}%) with solid win rate ({win_rate:.2f}).",
             }
         )
 

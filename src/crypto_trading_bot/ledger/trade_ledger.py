@@ -5,6 +5,8 @@ Encapsulates trade lifecycle logging, ROI updates, schema validation,
 and trade syncing using a class-based approach.
 """
 
+# pylint: disable=too-many-lines
+
 import fcntl
 import json
 import logging
@@ -701,9 +703,10 @@ class TradeLedger:
                             trade_id,
                         )
                     else:
+                        reason_text = reason or exit_reason or "n/a"
                         message = (
-                            f"Trade ID {trade_id} not found in memory or trades.log — skipping update "
-                            f"(exit_price={exit_price}, reason={reason or exit_reason or 'n/a'})"
+                            f"Trade ID {trade_id} not found in memory or trades.log — "
+                            f"skipping update (exit_price={exit_price}, reason={reason_text})"
                         )
                         pos = self.position_manager.positions.get(trade_id)
                         pair = (pos or {}).get("pair")

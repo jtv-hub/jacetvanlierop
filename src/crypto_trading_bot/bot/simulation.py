@@ -54,7 +54,9 @@ def collect_signal_snapshot(pairs: List[str]) -> List[Dict[str, object]]:
         adx_val = context.get_adx(pair, prices)
         volume_estimate = max(min_volume, min_volume)
 
-        strategies = trading_logic.get_strategy_pipeline(per_asset_params)
+        strategies = trading_logic._build_strategy_pipeline(  # pylint: disable=protected-access
+            per_asset_params=per_asset_params,
+        )
 
         signal_entries: List[Dict[str, object]] = []
         for strategy in strategies:

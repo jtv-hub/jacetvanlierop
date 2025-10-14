@@ -4,19 +4,13 @@ simple_rsi_strategies.py
 Implements the SimpleRSIStrategy class using RSI thresholds.
 """
 
-import logging
 import math
 from typing import List
 
 from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
-logger = logging.getLogger("SimpleRSIStrategy")
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    handler = logging.FileHandler("logs/full_debug.log")
-    formatter = logging.Formatter(r"\[%(levelname)s\] %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+logger = get_system_logger().getChild("strategies.simple_rsi")
 
 
 class SimpleRSIStrategy:
@@ -56,7 +50,10 @@ class SimpleRSIStrategy:
             bool: True if the volume is sufficient, False otherwise.
         """
         if volume is None or volume < min_volume:
-            print(f"[DEBUG] Low volume: {volume} < {min_volume}")
+            logger.debug(
+                "Volume below minimum threshold",
+                extra={"volume": volume, "min_volume": min_volume},
+            )
             return False
         return True
 
@@ -77,54 +74,69 @@ class SimpleRSIStrategy:
         Returns:
             dict: A dictionary containing the signal type and confidence level.
         """
+        base_period = self.period
+        base_lower = self.lower
+        base_upper = self.upper
+
         # Filter 1: Price validity and sufficiency
         if not prices:
-            logger.debug("[RSI DEBUG] Exit: prices is empty")
+            logger.debug("RSI evaluation skipped: no price history available")
             return {"signal": None, "confidence": 0.0}
-        if len(prices) < max(self.period + 1, 5):
-            logger.debug("[RSI DEBUG] Exit: not enough prices (len=%s)", len(prices))
+        if len(prices) < max(base_period + 1, 5):
+            logger.debug(
+                "RSI evaluation skipped: insufficient price history",
+                extra={"history_length": len(prices)},
+            )
             return {"signal": None, "confidence": 0.0}
         if any(p is None or p <= 0 for p in prices):
-            logger.debug("[RSI DEBUG] Exit: invalid price found")
+            logger.debug("RSI evaluation skipped: invalid price detected")
             return {"signal": None, "confidence": 0.0}
 
         # Filter 2: Volume check
         if not self.validate_volume(volume):
             return {"signal": None, "confidence": 0.0}
 
+        period = base_period
+        lower = base_lower
+        upper = base_upper
+
         # Apply per-asset params if provided
         if asset and asset in self.per_asset:
             cfg = self.per_asset[asset]
-            self.period = int(cfg.get("period", self.period))
-            self.lower = float(cfg.get("lower", self.lower))
-            self.upper = float(cfg.get("upper", self.upper))
+            try:
+                period = int(cfg.get("period", period))
+            except (TypeError, ValueError):
+                period = base_period
+            try:
+                lower = float(cfg.get("lower", lower))
+            except (TypeError, ValueError):
+                lower = base_lower
+            try:
+                upper = float(cfg.get("upper", upper))
+            except (TypeError, ValueError):
+                upper = base_upper
 
-        rsi = calculate_rsi(prices, self.period)
-        # Explicit RSI debug prints per asset
-        if rsi is not None:
-            print(f"[RSI DEBUG] {asset}: RSI={rsi}")
-        else:
-            print(f"[RSI DEBUG] {asset}: RSI is None")
-        # Format RSI value safely without broad exception
-        try:
-            rsi_num = float(rsi) if rsi is not None else None
-        except (TypeError, ValueError):
-            rsi_num = None
-        rsi_str = f"{rsi_num:.2f}" if rsi_num is not None else str(rsi)
-        logger.debug(
-            "[RSI DEBUG] %s RSI=%s price=%s volume=%s",
-            asset,
-            rsi_str,
-            prices[-1],
-            volume,
-        )
-        print(f"[DEBUG] Thresholds: oversold={self.lower}, overbought={self.upper}")
+        period = max(2, period)
+
+        rsi = calculate_rsi(prices, period)
 
         # Fallback if RSI missing/invalid
         try:
             rsi_val = float(rsi) if rsi is not None else None
         except (TypeError, ValueError):
             rsi_val = None
+        logger.info(
+            "RSI evaluation",
+            extra={
+                "asset": asset,
+                "price": prices[-1],
+                "volume": volume,
+                "oversold": lower,
+                "overbought": upper,
+                "period": period,
+                "rsi": rsi_val,
+            },
+        )
 
         if rsi_val is None:
             return {"signal": None, "confidence": 0.0}
@@ -132,8 +144,8 @@ class SimpleRSIStrategy:
         # Nonlinear confidence centered at RSI midpoint (50)
         # Tunable curve: logistic with center at d0 (distance=20 -> ~0.5),
         # and steepness k. We zero confidence inside a neutral band [45,55].
-        oversold = float(min(self.lower, self.upper))
-        overbought = float(max(self.lower, self.upper))
+        oversold = float(min(lower, upper))
+        overbought = float(max(lower, upper))
         d = abs(rsi_val - 50.0)
         if d <= 5.0:
             conf_nl = 0.0
@@ -153,8 +165,10 @@ class SimpleRSIStrategy:
             asset_label = asset or ""
             # Weak trend: skip trades
             if adx < 20:
-                print(f"[SKIP] {asset_label}: ADX too weak ({adx})")
-                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence=0.0")
+                logger.info(
+                    "ADX below threshold; skipping trade",
+                    extra={"asset": asset_label, "adx": adx, "rsi": rsi_val},
+                )
                 return {
                     "signal": None,
                     "side": None,
@@ -164,9 +178,25 @@ class SimpleRSIStrategy:
             # Strong trend: boost confidence
             if adx > 40:
                 baseline_conf = min(1.0, baseline_conf * 1.2)
-                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence={baseline_conf}")
+                logger.info(
+                    "ADX strong trend adjustment applied",
+                    extra={
+                        "asset": asset_label,
+                        "adx": adx,
+                        "confidence": baseline_conf,
+                        "rsi": rsi_val,
+                    },
+                )
             else:
-                print(f"[ADX DEBUG] {asset_label}: ADX={adx}, adjusted confidence={baseline_conf}")
+                logger.info(
+                    "ADX neutral adjustment",
+                    extra={
+                        "asset": asset_label,
+                        "adx": adx,
+                        "confidence": baseline_conf,
+                        "rsi": rsi_val,
+                    },
+                )
 
         # Signals: still trigger at thresholds, but confidence uses nonlinear curve
         def _scaled_conf(score: float) -> float:
@@ -175,6 +205,16 @@ class SimpleRSIStrategy:
         final_conf = _scaled_conf(baseline_conf)
 
         if rsi_val < oversold and baseline_conf > 0.0:
+            logger.info(
+                "RSI buy signal triggered",
+                extra={
+                    "asset": asset,
+                    "rsi": rsi_val,
+                    "confidence": final_conf,
+                    "oversold": oversold,
+                    "period": period,
+                },
+            )
             return {
                 "signal": "buy",
                 "side": "buy",
@@ -183,6 +223,16 @@ class SimpleRSIStrategy:
                 "raw_confidence": round(baseline_conf, 4),
             }
         if rsi_val > overbought and baseline_conf > 0.0:
+            logger.info(
+                "RSI sell signal triggered",
+                extra={
+                    "asset": asset,
+                    "rsi": rsi_val,
+                    "confidence": final_conf,
+                    "overbought": overbought,
+                    "period": period,
+                },
+            )
             return {
                 "signal": "sell",
                 "side": "sell",
@@ -190,4 +240,14 @@ class SimpleRSIStrategy:
                 "confidence": final_conf,
                 "raw_confidence": round(baseline_conf, 4),
             }
+        logger.info(
+            "RSI hold condition",
+            extra={
+                "asset": asset,
+                "rsi": rsi_val,
+                "confidence": baseline_conf,
+                "oversold": oversold,
+                "overbought": overbought,
+            },
+        )
         return {"signal": None, "side": None, "strategy": "SimpleRSIStrategy", "confidence": 0.0}

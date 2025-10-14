@@ -17,7 +17,11 @@ os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger("shadow_test_runner")
 logger.setLevel(logging.INFO)
 
-handler = RotatingFileHandler("logs/shadow_test_runner.log", maxBytes=50 * 1024 * 1024, backupCount=3)  # 50 MB
+handler = RotatingFileHandler(
+    "logs/shadow_test_runner.log",
+    maxBytes=50 * 1024 * 1024,
+    backupCount=3,
+)  # 50 MB
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 
@@ -39,7 +43,7 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
         with open(input_file, "w", encoding="utf-8"):
             pass
         logger.info(
-            "Created empty suggestions file at %s. " "Please run review_learning_ledger.py to add suggestions.",
+            "Created empty suggestions file (%s). Run review_learning_ledger.py to populate it.",
             input_file,
         )
         return
@@ -106,7 +110,7 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
                 else "Met confidence threshold"
             )
             logger.info(
-                "Suggestion %s: %s (confidence=%.2f threshold=%.2f avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
+                "Suggestion %s: %s (confidence=%.2f threshold=%.2f " "avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
                 suggestion.get("suggestion", "unknown"),
                 status,
                 confidence,
@@ -133,7 +137,11 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
             }
             results.append(result)
             strategy_key = result["strategy_name"]
-            stats = strategy_stats.get(strategy_key) or {"passes": 0.0, "fails": 0.0, "confidence_sum": 0.0}
+            stats = strategy_stats.get(strategy_key) or {
+                "passes": 0.0,
+                "fails": 0.0,
+                "confidence_sum": 0.0,
+            }
             if status == "pass":
                 stats["passes"] += 1.0
             else:

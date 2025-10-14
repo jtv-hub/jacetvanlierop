@@ -21,9 +21,9 @@ from typing import Dict, List, Tuple
 try:
     # Testing-only utility; used here as a last-resort fallback when
     # seeded history is unavailable and we need sufficient candles to proceed.
-    from .mock_data_utils import generate_mock_data  # type: ignore
-except Exception:  # pragma: no cover - optional import
-    generate_mock_data = None  # type: ignore
+    from .mock_data_utils import generate_mock_data as _generate_mock_data  # type: ignore
+except ImportError:  # pragma: no cover - optional import
+    _generate_mock_data = None  # type: ignore
 
 from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import CONFIG, is_live
@@ -64,7 +64,7 @@ def get_fallback_metrics(reset: bool = False) -> Dict[str, Dict[str, int] | floa
     """Return fallback usage counters (optionally resetting them)."""
 
     snapshot = {
-        "mock": dict(_fallback_metrics.get("mock", {})) if isinstance(_fallback_metrics.get("mock"), dict) else {},
+        "mock": (dict(_fallback_metrics.get("mock", {})) if isinstance(_fallback_metrics.get("mock"), dict) else {}),
         "live_block": (
             dict(_fallback_metrics.get("live_block", {}))
             if isinstance(_fallback_metrics.get("live_block"), dict)
@@ -114,7 +114,7 @@ def _attempt_live_history(pair: str, min_len: int) -> List[Tuple[str, float]]:
     for attempt in range(_LIVE_HISTORY_ATTEMPTS):
         try:
             rows = get_ohlc_data(pair, interval=1, limit=target)
-        except Exception as exc:  # pragma: no cover - network dependent
+        except Exception as exc:  # pragma: no cover - network dependent  # pylint: disable=broad-exception-caught
             logger.warning(
                 "Live history fetch attempt %d/%d failed for %s: %s",
                 attempt + 1,
@@ -238,7 +238,7 @@ def get_history_prices(pair: str, min_len: int = 14) -> List[float]:
 
     if len(valid_prices) < req and live_real_mode:
         _record_fallback_event("live_block", pair.upper())
-        message = f"Live trading blocked for {pair}: insufficient candles (need {req}, have {len(valid_prices)})."
+        message = f"Live trading blocked for {pair}: insufficient candles " f"(need {req}, have {len(valid_prices)})."
         context = {"pair": pair, "required": req, "available": len(valid_prices)}
         send_alert(message, context=context, level="CRITICAL")
         logger.critical(message)
@@ -246,14 +246,14 @@ def get_history_prices(pair: str, min_len: int = 14) -> List[float]:
 
     if len(valid_prices) < 15:
         print(f"[ERROR] Insufficient candles fetched for {pair}: only {len(valid_prices)}")
-        if generate_mock_data is not None:
+        if _generate_mock_data is not None:
             print(f"[MOCK DATA] Using mock prices for {pair} due to fetch failure")
             _record_fallback_event("mock", pair.upper())
             mock_pair = pair.replace("/", "-")
             try:
-                snap = generate_mock_data(mock_pair)
+                snap = _generate_mock_data(mock_pair)
                 base_price = float(snap.get("price", 100.0))
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 base_price = 100.0
             steps = max(req, 30)
             px = base_price

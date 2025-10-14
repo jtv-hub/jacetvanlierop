@@ -402,7 +402,9 @@ def test_submit_live_trade_boundary_executes(monkeypatch):
     captured_payload = {}
 
     def fake_place_order(pair, side, size, price, **kwargs):  # pylint: disable=unused-argument
-        captured_payload.update({"pair": pair, "side": side, "size": size, "price": price, **kwargs})
+        payload = {"pair": pair, "side": side, "size": size, "price": price}
+        payload.update(kwargs)
+        captured_payload.update(payload)
         return {"ok": True, "code": "ok", "txid": ["test"], "descr": "buy"}
 
     monkeypatch.setattr(trading_logic, "kraken_place_order", fake_place_order)

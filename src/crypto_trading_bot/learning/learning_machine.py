@@ -18,10 +18,13 @@ import math
 import os
 from typing import Dict, List
 
-import numpy as np
+try:
+    import numpy as np  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    np = None  # type: ignore[assignment]
 
-from ..bot.utils.log_rotation import get_rotating_handler
-from ..risk.risk_manager import get_dynamic_buffer
+from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)
@@ -128,29 +131,64 @@ def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
             "sortino_ratio": 0.0,
         }
 
-    rois = np.array([float(trade["roi"]) for trade in trades], dtype=float)
-    wins = int(np.sum(rois > 0))
-    losses = int(np.sum(rois <= 0))
+    roi_values = [float(trade["roi"]) for trade in trades]
+    wins = sum(1 for roi in roi_values if roi > 0)
+    losses = total_trades - wins
     win_rate = float(wins) / float(total_trades)
-    print(f"[LEARN] Win rate calculated from {wins} wins out of {total_trades} valid trades")
+    logger.info(
+        "Learning cycle win rate computed",
+        extra={"wins": wins, "losses": losses, "total_trades": total_trades, "win_rate": win_rate},
+    )
 
-    avg_roi = float(np.mean(rois))
-    cumulative_return = float(np.prod(1 + rois) - 1)
+    if np is not None:
+        rois = np.array(roi_values, dtype=float)
+        avg_roi = float(np.mean(rois))
+        cumulative_return = float(np.prod(1 + rois) - 1)
 
-    # Sharpe ratio (risk-adjusted return)
-    std = float(np.std(rois))
-    sharpe_ratio = float(np.mean(rois) / std) if std > 0 else 0.0
+        std = float(np.std(rois))
+        sharpe_ratio = float(np.mean(rois) / std) if std > 0 else 0.0
 
-    # Sortino ratio (downside deviation)
-    downside = rois[rois < 0]
-    dd = float(np.std(downside)) if downside.size > 0 else 0.0
-    sortino_ratio = float(np.mean(rois) / dd) if dd > 0 else 0.0
+        downside = rois[rois < 0]
+        dd = float(np.std(downside)) if downside.size > 0 else 0.0
+        sortino_ratio = float(np.mean(rois) / dd) if dd > 0 else 0.0
 
-    # Max drawdown on equity curve of (1+roi)
-    cumulative = np.cumprod(1 + rois)
-    running_max = np.maximum.accumulate(cumulative)
-    drawdowns = (cumulative - running_max) / running_max
-    max_drawdown = float(np.min(drawdowns)) if drawdowns.size > 0 else 0.0
+        cumulative = np.cumprod(1 + rois)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdowns = (cumulative - running_max) / running_max
+        max_drawdown = float(np.min(drawdowns)) if drawdowns.size > 0 else 0.0
+    else:
+        avg_roi = sum(roi_values) / float(total_trades)
+
+        cumulative_product = 1.0
+        for roi in roi_values:
+            cumulative_product *= 1 + roi
+        cumulative_return = cumulative_product - 1.0
+
+        if total_trades > 1:
+            variance = sum((roi - avg_roi) ** 2 for roi in roi_values) / float(total_trades)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        sharpe_ratio = avg_roi / std if std > 0 else 0.0
+
+        downside_values = [roi for roi in roi_values if roi < 0]
+        if downside_values:
+            variance_downside = sum(roi**2 for roi in downside_values) / float(len(downside_values))
+            dd = math.sqrt(variance_downside)
+        else:
+            dd = 0.0
+        sortino_ratio = avg_roi / dd if dd > 0 else 0.0
+
+        running_balance = 1.0
+        running_max = 1.0
+        max_drawdown = 0.0
+        for roi in roi_values:
+            running_balance *= 1 + roi
+            running_max = max(running_max, running_balance)
+            if running_max > 0:
+                drawdown = (running_balance - running_max) / running_max
+                if drawdown < max_drawdown:
+                    max_drawdown = drawdown
 
     return {
         "total_trades": int(total_trades),
@@ -241,7 +279,6 @@ def _evaluate_shadow_promotions(
                 f"[Promotion] Strategy '{strategy}' reached promotion threshold "
                 f"(runs={total_runs}, success_rate={average_success:.2%})."
             )
-            print(msg)
             logger.info(msg)
             promotion_records.append(
                 {
@@ -261,7 +298,6 @@ def _evaluate_shadow_promotions(
                 f"[Promotion] Strategy '{strategy}' qualifies as a promotion candidate "
                 f"(runs={total_runs}, success_rate={average_success:.2%})."
             )
-            print(msg)
             logger.info(msg)
             promotion_record = {
                 "timestamp": timestamp,
@@ -331,7 +367,6 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
         f"({len(valid_conf)} with valid confidence, {n_conf_not_half} != 0.5). "
         f"Strategies={strategies_considered}: {by_strategy}"
     )
-    print(summary_line)
     logger.info(summary_line)
     if recent_samples:
         for line in recent_samples:
@@ -374,7 +409,6 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             f"[LearningMachine] No suggestions generated — reason='{reason}', "
             f"total_trades={total_trades}, strategies={strategies_considered}"
         )
-        print(msg)
         logger.info(msg)
         return 0
 
@@ -412,8 +446,6 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             f.write(json.dumps(rec, separators=(",", ":")) + "\n")
             wrote += 1
 
-            # Inline debug for each suggestion with full record echo
-            print(f"[LearningMachine] Writing suggestion #{wrote}: {rec}")
             log_msg = "".join(
                 [
                     "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s ",
@@ -468,7 +500,12 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                         "confidence": conf_val,
                     }
                     sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                    print(f"[SHADOW TEST] {strat} -> {success_rate*100:.2f}%, ROI={avg_roi:.2f}")
+                    logger.info(
+                        "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f",
+                        strat,
+                        success_rate * 100,
+                        avg_roi,
+                    )
     except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Shadow test logging skipped: %s", _e)
 
@@ -516,7 +553,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             with open(output_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
             opt_msg = f"[OPTIMIZER] Suggested confidence={best_conf:.4f} " f"with Sharpe={best_score:.4f}"
-            print(opt_msg)
+            logger.info(opt_msg)
     except (ImportError, ValueError, TypeError) as _e:  # pragma: no cover - optional dep fallback
         logger.info("Bayesian optimizer unavailable or failed: %s", _e)
 
@@ -563,13 +600,12 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
                             with open(output_path, "a", encoding="utf-8") as f:
                                 f.write(json.dumps(applied, separators=(",", ":")) + "\n")
                             apply_msg = f"[LEARNING APPLY] {sname} updated with " f"confidence={float(latest_conf):.3f}"
-                            print(apply_msg)
+                            logger.info(apply_msg)
     except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Auto-apply skipped: %s", _e)
     _evaluate_shadow_promotions(output_path=output_path, timestamp=ts)
 
     logger.info("Wrote %s suggestion(s) to %s", wrote, output_path)
-    print(f"[LearningMachine] Wrote {wrote} suggestion(s) to {output_path}")
     return wrote
 
 
@@ -577,12 +613,15 @@ def _debug_main() -> None:  # pragma: no cover
     """Run a single learning cycle and emit suggestions for manual inspection."""
 
     result = run_learning_cycle()
-    print("📊 Learning Machine Metrics:", result)
+    logger.info("Learning Machine metrics", extra={"metrics": result})
     try:
         suggestions_written = run_learning_machine()
-        print(f"✍️  Wrote {suggestions_written} suggestion(s) to logs/learning_feedback.jsonl")
+        logger.info(
+            "Suggestions written via debug run",
+            extra={"count": suggestions_written},
+        )
     except (OSError, RuntimeError, ValueError) as exc:  # safety for ad-hoc runs
-        print(f"⚠️ Failed to write suggestions: {exc}")
+        logger.error("Failed to write suggestions in debug mode", extra={"error": str(exc)})
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -36,6 +36,7 @@ from crypto_trading_bot.scripts.suggest_top_configs import (
     generate_parameter_suggestions,
 )
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
 # Constants for task intervals in seconds
 TRADE_INTERVAL = 5 * 60  # Every 5 minutes
@@ -45,6 +46,7 @@ ANOMALY_AUDIT_INTERVAL = 6 * 60 * 60  # 6 hours in seconds
 ALERTS_LOG_PATH = "logs/alerts.log"
 
 anomalies_logger = get_anomalies_logger()
+logger = get_system_logger().getChild("scheduler")
 
 
 def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
@@ -68,7 +70,7 @@ def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
 def run_anomaly_audit() -> bool:
     """Run audit with cleanup of closed positions; return True if final state passes."""
     if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-        print("ℹ️ Skipping anomaly audit — live mode disabled.")
+        logger.info("Skipping anomaly audit — live mode disabled.")
         return True
     try:
         result = audit_run_and_cleanup("logs/trades.log", "logs/positions.jsonl")
@@ -76,9 +78,15 @@ def run_anomaly_audit() -> bool:
         removed = result.get("removed", 0)
         final_errors = result.get("final_errors", 0)
         if final_errors > 0:
-            print("⚠️ Audit still failing after cleanup:")
-            for err in result.get("errors", []):
-                print(f" - {err}")
+            logger.warning(
+                "Audit still failing after cleanup",
+                extra={
+                    "initial_errors": initial_errors,
+                    "removed": removed,
+                    "final_errors": final_errors,
+                    "errors": result.get("errors", []),
+                },
+            )
             send_alert(
                 "Anomaly audit failed after cleanup",
                 context={
@@ -90,13 +98,11 @@ def run_anomaly_audit() -> bool:
             )
             return False
         else:
-            msg = (
-                "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, " "final_errors=0"
-            )
-            print(msg)
+            msg = "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, final_errors=0"
+            logger.info("Audit cleanup complete", extra={"message": msg})
             return True
     except (OSError, IOError, ValueError, KeyError, RuntimeError) as e:
-        print(f"[Scheduler] run_anomaly_audit failed: {e}")
+        logger.error("run_anomaly_audit failed", extra={"error": str(e)})
         send_alert("run_anomaly_audit failed", context={"error": str(e)})
         return False
 
@@ -144,26 +150,32 @@ def update_shadow_test_results():
 def run_daily_pipeline() -> None:
     """Run all daily tasks: heartbeat, optimization, shadow testing, learning."""
     if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-        print("ℹ️ Skipping daily pipeline — live mode disabled.")
+        logger.info("Skipping daily pipeline — live mode disabled.")
         return
     state = refresh_portfolio_state()
     available = float(state.get("available_capital", 0.0) or 0.0)
-    print("🧹 Rotating logs before running daily tasks...")
-    print(f"💰 Portfolio available capital: ${available:,.2f}")
-    print("\n🌅 Running daily heartbeat tasks...")
+    logger.info("Rotating logs before running daily tasks")
+    logger.info("Portfolio available capital", extra={"available_capital": available})
+    logger.info("Running daily heartbeat tasks")
     run_daily_tasks()
 
-    print("🧠 Running shadow optimization suggestions...")
+    logger.info("Running shadow optimization suggestions")
     top_configs = detect_outliers(min_trades=25, top_n=3)
     if top_configs:
         suggestions = generate_parameter_suggestions(top_configs)
         export_suggestions(suggestions)
-        print("✅ Optimization suggestions complete.")
+        logger.info(
+            "Optimization suggestions complete",
+            extra={"suggestion_count": len(suggestions)},
+        )
 
-        print("🧪 Running shadow test evaluation...")
+        logger.info("Running shadow test evaluation")
         try:
             run_shadow_tests(output_file="logs/shadow_test_results.jsonl")
-            print("📄 Shadow test results saved to logs/shadow_test_results.jsonl.")
+            logger.info(
+                "Shadow test results saved",
+                extra={"path": "logs/shadow_test_results.jsonl"},
+            )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             error_payload = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -173,14 +185,14 @@ def run_daily_pipeline() -> None:
                 "error": str(exc),
             }
             anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-            print(f"[Scheduler] run_shadow_tests failed: {exc}")
+            logger.error("run_shadow_tests failed during daily pipeline", extra={"error": str(exc)})
     else:
-        print("⚠️ No top configurations found for suggestion. Skipping shadow tests.")
+        logger.warning("No top configurations found for suggestion; skipping shadow tests.")
 
     # Emit learning suggestions for dashboard consumption
     try:
         wrote = run_learning_machine()
-        print(f"✍️  Learning suggestions written: {wrote}")
+        logger.info("Learning suggestions written", extra={"count": wrote})
     except Exception as exc:  # pylint: disable=broad-exception-caught
         error_payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -190,17 +202,20 @@ def run_daily_pipeline() -> None:
             "error": str(exc),
         }
         anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-        print(f"[Scheduler] run_learning_machine failed: {exc}")
+        logger.error("run_learning_machine failed during daily pipeline", extra={"error": str(exc)})
 
     metrics = run_learning_cycle()
-    print("📊 Learning Summary:", metrics)
+    logger.info("Learning summary", extra={"metrics": metrics})
 
     # Confidence threshold analysis (append-only diagnostics; no prod effect)
     try:
         n_rows = run_shadow_confidence_test()
-        print(f"📐 Confidence threshold analysis appended {n_rows} row(s).")
+        logger.info(
+            "Confidence threshold analysis appended rows",
+            extra={"rows_appended": n_rows},
+        )
     except Exception as e:  # pylint: disable=broad-exception-caught
-        print(f"[Scheduler] run_shadow_confidence_test failed: {e}")
+        logger.error("run_shadow_confidence_test failed", extra={"error": str(e)})
 
 
 def should_run_daily(last_run_time):
@@ -222,12 +237,12 @@ def should_run_anomaly_audit(last_audit_time):
 
 def run_scheduler():
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
-    print("📅 Scheduler started. Running bot tasks...")
+    logger.info("Scheduler started; running bot tasks")
     if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-        print("⚠️ Live mode disabled in configuration — scheduler will not start.")
+        logger.warning("Live mode disabled in configuration — scheduler will not start.")
         return
     mode_label = get_mode_label()
-    print(f"🛰️  Operating mode: {mode_label} (is_live={is_live})")
+    logger.info("Operating mode resolved", extra={"mode": mode_label, "is_live": is_live})
 
     get_rotating_handler("trades.log")
     get_rotating_handler("anomalies.log")
@@ -240,14 +255,21 @@ def run_scheduler():
 
     if buffer_pct > 0.25:
         adjusted_risk = 0.02 * 0.5
-        print(f"🛡️ Buffer high ({round(buffer_pct * 100)}%), " f"risk ↓ to {adjusted_risk * 100:.1f}%")
+        logger.info(
+            "Capital buffer high; reducing risk",
+            extra={"buffer_pct": buffer_pct, "adjusted_risk": adjusted_risk},
+        )
     elif buffer_pct > 0.10:
         adjusted_risk = 0.02 * 0.75
-        buffer_msg = f"⚠️ Buffer elevated ({round(buffer_pct * 100)}%), " f"risk ↓ to {adjusted_risk * 100:.1f}%"
-        print(buffer_msg)
+        logger.info(
+            "Capital buffer elevated; adjusting risk",
+            extra={"buffer_pct": buffer_pct, "adjusted_risk": adjusted_risk},
+        )
     else:
-        print(f"✅ Capital buffer low ({round(buffer_pct * 100)}%)")
-        print("Using full risk allocation")
+        logger.info(
+            "Capital buffer low; using full risk allocation",
+            extra={"buffer_pct": buffer_pct},
+        )
 
     last_daily_run = None
     last_audit_run = None
@@ -258,7 +280,7 @@ def run_scheduler():
     try:
         wrote_boot = run_learning_machine()
         if wrote_boot:
-            print(f"✍️  Boot suggestions written: {wrote_boot}")
+            logger.info("Boot suggestions written", extra={"count": wrote_boot})
     except Exception as exc:  # pylint: disable=broad-exception-caught
         error_payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -268,12 +290,12 @@ def run_scheduler():
             "error": str(exc),
         }
         anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-        print(f"[Scheduler] Initial run_learning_machine failed: {exc}")
+        logger.error("Initial run_learning_machine failed", extra={"error": str(exc)})
 
     while True:
         try:
             if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-                print("⏸️  Live mode disabled — scheduler idle.")
+                logger.info("Live mode disabled — scheduler idle.")
                 time.sleep(TRADE_INTERVAL)
                 continue
 
@@ -286,9 +308,9 @@ def run_scheduler():
             reinvestment_rate = float(portfolio_state.get("reinvestment_rate", 0.0))
 
             if available_capital <= 0:
-                print("⚠️ Available capital is non-positive — skipping trade evaluation.")
+                logger.warning("Available capital is non-positive — skipping trade evaluation.")
             else:
-                print("\n⏱️ Evaluating trades...")
+                logger.info("Evaluating trades")
                 evaluate_signals_and_trade(
                     tradable_pairs=CONFIG.get("tradable_pairs", []),
                     available_capital=available_capital,
@@ -296,7 +318,7 @@ def run_scheduler():
                     reinvestment_rate=reinvestment_rate,
                 )
 
-            print("🔁 Checking exit conditions...")
+            logger.info("Checking exit conditions")
             run_exit_checks()
 
             # Run sync validation each cycle after exits
@@ -304,17 +326,18 @@ def run_scheduler():
                 validator = SyncValidator()
                 ok = validator.validate_sync()
                 if not ok:
-                    print("⚠️ Sync validation issues detected:")
-                    for err in validator.validation_errors:
-                        print(f" - {err}")
+                    logger.warning(
+                        "Sync validation issues detected",
+                        extra={"errors": list(validator.validation_errors)},
+                    )
                 else:
-                    print("✅ Sync validation passed.")
+                    logger.info("Sync validation passed")
             except (ValueError, RuntimeError, OSError) as e:
-                print(f"[Scheduler] SyncValidator failed: {e}")
+                logger.error("SyncValidator failed", extra={"error": str(e)})
 
             # Run anomaly audit every 6 hours
             if should_run_anomaly_audit(last_audit_run):
-                print("🧹 Running anomaly audit...")
+                logger.info("Running anomaly audit")
                 ok = run_anomaly_audit()
                 last_audit_run = datetime.now(timezone.utc)
                 if not ok:
@@ -332,7 +355,7 @@ def run_scheduler():
             time.sleep(TRADE_INTERVAL)
 
         except KeyboardInterrupt:
-            print("🛑 Scheduler stopped by user.")
+            logger.info("Scheduler stopped by user.")
             break
         except ConfigurationError as error:
             try:
@@ -347,12 +370,18 @@ def run_scheduler():
                         separators=(",", ":"),
                     )
                 )
-            except Exception:  # pragma: no cover - defensive JSON/logging errors
+            except (TypeError, ValueError, OSError):  # pragma: no cover
                 pass
-            print(f"❌ Scheduler configuration error: {error}")
+            logger.error("Scheduler configuration error", extra={"error": str(error)})
             raise
-        except (ValueError, RuntimeError, OSError) as error:
-            print(f"❌ Scheduler error: {error}")
+        except ValueError as error:
+            logger.error("Scheduler value error", extra={"error": str(error)})
+            traceback.print_exc()
+        except RuntimeError as error:
+            logger.error("Scheduler runtime error", extra={"error": str(error)})
+            traceback.print_exc()
+        except OSError as error:
+            logger.error("Scheduler OS error", extra={"error": str(error)})
             traceback.print_exc()
 
 

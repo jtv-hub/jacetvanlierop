@@ -613,7 +613,11 @@ def _fallback_pair_meta(pair: str) -> Dict[str, Any]:
         "lot_decimals": max(lot_decimals, 0),
         "source": "fallback",
     }
-    logger.warning("Using fallback Kraken metadata for %s: %s", pair, payload)
+    logger.warning(
+        "Using fallback Kraken metadata for %s: %s",
+        pair,
+        payload,
+    )
     return payload
 
 

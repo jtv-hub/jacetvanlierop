@@ -15,14 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from .constants import (
-    DEFAULT_AUTO_PAUSE_MAX_CONSEC_LOSSES,
-    DEFAULT_AUTO_PAUSE_MAX_DRAWDOWN,
-    DEFAULT_AUTO_PAUSE_TOTAL_ROI,
-    DEFAULT_CANARY_MAX_FRACTION,
-    DEFAULT_RISK_DRAWDOWN_THRESHOLD,
-    DEFAULT_RISK_FAILURE_LIMIT,
-)
+from crypto_trading_bot.utils.secrets_manager import SecretNotFound, get_secret
 
 try:  # pragma: no cover - optional dependency
     from dotenv import dotenv_values
@@ -33,7 +26,14 @@ except ImportError:  # pragma: no cover - fallback when python-dotenv unavailabl
         return {}
 
 
-from crypto_trading_bot.utils.secrets_manager import SecretNotFound, get_secret
+from .constants import (
+    DEFAULT_AUTO_PAUSE_MAX_CONSEC_LOSSES,
+    DEFAULT_AUTO_PAUSE_MAX_DRAWDOWN,
+    DEFAULT_AUTO_PAUSE_TOTAL_ROI,
+    DEFAULT_CANARY_MAX_FRACTION,
+    DEFAULT_RISK_DRAWDOWN_THRESHOLD,
+    DEFAULT_RISK_FAILURE_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ class ConfigurationError(RuntimeError):
 
 
 try:  # pragma: no cover - handled in tests via monkeypatch
-    from crypto_trading_bot.utils import kraken_client as _kraken_client
+    from crypto_trading_bot.utils import kraken_client as _kraken_client  # pylint: disable=ungrouped-imports
 except ImportError:  # pragma: no cover - optional dependency
     _kraken_client = None
 
@@ -391,7 +391,7 @@ def _ensure_env_credentials() -> None:
             )
 
     if not api_key or not api_secret:
-        logger.error("Kraken API credentials are missing: ensure " "KRAKEN_API_KEY and KRAKEN_API_SECRET are set.")
+        logger.error("Kraken API credentials missing: set KRAKEN_API_KEY and KRAKEN_API_SECRET.")
         CONFIG.setdefault("kraken_api_key", api_key or "")
         CONFIG.setdefault("kraken_api_secret", api_secret or "")
         return
@@ -426,7 +426,7 @@ def _validate_credentials() -> Tuple[str, str]:
     if missing:
         message = "Kraken credential(s) missing: " + ", ".join(missing)
         logger.error(
-            "%s. Checked environment variables, credential files, secrets manager, and CONFIG fallback.",
+            "%s. Checked environment variables, credential files, secrets manager, " "and CONFIG fallback.",
             message,
         )
         raise ConfigurationError(message)
@@ -473,8 +473,8 @@ def _validate_credentials() -> Tuple[str, str]:
         logger.warning("Kraken API secret length unexpected: %d", len(secret_sanitized))
 
     logger.debug(
-        "Kraken credentials validated | key_prefix=%s key_length=%d secret_prefix=%s secret_length=%d "
-        "key_source=%s secret_source=%s",
+        "Kraken credentials validated | key_prefix=%s key_length=%d secret_prefix=%s "
+        "secret_length=%d key_source=%s secret_source=%s",
         key_preview,
         len(key),
         secret_preview,
