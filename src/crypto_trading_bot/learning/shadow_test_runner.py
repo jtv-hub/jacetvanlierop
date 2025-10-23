@@ -109,8 +109,14 @@ def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESU
                 if status == "fail"
                 else "Met confidence threshold"
             )
+            summary_template = " ".join(
+                [
+                    "Suggestion %s: %s (confidence=%.2f threshold=%.2f",
+                    "avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
+                ]
+            )
             logger.info(
-                "Suggestion %s: %s (confidence=%.2f threshold=%.2f " "avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
+                summary_template,
                 suggestion.get("suggestion", "unknown"),
                 status,
                 confidence,

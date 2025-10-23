@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -28,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from crypto_trading_bot.config import IS_LIVE
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.utils.kraken_api import kraken_client
 from crypto_trading_bot.utils.kraken_client import KrakenAPIError
 from crypto_trading_bot.utils.kraken_pairs import PAIR_MAP, ensure_usdc_pair
@@ -39,11 +42,42 @@ DAEMON_ARCHIVE_DIR = Path("logs/archive")
 DAEMON_RETENTION_HOURS = 48
 DAEMON_CRITICAL_WINDOW_HOURS = 24
 TRADES_TO_CONSIDER = 200  # limit reconciliation to the most recent trades
-TIME_TOLERANCE_SECONDS = 30 * 60  # tolerate +/- 30 minutes between entries
-VOLUME_TOLERANCE = 1e-6  # absolute volume tolerance for matching
+try:
+    _TIME_TOLERANCE_RAW = float(os.getenv("RECONCILIATION_TIME_TOLERANCE_SECONDS", "5"))
+except (TypeError, ValueError):
+    _TIME_TOLERANCE_RAW = 5.0
+TIME_TOLERANCE_SECONDS = max(0, int(round(_TIME_TOLERANCE_RAW)))
+VOLUME_TOLERANCE = float(os.getenv("RECONCILIATION_VOLUME_TOLERANCE", "0.0001"))
 SWITCH_ENV_VAR = "USDC_SWITCH_TIMESTAMP"
+BALANCE_TOLERANCE = float(os.getenv("KRAKEN_BALANCE_TOLERANCE", "0.01"))
+RECONCILIATION_GRACE_SECONDS = int(os.getenv("RECONCILIATION_GRACE_SECONDS", "60"))
+LEGACY_MISMATCH_HOURS = float(os.getenv("RECONCILIATION_LEGACY_HOURS", "24"))
+RECONCILE_IMPORT_ENABLED = os.getenv("RECONCILE_IMPORT_ENABLED", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 REVERSE_PAIR_MAP = {v: k for k, v in PAIR_MAP.items()}
+
+
+def _truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DRY_RUN_MODE = _truthy(os.getenv("FINAL_AUDIT_DRY_RUN"))
+IGNORE_UNMATCHED_PAPER_TRADES = _truthy(os.getenv("AUDIT_IGNORE_UNMATCHED_PAPER_TRADES", "1"))
+
+logger = logging.getLogger(__name__)
+
+
+class _LedgerPositionStub:
+    """Minimal stub to satisfy TradeLedger's position manager dependency."""
+
+    def __init__(self) -> None:
+        self.positions: Dict[str, Any] = {}
 
 
 def _extract_daemon_timestamp(line: str) -> Optional[datetime]:
@@ -208,6 +242,11 @@ class LogTrade:
     normalized_pair: str
     size: float
     side: str
+    txids: List[str]
+    reconciled: bool
+    pending_reconciliation: bool
+    pending_reconciliation_at: Optional[datetime]
+    source: str
     raw: Dict[str, Any]
 
 
@@ -222,6 +261,30 @@ class KrakenTrade:
     volume: float
     side: str
     raw: Dict[str, Any]
+
+
+def _describe_log_trade(trade: LogTrade) -> Dict[str, Any]:
+    return {
+        "trade_id": trade.trade_id,
+        "timestamp": trade.timestamp.isoformat(),
+        "pair": trade.pair,
+        "normalized_pair": trade.normalized_pair,
+        "size": trade.size,
+        "side": trade.side,
+        "txids": trade.txids,
+        "source": trade.source,
+    }
+
+
+def _describe_kraken_trade(trade: KrakenTrade) -> Dict[str, Any]:
+    return {
+        "txid": trade.txid,
+        "timestamp": trade.timestamp.isoformat(),
+        "pair": trade.pair,
+        "normalized_pair": trade.normalized_pair,
+        "volume": trade.volume,
+        "side": trade.side,
+    }
 
 
 def _parse_iso(ts: str | None) -> Optional[datetime]:
@@ -247,6 +310,155 @@ def _kraken_time(value: Any) -> Optional[datetime]:
     return None
 
 
+def _analyse_log_mismatch(
+    trade: LogTrade,
+    kraken_trades: Iterable[KrakenTrade],
+    *,
+    time_tolerance: int,
+    volume_tolerance: float,
+) -> Dict[str, Any]:
+    """Return structured diagnostics describing why ``trade`` failed to match."""
+
+    time_tolerance_seconds = max(0, int(time_tolerance))
+    context: Dict[str, Any] = {
+        "candidate_count": 0,
+        "finite_candidate_count": 0,
+        "time_tolerance_seconds": time_tolerance_seconds,
+        "volume_tolerance": volume_tolerance,
+        "effective_volume_tolerance": None,
+        "best_volume_gap": None,
+        "closest_timestamp_delta": None,
+        "log_side": trade.side,
+        "candidate_sides": [],
+        "reason": "unclassified_mismatch",
+    }
+
+    candidates = [kt for kt in kraken_trades if kt.normalized_pair == trade.normalized_pair]
+    context["candidate_count"] = len(candidates)
+    if not candidates:
+        context["reason"] = "no_remote_trades_for_pair"
+        return context
+
+    finite_candidates = [kt for kt in candidates if math.isfinite(kt.volume)]
+    context["finite_candidate_count"] = len(finite_candidates)
+    if not finite_candidates:
+        context["reason"] = "remote_volume_missing"
+        return context
+
+    effective_volume_tolerance = max(volume_tolerance, 0.001 * trade.size)
+    context["effective_volume_tolerance"] = effective_volume_tolerance
+
+    volume_gaps = [abs(kt.volume - trade.size) for kt in finite_candidates]
+    if volume_gaps:
+        best_volume_gap = min(volume_gaps)
+        context["best_volume_gap"] = best_volume_gap
+        if best_volume_gap > effective_volume_tolerance:
+            context["reason"] = f"volume_gap>{effective_volume_tolerance:.6f}"
+            return context
+
+    candidate_sides = {_kraken_side_to_position(kt.side) for kt in finite_candidates}
+    context["candidate_sides"] = sorted(candidate_sides)
+    if trade.side in {"long", "short"} and trade.side not in candidate_sides:
+        context["reason"] = "side_mismatch"
+        return context
+
+    deltas = [abs((kt.timestamp - trade.timestamp).total_seconds()) for kt in finite_candidates]
+    if deltas:
+        best_delta = min(deltas)
+        context["closest_timestamp_delta"] = best_delta
+        if best_delta > time_tolerance_seconds:
+            context["reason"] = f"timestamp_delta>{time_tolerance_seconds}s (min={best_delta:.1f}s)"
+            return context
+
+    return context
+
+
+def _diagnose_log_mismatch(
+    trade: LogTrade,
+    kraken_trades: Iterable[KrakenTrade],
+    *,
+    time_tolerance: int,
+    volume_tolerance: float,
+) -> str:
+    result = _analyse_log_mismatch(
+        trade,
+        kraken_trades,
+        time_tolerance=time_tolerance,
+        volume_tolerance=volume_tolerance,
+    )
+    return result.get("reason", "unclassified_mismatch")
+
+
+def _candidate_summaries(
+    log_trade: LogTrade,
+    kraken_trades: Iterable[KrakenTrade],
+    limit: int = 3,
+) -> list[Dict[str, Any]]:
+    candidates: list[tuple[float, KrakenTrade]] = []
+    for remote in kraken_trades:
+        if remote.normalized_pair != log_trade.normalized_pair:
+            continue
+        if not math.isfinite(remote.volume):
+            continue
+        delta = abs((remote.timestamp - log_trade.timestamp).total_seconds())
+        candidates.append((delta, remote))
+    candidates.sort(key=lambda item: item[0])
+    summaries: list[Dict[str, Any]] = []
+    for _, remote in candidates[:limit]:
+        entry = _describe_kraken_trade(remote)
+        entry["position_side"] = _kraken_side_to_position(remote.side)
+        summaries.append(entry)
+    return summaries
+
+
+def _log_unmatched_trades(
+    missing_logs: Iterable[LogTrade],
+    missing_kraken: Iterable[KrakenTrade],
+    kraken_trades: Iterable[KrakenTrade],
+    *,
+    time_tolerance: int,
+    volume_tolerance: float,
+) -> None:
+    missing_logs_list = list(missing_logs)
+    missing_kraken_list = list(missing_kraken)
+
+    if missing_logs_list:
+        logger.warning("Unmatched local trades detected: %d", len(missing_logs_list))
+    for log_trade in missing_logs_list:
+        analysis = _analyse_log_mismatch(
+            log_trade,
+            kraken_trades,
+            time_tolerance=time_tolerance,
+            volume_tolerance=volume_tolerance,
+        )
+        candidates = _candidate_summaries(log_trade, kraken_trades)
+        context = {
+            "trade": _describe_log_trade(log_trade),
+            "analysis": analysis,
+            "candidate_matches": candidates,
+        }
+        logger.warning("Unmatched local trade | %s", json.dumps(context, default=str))
+
+    if missing_kraken_list:
+        logger.warning("Unmatched Kraken trades detected: %d", len(missing_kraken_list))
+    for remote in missing_kraken_list:
+        context = {"trade": _describe_kraken_trade(remote)}
+        logger.warning("Unmatched Kraken trade | %s", json.dumps(context, default=str))
+
+
+def _partition_legacy_unmatched(log_trades: Iterable[LogTrade]) -> tuple[list[LogTrade], list[LogTrade]]:
+    legacy: list[LogTrade] = []
+    active: list[LogTrade] = []
+    now = datetime.now(timezone.utc)
+    for trade in log_trades:
+        age_hours = max(0.0, (now - trade.timestamp).total_seconds() / 3600)
+        if age_hours >= LEGACY_MISMATCH_HOURS:
+            legacy.append(trade)
+        else:
+            active.append(trade)
+    return legacy, active
+
+
 def _cleanup_asset(code: str) -> str:
     """Normalize Kraken asset codes (strip prefixes, harmonise aliases)."""
 
@@ -258,6 +470,42 @@ def _cleanup_asset(code: str) -> str:
     while token.startswith(("X", "Z")) and len(token) > 1:
         token = token[1:]
     return token
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_trade_ledger() -> TradeLedger:
+    """Instantiate a TradeLedger bound to the default log paths."""
+
+    return TradeLedger(_LedgerPositionStub())
+
+
+def balance_difference_within_tolerance(
+    kraken_balances: Dict[str, float],
+    internal_state: Dict[str, Any],
+    tolerance: float,
+) -> Tuple[Optional[float], bool]:
+    """Return balance delta (Kraken - internal) and whether it fits tolerance."""
+
+    if not kraken_balances or not internal_state:
+        return None, True
+
+    internal_usdc = _safe_float(internal_state.get("available_capital")) or 0.0
+    kraken_usdc = (
+        _safe_float(kraken_balances.get("USDC"))
+        or _safe_float(kraken_balances.get("USD"))
+        or _safe_float(kraken_balances.get("ZUSD"))
+    )
+    if kraken_usdc is None:
+        return None, True
+
+    diff = kraken_usdc - internal_usdc
+    return diff, abs(diff) <= tolerance
 
 
 def kraken_pair_to_human(raw_pair: str | None) -> str:
@@ -332,13 +580,31 @@ def load_log_trades(
             normalized_pair = to_usdc_pair(pair)
         except ValueError:
             normalized_pair = pair
+        raw_txid = item.get("txid")
+        if isinstance(raw_txid, list):
+            txids = [str(val) for val in raw_txid if val]
+        elif isinstance(raw_txid, str) and raw_txid:
+            txids = [raw_txid]
+        else:
+            txids = []
+        reconciled_flag = bool(item.get("reconciled", False))
+        pending_flag = bool(item.get("pending_reconciliation", False))
+        source_flag = item.get("source", "local")
+        pending_at_raw = item.get("pending_reconciliation_at")
+        pending_at = _parse_iso(pending_at_raw) if pending_at_raw else None
+
         log_trade = LogTrade(
             trade_id=str(item.get("trade_id") or ""),
             timestamp=ts,
             pair=pair,
             normalized_pair=normalized_pair,
             size=float(size),
-            side=(item.get("side") or "").lower(),
+            side=_normalize_log_side(item.get("side")),
+            txids=txids,
+            reconciled=reconciled_flag,
+            pending_reconciliation=pending_flag,
+            pending_reconciliation_at=pending_at,
+            source=source_flag,
             raw=item,
         )
         quote = normalized_pair.split("/", 1)[-1] if "/" in normalized_pair else ""
@@ -405,6 +671,26 @@ def load_kraken_balance() -> Tuple[Dict[str, float], Dict[str, Any]]:
     return normalized, payload
 
 
+def _kraken_side_to_position(side: str) -> str:
+    side_normalized = (side or "").strip().lower()
+    if side_normalized == "sell":
+        return "short"
+    if side_normalized == "buy":
+        return "long"
+    return side_normalized or "unknown"
+
+
+def _normalize_log_side(side: Any) -> str:
+    """Normalize local trade side labels to ``long``/``short``."""
+
+    value = (str(side) if side is not None else "").strip().lower()
+    if value in {"long", "buy"}:
+        return "long"
+    if value in {"short", "sell"}:
+        return "short"
+    return value
+
+
 def match_trades(
     log_trades: Iterable[LogTrade],
     kraken_trades: Iterable[KrakenTrade],
@@ -419,24 +705,41 @@ def match_trades(
     matches: List[Tuple[LogTrade, KrakenTrade, float]] = []
     log_missing: List[LogTrade] = []
 
+    txid_lookup: Dict[str, int] = {trade.txid: idx for idx, trade in enumerate(kraken_pool)}
+
     for log_trade in log_trades:
         best_idx: Optional[int] = None
         best_delta: float = float("inf")
-        for idx, candidate in enumerate(kraken_pool):
-            if idx in matched_indices:
-                continue
-            if candidate.normalized_pair != log_trade.normalized_pair:
-                continue
-            if not math.isfinite(candidate.volume):
-                continue
-            volume_gap = abs(candidate.volume - log_trade.size)
-            tolerance = max(volume_tolerance, 0.001 * log_trade.size)
-            if volume_gap > tolerance:
-                continue
-            delta = abs((candidate.timestamp - log_trade.timestamp).total_seconds())
-            if delta <= time_tolerance and delta < best_delta:
+
+        # Prefer matching by txid when available.
+        for tx in log_trade.txids:
+            idx = txid_lookup.get(tx)
+            if idx is not None and idx not in matched_indices:
                 best_idx = idx
-                best_delta = delta
+                best_delta = 0.0
+                break
+
+        if best_idx is None:
+            for idx, candidate in enumerate(kraken_pool):
+                if idx in matched_indices:
+                    continue
+                if candidate.normalized_pair != log_trade.normalized_pair:
+                    continue
+                if not math.isfinite(candidate.volume):
+                    continue
+                volume_gap = abs(candidate.volume - log_trade.size)
+                tolerance = max(volume_tolerance, 0.001 * log_trade.size)
+                if volume_gap > tolerance:
+                    continue
+                candidate_side = _kraken_side_to_position(candidate.side)
+                if log_trade.side and log_trade.side in {"long", "short"}:
+                    if candidate_side and candidate_side != log_trade.side:
+                        continue
+                delta = abs((candidate.timestamp - log_trade.timestamp).total_seconds())
+                if delta <= time_tolerance and delta < best_delta:
+                    best_idx = idx
+                    best_delta = delta
+
         if best_idx is not None:
             matched_indices.add(best_idx)
             matches.append((log_trade, kraken_pool[best_idx], best_delta))
@@ -445,6 +748,100 @@ def match_trades(
 
     kraken_missing = [trade for idx, trade in enumerate(kraken_pool) if idx not in matched_indices]
     return matches, log_missing, kraken_missing
+
+
+def reconcile_trades(
+    *,
+    matches: Iterable[Tuple[LogTrade, KrakenTrade, float]],
+    missing_log_trades: Iterable[LogTrade],
+    missing_kraken_trades: Iterable[KrakenTrade],
+    ledger: TradeLedger,
+    grace_seconds: int = RECONCILIATION_GRACE_SECONDS,
+) -> Dict[str, Any]:
+    """Import missing Kraken trades and mark unmatched log trades as pending."""
+
+    imported = 0
+    pending_ids: List[str] = []
+    reconciled_ids: List[str] = []
+
+    now = datetime.now(timezone.utc)
+
+    for log_trade, _kraken_trade, _ in matches:
+        ledger.mark_reconciled(log_trade.trade_id)
+        reconciled_ids.append(log_trade.trade_id)
+
+    for log_trade in missing_log_trades:
+        age = (now - log_trade.timestamp).total_seconds()
+        already_pending = log_trade.pending_reconciliation
+        if not already_pending:
+            already_pending = log_trade.pending_reconciliation_at is not None
+        if age >= grace_seconds and not already_pending:
+            ledger.mark_pending_reconciliation(log_trade.trade_id, pending=True, timestamp=now)
+            pending_ids.append(log_trade.trade_id)
+
+    for kraken_trade in missing_kraken_trades:
+        if ledger.find_trade_by_txid(kraken_trade.txid):
+            continue
+
+        if not RECONCILE_IMPORT_ENABLED:
+            continue
+
+        raw = kraken_trade.raw
+        cost_val = _safe_float(raw.get("cost"))
+        fee_val = _safe_float(raw.get("fee")) or 0.0
+        price = _safe_float(raw.get("price")) or _safe_float(raw.get("avg_price"))
+        if price is None and cost_val is not None and kraken_trade.volume:
+            price = cost_val / max(kraken_trade.volume, 1e-12)
+        if price is None or price <= 0:
+            price = 1.0
+        if cost_val is None:
+            cost_val = abs(price * kraken_trade.volume)
+
+        gross = abs(cost_val)
+        if kraken_trade.side == "sell":
+            net_amount = gross - abs(fee_val)
+        else:
+            net_amount = -(gross + abs(fee_val))
+
+        fills = [
+            {
+                "price": price,
+                "quantity": kraken_trade.volume,
+                "cost": gross,
+                "fee": abs(fee_val),
+                "type": raw.get("type") or kraken_trade.side,
+                "time": kraken_trade.timestamp.isoformat(),
+            }
+        ]
+
+        trade_id = raw.get("ordertxid") or f"kraken-{kraken_trade.txid}"
+        ledger.log_trade(
+            trading_pair=kraken_trade.pair,
+            trade_size=kraken_trade.volume,
+            strategy_name="ReconciliationImport",
+            trade_id=trade_id,
+            confidence=1.0,
+            entry_price=price or 0.0,
+            txid=[kraken_trade.txid],
+            fills=fills,
+            gross_amount=gross,
+            fee=abs(fee_val),
+            net_amount=net_amount,
+            balance_delta=net_amount,
+            reconciled=True,
+            pending_reconciliation=False,
+            source="kraken_import",
+        )
+        ledger.mark_reconciled(trade_id)
+        imported += 1
+
+    return {
+        "kraken_trades_imported": imported,
+        "log_trades_marked_pending": len(pending_ids),
+        "pending_trade_ids": pending_ids,
+        "reconciled_trade_ids": reconciled_ids,
+        "import_enabled": RECONCILE_IMPORT_ENABLED,
+    }
 
 
 def load_internal_portfolio_state() -> Dict[str, Any]:
@@ -525,7 +922,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    report: Dict[str, Any] = {}
+    report: Dict[str, Any] = {"warnings": []}
 
     switch_time = resolve_switch_time(args.switch_time)
     report["switch_timestamp"] = switch_time.isoformat() if switch_time else None
@@ -558,6 +955,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         report["kraken_balances"] = {}
         report["kraken_balance_error"] = balance_result.get("error")
 
+    ledger = load_trade_ledger()
+
     matches: List[Tuple[LogTrade, KrakenTrade, float]] = []
     missing_logs: List[LogTrade] = []
     missing_kraken: List[KrakenTrade] = []
@@ -565,8 +964,76 @@ def main(argv: Optional[List[str]] = None) -> None:
         matches, missing_logs, missing_kraken = match_trades(log_trades, kraken_trades)
 
     report["matched_trades"] = len(matches)
+    legacy_unmatched: list[LogTrade] = []
+    active_unmatched: list[LogTrade] = []
+    if missing_logs:
+        legacy_unmatched, active_unmatched = _partition_legacy_unmatched(missing_logs)
+    missing_logs = active_unmatched
+
+    report["legacy_unmatched_log_trades"] = len(legacy_unmatched)
+    if legacy_unmatched:
+        report["legacy_unmatched_details"] = [_describe_log_trade(trade) for trade in legacy_unmatched]
+
     report["unmatched_log_trades"] = len(missing_logs) if kraken_trades else len(log_trades)
     report["unmatched_kraken_trades"] = len(missing_kraken)
+    ignore_unmatched_logs = IGNORE_UNMATCHED_PAPER_TRADES and (DRY_RUN_MODE or not IS_LIVE)
+
+    if missing_logs or missing_kraken:
+        _log_unmatched_trades(
+            missing_logs,
+            missing_kraken,
+            kraken_trades,
+            time_tolerance=TIME_TOLERANCE_SECONDS,
+            volume_tolerance=VOLUME_TOLERANCE,
+        )
+        unmatched_details: list[Dict[str, Any]] = []
+        for log_trade in missing_logs:
+            analysis = _analyse_log_mismatch(
+                log_trade,
+                kraken_trades,
+                time_tolerance=TIME_TOLERANCE_SECONDS,
+                volume_tolerance=VOLUME_TOLERANCE,
+            )
+            entry = _describe_log_trade(log_trade)
+            entry["reason"] = analysis.get("reason", "unclassified_mismatch")
+            entry["analysis"] = analysis
+            unmatched_details.append(entry)
+        report["unmatched_log_details"] = unmatched_details
+        report["unmatched_kraken_details"] = [_describe_kraken_trade(remote) for remote in missing_kraken]
+
+    if missing_logs:
+        mode_label = "dry-run" if DRY_RUN_MODE else ("paper" if not IS_LIVE else "live")
+        trade_summary = {
+            "type": "unmatched_log_trades",
+            "count": len(missing_logs),
+            "ignored": bool(ignore_unmatched_logs),
+            "mode": mode_label,
+            "trade_ids": [trade.trade_id for trade in missing_logs if trade.trade_id],
+        }
+        report.setdefault("warnings_json", []).append(trade_summary)
+        report["unmatched_log_warning_summary"] = trade_summary
+        if ignore_unmatched_logs:
+            structured_message = f"Unmatched paper trades ignored ({mode_label} mode)"
+            logger.warning("%s | %s", structured_message, json.dumps(trade_summary, default=str))
+            report["warnings"].append(structured_message)
+
+    reconciliation_details: Dict[str, Any] = {}
+    if matches or missing_logs or missing_kraken:
+        reconciliation_details = reconcile_trades(
+            matches=matches,
+            missing_log_trades=missing_logs,
+            missing_kraken_trades=missing_kraken,
+            ledger=ledger,
+        )
+        report.update(reconciliation_details)
+        if reconciliation_details.get("log_trades_marked_pending"):
+            report["warnings"].append(
+                f"Marked {reconciliation_details['log_trades_marked_pending']} trade(s) pending reconciliation."
+            )
+        if reconciliation_details.get("kraken_trades_imported"):
+            report["warnings"].append(
+                f"Imported {reconciliation_details['kraken_trades_imported']} trade(s) from Kraken history."
+            )
 
     if matches:
         avg_time_delta = sum(delta for *_, delta in matches) / len(matches)
@@ -576,6 +1043,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     if missing_kraken:
         report["kraken_unmatched_samples"] = [trade.raw for trade in missing_kraken[:5]]
 
+    if reconciliation_details:
+        pending_count = reconciliation_details.get("log_trades_marked_pending", 0)
+        imported_count = reconciliation_details.get("kraken_trades_imported", 0)
+        if pending_count or imported_count:
+            report["reconciliation_status"] = "warning" if IS_LIVE else "error"
+        else:
+            report["reconciliation_status"] = "ok"
+    else:
+        report["reconciliation_status"] = "ok"
+
     if kraken_trades:
         quote_counts = Counter(trade.pair.split("/")[-1] for trade in kraken_trades)
         report["kraken_quote_usage"] = dict(quote_counts)
@@ -583,13 +1060,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     internal_state = load_internal_portfolio_state()
     report["internal_portfolio_state"] = internal_state
 
-    balance_difference: Optional[float] = None
-    if balances and internal_state:
-        internal_usdc = float(internal_state.get("available_capital") or 0.0)
-        kraken_usdc = balances.get("USDC") or balances.get("USD") or balances.get("ZUSD")
-        if kraken_usdc is not None:
-            balance_difference = kraken_usdc - internal_usdc
+    balance_difference, within_tol = balance_difference_within_tolerance(
+        balances,
+        internal_state,
+        BALANCE_TOLERANCE,
+    )
     report["balance_difference"] = balance_difference
+    report["balance_within_tolerance"] = within_tol
+    if balance_difference is not None and not within_tol:
+        report["warnings"].append(f"Balance difference {balance_difference:.2f} exceeds ±{BALANCE_TOLERANCE:.2f} USD.")
 
     logs_inspection = inspect_daemon_logs()
     report["daemon_log_inspection"] = logs_inspection
@@ -605,12 +1084,23 @@ def main(argv: Optional[List[str]] = None) -> None:
         f"Unmatched Kraken trades: {report['unmatched_kraken_trades']}",
     ]
     if balance_difference is not None:
-        summary_lines.append(f"Balance difference (Kraken - internal): {balance_difference:.6f}")
+        status = "within" if within_tol else "exceeds"
+        summary_lines.append(
+            f"Balance difference (Kraken - internal): {balance_difference:.6f} ({status} ±{BALANCE_TOLERANCE:.2f})"
+        )
     else:
         summary_lines.append("Balance difference (Kraken - internal): n/a")
     if report["usd_pair_violations"]:
         violations = report["usd_pair_violations"]
         summary_lines.append(f"USD pair violations after switch: {violations}")
+    if reconciliation_details.get("kraken_trades_imported"):
+        summary_lines.append(
+            f"Imported {reconciliation_details['kraken_trades_imported']} trade(s) from Kraken history."
+        )
+    if reconciliation_details.get("log_trades_marked_pending"):
+        summary_lines.append(f"Pending reconciliation trades: {reconciliation_details['log_trades_marked_pending']}")
+    if report["warnings"]:
+        summary_lines.append("Warnings: " + "; ".join(report["warnings"]))
     print("\n".join(summary_lines))
 
     print()

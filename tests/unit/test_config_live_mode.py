@@ -44,3 +44,15 @@ def test_set_live_mode_allows_non_withdraw_key(monkeypatch):
     assert config.is_live is True
 
     config.set_live_mode(False)
+
+
+def test_load_tradable_pairs_accepts_zusd(monkeypatch):
+    monkeypatch.setenv("CRYPTO_TRADING_BOT_PAIRS", "BTC/USDC")
+    monkeypatch.setattr(
+        config,
+        "_kraken_pair_meta",
+        lambda _pair: {"quote": "", "altname": "XXBTZUSD"},
+    )
+
+    pairs = config._load_tradable_pairs()
+    assert "BTC/USDC" in pairs

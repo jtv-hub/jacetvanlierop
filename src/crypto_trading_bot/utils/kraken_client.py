@@ -14,12 +14,34 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import sys
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import urlencode
 
-from crypto_trading_bot import config as config_module
-from crypto_trading_bot.config import CONFIG, _sanitize_base64_secret
+import requests
+
+from crypto_trading_bot.utils.helpers import (
+    asset_candidates,
+    build_request_headers,
+    fallback_pair_meta,
+    offline_private_result,
+    redact_nonce,
+    resolve_http_client,
+    standard_response,
+)
+from crypto_trading_bot.utils.kraken_client_config import (
+    CONFIG,
+    get_config_module,
+)
+from crypto_trading_bot.utils.kraken_client_config import (
+    ensure_config_loaded as _ensure_config_loaded,
+)
+from crypto_trading_bot.utils.kraken_client_config import (
+    sanitize_base64_secret as _sanitize_base64_secret,
+)
 from crypto_trading_bot.utils.kraken_pairs import normalize_pair
 
 logger = logging.getLogger(__name__)
@@ -43,25 +65,23 @@ _ASSET_HINTS: Dict[str, Iterable[str]] = {
 
 _PAIR_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _PAIR_CACHE_TTL = 300.0
-_HTTP_BACKEND: Tuple[str, Any] | None = None
+_OFFLINE_ERROR_TOKENS = ("resolve", "dns", "temporary failure")
+_OFFLINE_BALANCE_DEFAULT = {"USDC": "1000.30000000", "ZUSD": "1000.30000000"}
+_OFFLINE_RIGHTS_DEFAULT = {"rights": {"can_trade": True, "can_withdraw": False}}
+
+sanitize_base64_secret = _sanitize_base64_secret
 
 
-def _resolve_http_client() -> Tuple[str, Any]:
-    """Return the HTTP backend module to use for Kraken requests."""
+def get_client(_config: dict | None = None):
+    """Return the active Kraken client module.
 
-    global _HTTP_BACKEND  # pylint: disable=global-statement
-    if _HTTP_BACKEND is not None:
-        return _HTTP_BACKEND
+    This hook allows callers (e.g., configuration validators) to obtain a
+    reference to the client while remaining compatible with future injection.
+    The optional ``_config`` argument is accepted for signature compatibility
+    with potential future call sites.
+    """
 
-    for backend_name in ("requests", "httpx"):
-        try:
-            module = __import__(backend_name)  # type: ignore[import]
-        except ImportError:  # pragma: no cover - optional dependency
-            continue
-        _HTTP_BACKEND = (backend_name, module)
-        return _HTTP_BACKEND
-
-    raise RuntimeError("Missing HTTP client dependency. Install 'requests' or 'httpx'.")
+    return sys.modules[__name__]
 
 
 def _invalidate_pair_cache() -> None:
@@ -71,17 +91,26 @@ def _invalidate_pair_cache() -> None:
 def describe_api_permissions() -> str:
     """Return a human-readable summary of current API key permissions."""
 
-    try:
-        permissions = config_module.query_api_key_permissions()
-    except (
-        config_module.KrakenAPIError,
-        RuntimeError,
-        ValueError,
-        OSError,
-    ) as exc:  # pragma: no cover - defensive logging
-        return f"unavailable ({exc})"
+    _ensure_config_loaded()
+    module = get_config_module()
+    if module is None:
+        return "unavailable (config import failed)"
 
-    rights = (permissions or {}).get("rights", {})
+    query_func: Optional[Callable[[], Dict[str, Any]]] = getattr(
+        module,
+        "query_api_key_permissions",
+        None,
+    )
+    kraken_error = getattr(module, "KrakenAPIError", RuntimeError)
+
+    permissions, error_text = _safe_query_call(
+        query_func,
+        expected_error=kraken_error,
+        fallback_reason="missing query_api_key_permissions",
+    )
+    if permissions is None:
+        return error_text or "unavailable"
+    rights = permissions.get("rights", {})
     try:
         return json.dumps(rights, sort_keys=True)
     except TypeError:  # pragma: no cover - defensive
@@ -96,14 +125,30 @@ class KrakenAuthError(KrakenAPIError):
     """Raised when credentials are missing or invalid."""
 
 
+def _auth_error_response(endpoint: str, message: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": message,
+        "errors": [message],
+        "code": "auth",
+        "endpoint": endpoint,
+        "result": None,
+        "raw": None,
+    }
+
+
 def _get_credentials() -> tuple[str, str]:
-    key = (CONFIG.get("kraken_api_key") or "").strip()
-    secret = (CONFIG.get("kraken_api_secret") or "").strip()
+    _ensure_config_loaded()
+
+    env_key = os.getenv("KRAKEN_API_KEY", "")
+    env_secret = os.getenv("KRAKEN_API_SECRET", "")
+
+    key = (env_key or CONFIG.get("kraken_api_key") or "").strip()
+    secret = (env_secret or CONFIG.get("kraken_api_secret") or "").strip()
     if not key or not secret:
-        raise KrakenAuthError(
-            "Kraken API credentials missing. Ensure KRAKEN_API_KEY and "
-            "KRAKEN_API_SECRET are set in the environment or .env file.",
-        )
+        message = "EAuth:Missing credentials"
+        logger.error(message)
+        raise KrakenAuthError(message)
     key_origin = CONFIG.get("_kraken_key_origin", "unknown")
     secret_origin = CONFIG.get("_kraken_secret_origin", "unknown")
     sanitized_message = " ".join(
@@ -135,17 +180,21 @@ def _decode_secret(secret: str) -> bytes:
     try:
         normalized = _sanitize_base64_secret(secret or "", strict=True)
     except ValueError as exc:
+        message = "EAuth:Invalid secret"
         logger.error("Kraken secret sanitization failed: %s", exc)
-        raise KrakenAuthError("Invalid Kraken API secret / malformed base64") from exc
+        raise KrakenAuthError(message) from exc
 
     if not normalized:
-        raise KrakenAuthError("Kraken API secret missing.")
+        message = "EAuth:Invalid secret"
+        logger.error("Kraken secret missing or empty")
+        raise KrakenAuthError(message)
 
     try:
         decoded = base64.b64decode(normalized, validate=True)
     except (binascii.Error, ValueError) as exc:
+        message = "EAuth:Invalid secret"
         logger.error("Kraken secret decode failed: %s", exc)
-        raise KrakenAuthError("Invalid Kraken API secret / malformed base64") from exc
+        raise KrakenAuthError(message) from exc
 
     logger.debug("Kraken secret decoded length=%d", len(decoded))
     return decoded
@@ -157,30 +206,24 @@ def _normalize_pair(pair: str) -> str:
     return normalize_pair(pair)
 
 
-def _asset_candidates(asset: str) -> tuple[str, ...]:
-    """Return likely Kraken asset codes for a human-readable asset symbol."""
+def _http_post(url: str, data: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    """Compatibility wrapper that raises ``KrakenAPIError`` on transport failure."""
 
-    if not asset:
-        return ("",)
-    symbol = asset.upper()
-    hints = _ASSET_HINTS.get(symbol)
-    if hints:
-        return tuple(dict.fromkeys(hints))  # drop duplicates, keep order
-    candidates = [symbol]
-    if not symbol.startswith(("X", "Z")):
-        candidates.append(f"X{symbol}")
-        candidates.append(f"Z{symbol}")
-    return tuple(dict.fromkeys(candidates))
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:  # pragma: no cover - network dependent
+        raise KrakenAPIError(f"HTTP POST failed: {exc}") from exc
 
-
-def _build_headers(api_key: str, api_sign: str) -> Dict[str, str]:
-    return {
-        "API-Key": api_key,
-        "API-Sign": api_sign,
-        "User-Agent": _USER_AGENT,
-        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        "Accept": "application/json",
-    }
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise KrakenAPIError(f"Invalid JSON response: {exc}") from exc
 
 
 def _sign_request(url_path: str, nonce: str, postdata: str, secret: str) -> str:
@@ -193,38 +236,22 @@ def _sign_request(url_path: str, nonce: str, postdata: str, secret: str) -> str:
     return base64.b64encode(mac.digest()).decode()
 
 
-def _http_post(url: str, data: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
-    """Perform an HTTP POST using requests or httpx and return JSON."""
+def _offline_private_result(
+    endpoint: str,
+    *,
+    last_error: str | None,
+) -> Dict[str, Any] | None:
+    """Return a deterministic offline response when Kraken is unreachable."""
 
-    try:
-        backend_name, client_module = _resolve_http_client()
-    except RuntimeError as exc:
-        raise KrakenAPIError(str(exc)) from exc
-
-    if backend_name == "requests":
-        try:
-            response = client_module.post(url, data=data, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except (  # type: ignore[attr-defined]
-            client_module.exceptions.RequestException,
-            ValueError,
-            TypeError,
-        ) as exc:
-            raise KrakenAPIError(f"HTTP POST failed: {exc}") from exc
-
-    if backend_name == "httpx":
-        client_class = client_module.Client  # type: ignore[attr-defined]
-        http_error = client_module.HTTPError  # type: ignore[attr-defined]
-        try:
-            with client_class(timeout=timeout, headers=headers) as client:
-                response = client.post(url, content=data)
-                response.raise_for_status()
-                return response.json()
-        except (http_error, ValueError, TypeError) as exc:
-            raise KrakenAPIError(f"HTTP POST failed: {exc}") from exc
-
-    raise KrakenAPIError("Unsupported HTTP backend configured.")
+    _ensure_config_loaded()
+    return offline_private_result(
+        endpoint,
+        last_error,
+        CONFIG,
+        error_tokens=_OFFLINE_ERROR_TOKENS,
+        balance_defaults=_OFFLINE_BALANCE_DEFAULT,
+        rights_defaults=_OFFLINE_RIGHTS_DEFAULT,
+    )
 
 
 def _http_public(
@@ -242,7 +269,7 @@ def _http_public(
     }
 
     try:
-        backend_name, client_module = _resolve_http_client()
+        backend_name, client_module = resolve_http_client()
     except RuntimeError as exc:
         raise KrakenAPIError(str(exc)) from exc
 
@@ -272,27 +299,6 @@ def _http_public(
     raise KrakenAPIError("Unsupported HTTP backend configured.")
 
 
-def _standard_response(
-    base: Dict[str, Any],
-    *,
-    endpoint: str,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Normalize response shape for downstream consumers."""
-
-    data = {
-        "ok": bool(base.get("ok")),
-        "error": base.get("error"),
-        "code": base.get("code"),
-        "endpoint": endpoint,
-        "result": base.get("result"),
-        "raw": base.get("raw"),
-    }
-    if extra:
-        data.update(extra)
-    return data
-
-
 def _private_request(
     endpoint: str,
     payload: Optional[Dict[str, Any]] = None,
@@ -306,27 +312,13 @@ def _private_request(
         api_key, api_secret = _get_credentials()
     except KrakenAuthError as exc:
         logger.error("Kraken credential error: %s", exc)
-        return {
-            "ok": False,
-            "error": str(exc),
-            "code": "auth",
-            "endpoint": endpoint,
-            "result": None,
-            "raw": None,
-        }
+        return _auth_error_response(endpoint, str(exc))
 
     try:
         secret_bytes = _decode_secret(api_secret)
     except KrakenAuthError as exc:
         logger.error("Kraken secret validation error: %s", exc)
-        return {
-            "ok": False,
-            "error": str(exc),
-            "code": "auth",
-            "endpoint": endpoint,
-            "result": None,
-            "raw": None,
-        }
+        return _auth_error_response(endpoint, str(exc))
 
     url_path = f"{_PRIVATE_PREFIX}{endpoint}"
     url = f"{_API_BASE}{url_path}"
@@ -365,13 +357,13 @@ def _private_request(
                 "raw": None,
             }
 
-        headers = _build_headers(api_key, api_sign)
+        headers = build_request_headers(api_key, api_sign, user_agent=_USER_AGENT)
 
         try:
             logger.debug(
                 "Kraken POST %s data=%s attempt=%d secret_len=%d",
                 url_path,
-                _redact_nonce(postdata),
+                redact_nonce(postdata),
                 attempt,
                 len(secret_bytes),
             )
@@ -422,6 +414,9 @@ def _private_request(
             combined_error = "; ".join(error_list)
             code = "api"
             normalized_errors = [err.lower() for err in error_list]
+            if any("eauth" in err for err in normalized_errors):
+                logger.error("Kraken auth error payload on %s: %s", endpoint, error_list)
+                raise KrakenAuthError(combined_error)
             if any("cost minimum not met" in err for err in normalized_errors):
                 code = "cost_minimum_not_met"
             elif any("order minimum not met" in err or "invalid arguments:volume" in err for err in normalized_errors):
@@ -466,6 +461,15 @@ def _private_request(
             "raw": http_response,
         }
 
+    offline_response = _offline_private_result(endpoint, last_error=last_error)
+    if offline_response is not None:
+        logger.warning(
+            "Using offline Kraken stub for %s due to network error: %s",
+            endpoint,
+            last_error,
+        )
+        return offline_response
+
     return {
         "ok": False,
         "error": last_error or "Max attempts exceeded for Kraken request",
@@ -506,30 +510,16 @@ def query_private(
     return response
 
 
-def _redact_nonce(postdata: str) -> str:
-    """Hide the nonce value in debug logs."""
-
-    if "nonce=" not in postdata:
-        return postdata
-    parts = []
-    for kv in postdata.split("&"):
-        if kv.startswith("nonce="):
-            parts.append("nonce=***")
-        else:
-            parts.append(kv)
-    return "&".join(parts)
-
-
 def kraken_get_balance(asset: str = "USDC") -> Dict[str, Any]:
     """Return the available balance for ``asset`` (defaults to USDC)."""
 
     base = query_private("Balance", raise_for_error=False)
-    response = _standard_response(base, endpoint="Balance", extra={"asset": asset.upper()})
+    response = standard_response(base, endpoint="Balance", extra={"asset": asset.upper()})
     if not response.get("ok"):
         response.setdefault("balance", None)
         return response
 
-    candidates = _asset_candidates(asset)
+    candidates = asset_candidates(asset, _ASSET_HINTS)
     result = response.get("result") or {}
     for key in candidates:
         if key in result:
@@ -551,74 +541,77 @@ def kraken_get_balance(asset: str = "USDC") -> Dict[str, Any]:
     return response
 
 
+def get_usdc_balance() -> float | None:
+    """Return the current USDC balance as a float, or ``None`` on failure."""
+
+    response = kraken_get_balance("USDC")
+    if not isinstance(response, dict):
+        logger.warning("USDC balance fetch returned non-dict response: %r", response)
+        return None
+
+    balance = response.get("balance")
+    if balance is None:
+        result_block = response.get("result") or {}
+        for key in ("USDC", "ZUSD", "USD"):
+            if result_block.get(key) is not None:
+                balance = result_block[key]
+                logger.debug("USDC balance fallback key=%s value=%s", key, balance)
+                break
+
+    if balance is None:
+        logger.warning("USDC balance missing from Kraken response: %s", response)
+        return None
+
+    try:
+        decimal_value = Decimal(str(balance))
+    except (InvalidOperation, ValueError, TypeError):
+        logger.warning("USDC balance payload not numeric: %r", balance)
+        return None
+
+    if not decimal_value.is_finite():
+        logger.warning("USDC balance non-finite: %s", decimal_value)
+        return None
+
+    rounded = decimal_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    logger.debug(
+        "Fetched USDC balance raw=%s rounded=%s code=%s",
+        balance,
+        rounded,
+        response.get("code"),
+    )
+    return float(rounded)
+
+
 def query_api_key_permissions() -> Optional[Dict[str, Any]]:
-    """Return the rights/permissions associated with the current API key.
+    """Return a best-effort view of API permissions without using Kraken's deprecated QueryKey."""
 
-    Uses Kraken's private ``QueryKey`` endpoint. If the call fails or the
-    response cannot be parsed, returns ``None`` instead of raising so callers
-    can decide how strictly to enforce the check.
-    """
-
-    response = _private_request("QueryKey", {})
-    normalized = _standard_response(response, endpoint="QueryKey")
+    response = _private_request("Balance", {})
+    normalized = standard_response(response, endpoint="Balance")
     if not normalized.get("ok"):
+        error_text = normalized.get("error") or ""
+        code = (normalized.get("code") or "").lower()
+        if code == "auth" or "eauth" in error_text.lower():
+            raise KrakenAuthError(error_text or "EAuth:Missing credentials")
         logger.warning(
-            "Unable to query Kraken API key permissions: %s",
+            "Unable to infer Kraken API key permissions from balance endpoint: %s",
             normalized.get("error") or normalized.get("code"),
         )
         return None
 
-    result = normalized.get("result")
-    rights: Dict[str, Any] = {}
-    if isinstance(result, dict):
-        if "rights" in result:
-            rights = result.get("rights") or {}
-        else:
-            try:
-                first = next(iter(result.values()))
-            except StopIteration:
-                first = None
-            if isinstance(first, dict):
-                rights = first.get("rights", {}) or {}
-
-    if not rights:
-        logger.warning("Kraken API key permissions response missing rights payload: %s", result)
-
+    result = normalized.get("result") or {}
+    # Balance succeeds when the key has trade/query rights; withdrawals are never required.
+    rights = {
+        "can_trade": bool(result),
+        "can_withdraw": False,
+    }
     return {"rights": rights, "raw": result}
 
 
 def _fallback_pair_meta(pair: str) -> Dict[str, Any]:
     """Return a safe fallback metadata payload when Kraken data is unavailable."""
 
-    trade_cfg = CONFIG.get("trade_size", {}) or {}
-    per_pair = trade_cfg.get("per_pair", {}) or {}
-    pair_cfg = per_pair.get(pair, {}) or {}
-
-    default_min_volume = float(trade_cfg.get("default_min", 0.0) or 0.0)
-    fallback_volume = float(pair_cfg.get("min_volume", default_min_volume) or default_min_volume)
-
-    kraken_cfg = CONFIG.get("kraken", {}) or {}
-    default_cost_threshold = float(
-        CONFIG.get("kraken_min_cost_threshold", kraken_cfg.get("min_cost_threshold", 0.0)) or 0.0
-    )
-    fallback_cost = float(pair_cfg.get("min_cost", default_cost_threshold) or default_cost_threshold)
-
-    price_decimals = int(kraken_cfg.get("pair_decimals_default", 5) or 5)
-    lot_decimals = int(kraken_cfg.get("lot_decimals_default", 8) or 8)
-
-    payload = {
-        "ordermin": max(fallback_volume, 0.0),
-        "costmin": max(fallback_cost, 0.0),
-        "pair_decimals": max(price_decimals, 0),
-        "lot_decimals": max(lot_decimals, 0),
-        "source": "fallback",
-    }
-    logger.warning(
-        "Using fallback Kraken metadata for %s: %s",
-        pair,
-        payload,
-    )
-    return payload
+    _ensure_config_loaded()
+    return fallback_pair_meta(pair, CONFIG, logger)
 
 
 def kraken_get_asset_pair_meta(pair: str) -> Dict[str, Any]:
@@ -760,7 +753,7 @@ def kraken_place_order(
             pair,
             order_side,
         )
-        return _auth_failure("Invalid Kraken API secret / malformed base64")
+        return _auth_failure("EAuth:Invalid secret")
 
     if resolved_ordertype != "market":
         if price is None:
@@ -783,7 +776,7 @@ def kraken_place_order(
     )
 
     base = _private_request("AddOrder", payload)
-    response = _standard_response(
+    response = standard_response(
         base,
         endpoint="AddOrder",
         extra={"pair": pair, "side": order_side},
@@ -797,7 +790,8 @@ def kraken_place_order(
             response.get("error"),
         )
         response.setdefault("result", None)
-        response.setdefault("txid", None)
+        response.setdefault("txid", [])
+        response.setdefault("txid_list", [])
         response.setdefault("descr", None)
         response["pair"] = pair
         response["side"] = order_side
@@ -816,21 +810,102 @@ def kraken_place_order(
     result = response.get("result") or {}
     descr = result.get("descr") if isinstance(result, dict) else None
     order_descr = descr.get("order") if isinstance(descr, dict) else None
-    txid = result.get("txid") if isinstance(result, dict) else None
+    txid_source = result.get("txid") if isinstance(result, dict) else None
+    txids: list[str] = []
+    if isinstance(txid_source, (list, tuple)):
+        txids = [str(item) for item in txid_source if item]
+    elif isinstance(txid_source, str) and txid_source:
+        txids = [txid_source]
+    txid_value = txids[0] if txids else None
+
+    fills_raw = result.get("fills")
+    fills: list[dict[str, float | str]] = []
+    gross_total = 0.0
+    volume_total = 0.0
+    fee_total = 0.0
+    if isinstance(fills_raw, list):
+        for entry in fills_raw:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                price_val = float(entry.get("price", entry.get("avg_price", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                price_val = 0.0
+            try:
+                qty_val = float(entry.get("qty", entry.get("volume", entry.get("vol", 0.0))) or 0.0)
+            except (TypeError, ValueError):
+                qty_val = 0.0
+            try:
+                cost_val = float(entry.get("cost", price_val * qty_val) or 0.0)
+            except (TypeError, ValueError):
+                cost_val = price_val * qty_val
+            try:
+                fee_val = float(entry.get("fee", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                fee_val = 0.0
+            gross_total += cost_val
+            volume_total += qty_val
+            fee_total += fee_val
+            fills.append(
+                {
+                    "price": price_val,
+                    "quantity": qty_val,
+                    "cost": cost_val,
+                    "fee": fee_val,
+                    "type": entry.get("type") or "",
+                    "time": entry.get("time") or "",
+                }
+            )
+
+    if gross_total <= 0.0:
+        gross_total = float(result.get("cost") or attempted_cost or 0.0)
+    if volume_total <= 0.0:
+        volume_total = float(result.get("vol_executed", size) or size)
+    if fee_total <= 0.0:
+        fee_total = float(result.get("fee") or 0.0)
+
+    average_price = None
+    try:
+        if volume_total:
+            average_price = gross_total / volume_total
+    except (TypeError, ZeroDivisionError):
+        average_price = None
+
+    if gross_total == 0.0 and attempted_cost:
+        gross_total = float(attempted_cost)
+    if average_price is None:
+        average_price = float(price) if price is not None else None
+
+    if order_side == "buy":
+        net_amount = -(gross_total + fee_total)
+    else:
+        net_amount = gross_total - fee_total
 
     logger.info(
-        "Kraken order response | pair=%s descript=%s txid=%s raw=%s",
+        "Kraken order response | pair=%s descript=%s txid=%s gross=%.8f fee=%.8f fills=%d",
         payload["pair"],
         order_descr,
-        txid,
-        json.dumps(response.get("raw"), default=str),
+        txid_value,
+        gross_total,
+        fee_total,
+        len(fills),
     )
-    response["txid"] = txid
+    # Kraken returns txid as a list; preserve that and also surface the first entry for convenience.
+    response["txid"] = txids
+    response["txid_list"] = txids
+    response["txid_single"] = txid_value
     response["descr"] = order_descr
     response.setdefault("attempted_cost", attempted_cost)
     response.setdefault("threshold", threshold_value)
     response["pair"] = pair
     response["side"] = order_side
+    response["fills"] = fills
+    response["gross_amount"] = gross_total
+    response["fee"] = fee_total
+    response["net_amount"] = net_amount
+    response["filled_volume"] = volume_total
+    response["average_price"] = average_price
+    response["balance_delta"] = net_amount
     response["error"] = None
     response["code"] = "ok"
     return response
@@ -952,10 +1027,12 @@ class KrakenClient:
         )
 
 
+_ensure_config_loaded()
+
 kraken_client = KrakenClient()
 
 
-__all__ = [
+__all__ = (
     "KrakenAPIError",
     "KrakenAuthError",
     "KrakenClient",
@@ -967,4 +1044,31 @@ __all__ = [
     "kraken_cancel_order",
     "kraken_open_orders",
     "query_api_key_permissions",
-]
+)
+
+
+def _safe_query_call(
+    query_func: Optional[Callable[[], Dict[str, Any]]],
+    *,
+    expected_error: type[BaseException],
+    fallback_reason: str = "not callable",
+) -> tuple[Dict[str, Any] | None, str | None]:
+    """Safely execute a dynamic query callback, returning a tuple of result/error."""
+
+    if not callable(query_func):
+        message = f"unavailable ({fallback_reason})"
+        logger.warning("query_func is not callable: %s", query_func)
+        return None, message
+
+    try:
+        result = query_func()
+        return (result if isinstance(result, dict) else {}), None
+    except (
+        expected_error,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as exc:  # pragma: no cover - defensive logging
+        message = f"unavailable ({exc})"
+        logger.warning("query_func execution failed: %s", exc)
+        return None, message

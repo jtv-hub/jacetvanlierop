@@ -149,7 +149,7 @@ def get_account_balance(*, use_mock_for_paper: bool = True) -> Optional[float]:
         response.get("raw"),
     )
 
-    env_var = CONFIG.get("live_mode", {}).get("balance_env_var") or ("CRYPTO_TRADING_BOT_LIVE_BALANCE")
+    env_var = CONFIG.get("live_mode", {}).get("balance_env_var") or "CRYPTO_TRADING_BOT_LIVE_BALANCE"
     env_value = os.getenv(env_var)
     if env_value:
         try:

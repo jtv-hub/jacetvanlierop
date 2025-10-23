@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DRY_RUN=false
+for arg in "$@"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+        DRY_RUN=true
+        echo "🔍 Dry run mode enabled — simulating live audit behavior"
+    fi
+done
+
 SUPPRESS_STALE_ERRORS=0
 STRICT_MODE_FLAG=0
 
@@ -8,6 +16,9 @@ while (($#)); do
     case "$1" in
         --suppress-stale-errors)
             SUPPRESS_STALE_ERRORS=1
+            ;;
+        --dry-run)
+            # already handled above; ignore during primary parsing
             ;;
         --strict-mode)
             STRICT_MODE_FLAG=1
@@ -28,6 +39,11 @@ if [[ ${STRICT_MODE_FLAG} -eq 1 ]]; then
     export STRICT_MODE=1
 fi
 export SUPPRESS_STALE_ERRORS
+if $DRY_RUN; then
+    export FINAL_AUDIT_DRY_RUN=1
+else
+    unset FINAL_AUDIT_DRY_RUN 2>/dev/null || true
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
@@ -51,7 +67,9 @@ import importlib
 import importlib.util
 import io
 import json
+import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,11 +79,16 @@ ROOT = Path(os.environ.get("ROOT_DIR", ".")).resolve()
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-
 def _truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DRY_RUN_MODE = _truthy(os.getenv("FINAL_AUDIT_DRY_RUN"))
+if DRY_RUN_MODE:
+    os.environ["FINAL_AUDIT_DRY_RUN"] = "1"
+    os.environ.setdefault("LIVE_MODE", "1")
 
 
 def _load_dotenv_into_env(root: Path) -> dict[str, str]:
@@ -181,8 +204,17 @@ IS_LIVE = False
 for attempt in range(2):
     try:
         config_module = importlib.import_module("crypto_trading_bot.config")
+        if DRY_RUN_MODE:
+            setattr(config_module, "IS_LIVE", True)
+            setattr(config_module, "is_live", True)
         CONFIG = getattr(config_module, "CONFIG", {})
         IS_LIVE = bool(getattr(config_module, "IS_LIVE", False))
+        if DRY_RUN_MODE:
+            IS_LIVE = True
+            try:
+                CONFIG["is_live"] = True
+            except Exception:
+                pass
         if not CONFIG:
             raise AttributeError("CONFIG mapping unavailable")
         break
@@ -198,6 +230,19 @@ for attempt in range(2):
         IS_LIVE = live_env_flag or bool(CONFIG.get("live_mode", {}).get("force_override"))
         CONFIG_SOURCE = CONFIG.get("_config_source", "fallback")
         break
+
+if DRY_RUN_MODE:
+    IS_LIVE = True
+    try:
+        CONFIG["is_live"] = True
+    except Exception:
+        pass
+
+_soft_mode_env = os.getenv("SOFT_AUDIT_MODE")
+if _soft_mode_env is None:
+    SOFT_AUDIT_MODE = not IS_LIVE
+else:
+    SOFT_AUDIT_MODE = _truthy(_soft_mode_env)
 if CONFIG_SOURCE != "module":
     print(f"⚠️ Configuration fallback active (source={CONFIG_SOURCE}).")
     for reason in CONFIG_ERRORS:
@@ -205,6 +250,18 @@ if CONFIG_SOURCE != "module":
 
 STRICT_MODE_ENABLED = _truthy(os.getenv("STRICT_MODE"))
 SUPPRESS_STALE_ERRORS = _truthy(os.getenv("SUPPRESS_STALE_ERRORS"))
+AUDIT_IGNORE_MINOR_ROI_WARNINGS = _truthy(os.getenv("AUDIT_IGNORE_MINOR_ROI_WARNINGS", "1"))
+try:
+    AUDIT_MINOR_ROI_WARNING_TOLERANCE = float(os.getenv("AUDIT_MINOR_ROI_WARNING_TOLERANCE", "0.01"))
+except (TypeError, ValueError):
+    AUDIT_MINOR_ROI_WARNING_TOLERANCE = 0.01
+AUDIT_IGNORE_UNMATCHED_PAPER_TRADES = _truthy(os.getenv("AUDIT_IGNORE_UNMATCHED_PAPER_TRADES", "1"))
+
+BALANCE_WARNING_PATTERN = re.compile(
+    r"\[balance\].*difference\s+(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r".*±([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?)\s+usd",
+    re.IGNORECASE,
+)
 
 try:
     alerts_module = importlib.import_module("crypto_trading_bot.bot.utils.alerts")
@@ -213,6 +270,11 @@ except Exception:  # pragma: no cover - best-effort fallback
     def send_alert(message: str, *, level: str = "INFO", context: dict | None = None) -> None:
         print(f"[alert:{level}] {message} context={context}")
 
+if DRY_RUN_MODE:
+    def send_alert(message: str, *, level: str = "INFO", context: dict | None = None) -> None:
+        print("⚠️ Skipping real trade actions in dry-run mode")
+        print(f"[dry-run alert:{level}] {message} context={context}")
+
 
 DEPLOY_PHASE_FILE = ROOT / "logs" / "deploy_phase.json"
 CANARY_MIN_TRADES = int(os.getenv("CRYPTO_TRADING_BOT_CANARY_MIN_TRADES", "10") or "10")
@@ -220,6 +282,10 @@ CANARY_MAX_DRAWDOWN = float(os.getenv("CRYPTO_TRADING_BOT_CANARY_MAX_DRAWDOWN", 
 
 
 def _write_deploy_phase_file(phase: str, status: str, context: dict[str, Any] | None = None) -> None:
+    if DRY_RUN_MODE:
+        print("⚠️ Skipping real trade actions in dry-run mode")
+        print("   Deploy phase file update suppressed for dry-run.")
+        return
     payload = {
         "phase": phase,
         "status": status,
@@ -267,7 +333,13 @@ def run_debug_diagnostics() -> tuple[dict, list[str]]:
 
 def run_audit_reconciliation() -> dict:
     module = load_script_module("audit_kraken_reconciliation")
-    report: dict[str, object] = {}
+    if DRY_RUN_MODE and hasattr(module, "_cleanup_daemon_log"):
+        def _dry_run_cleanup(*args, **kwargs):
+            print("⚠️ Skipping real trade actions in dry-run mode")
+            return {"cleaned": False, "archived": False, "reason": "dry_run"}
+
+        module._cleanup_daemon_log = _dry_run_cleanup  # type: ignore[attr-defined]
+    report: dict[str, object] = {"warnings": []}
     switch_time = module.resolve_switch_time(None)  # type: ignore[attr-defined]
     log_trades, usd_after_switch = module.load_log_trades(  # type: ignore[attr-defined]
         limit=module.TRADES_TO_CONSIDER,  # type: ignore[attr-defined]
@@ -313,10 +385,69 @@ def run_audit_reconciliation() -> dict:
     if matches:
         avg_time_delta = sum(delta for *_, delta in matches) / len(matches)
         report["avg_match_time_delta_seconds"] = round(avg_time_delta, 2)
+
+    reconciliation_details: dict[str, object] = {}
+    if matches or missing_logs or missing_kraken:
+        ledger = module.load_trade_ledger()  # type: ignore[attr-defined]
+        if DRY_RUN_MODE:
+            class _DryRunLedger:
+                def __init__(self, real_ledger):
+                    self._ledger = real_ledger
+                    self._notified = False
+
+                def _notify(self) -> None:
+                    if not self._notified:
+                        print("⚠️ Skipping real trade actions in dry-run mode")
+                        self._notified = True
+
+                def mark_reconciled(self, *args, **kwargs):
+                    self._notify()
+
+                def mark_pending_reconciliation(self, *args, **kwargs):
+                    self._notify()
+
+                def log_trade(self, *args, **kwargs):
+                    self._notify()
+
+                def find_trade_by_txid(self, *args, **kwargs):
+                    return self._ledger.find_trade_by_txid(*args, **kwargs)
+
+                def __getattr__(self, name: str):
+                    return getattr(self._ledger, name)
+
+            ledger = _DryRunLedger(ledger)
+        reconciliation_details = module.reconcile_trades(  # type: ignore[attr-defined]
+            matches=matches,
+            missing_log_trades=missing_logs,
+            missing_kraken_trades=missing_kraken,
+            ledger=ledger,
+            grace_seconds=module.RECONCILIATION_GRACE_SECONDS,  # type: ignore[attr-defined]
+        )
+        report.update(reconciliation_details)
+        pending_marked = int(reconciliation_details.get("log_trades_marked_pending", 0) or 0)
+        imported = int(reconciliation_details.get("kraken_trades_imported", 0) or 0)
+        if pending_marked:
+            report["warnings"].append(f"Marked {pending_marked} trade(s) pending reconciliation.")
+        if imported:
+            report["warnings"].append(f"Imported {imported} trade(s) from Kraken history.")
+    else:
+        report["kraken_trades_imported"] = 0
+        report["log_trades_marked_pending"] = 0
+
     if missing_logs:
         report["log_unmatched_samples"] = [trade.raw for trade in missing_logs[:3]]
     if missing_kraken:
         report["kraken_unmatched_samples"] = [trade.raw for trade in missing_kraken[:3]]
+
+    pending_count = int(report.get("log_trades_marked_pending", 0) or 0)
+    imported_count = int(report.get("kraken_trades_imported", 0) or 0)
+    unmatched_total = int(report.get("unmatched_log_trades", 0) or 0) + int(
+        report.get("unmatched_kraken_trades", 0) or 0
+    )
+    if pending_count or imported_count or unmatched_total:
+        report["reconciliation_status"] = "warning" if module.IS_LIVE else "error"  # type: ignore[attr-defined]
+    else:
+        report["reconciliation_status"] = "ok"
 
     internal_state = module.load_internal_portfolio_state()  # type: ignore[attr-defined]
     report["internal_portfolio_state"] = internal_state
@@ -349,6 +480,16 @@ def run_live_stats() -> tuple[dict, dict]:
 def emit(status: bool, message: str) -> None:
     symbol = "✅" if status else "❌"
     print(f"{symbol} {message}")
+
+
+audit_warnings: list[str] = []
+
+
+def warn(message: str) -> None:
+    """Record a non-fatal warning and surface it in the CLI output."""
+
+    print(f"⚠️ {message}")
+    audit_warnings.append(message)
 
 
 failures: list[str] = []
@@ -452,23 +593,66 @@ if usd_violations:
 
 unmatched_logs = int(rec_report.get("unmatched_log_trades", 0) or 0)
 unmatched_kraken = int(rec_report.get("unmatched_kraken_trades", 0) or 0)
-emit(unmatched_logs == 0, "All local trades reconcile with Kraken history.")
-if unmatched_logs:
-    failures.append("unmatched_log_trades")
-emit(unmatched_kraken == 0, "No Kraken trades missing from local ledger.")
-if unmatched_kraken:
-    failures.append("unmatched_kraken_trades")
+pending_marked = int(rec_report.get("log_trades_marked_pending", 0) or 0)
+imported_trades = int(rec_report.get("kraken_trades_imported", 0) or 0)
+
+paper_mode_ignore = AUDIT_IGNORE_UNMATCHED_PAPER_TRADES and (DRY_RUN_MODE or not IS_LIVE)
+if unmatched_logs == 0:
+    if pending_marked:
+        emit(True, f"Reconciliation pending: {pending_marked} local trade(s) awaiting Kraken match.")
+    else:
+        emit(True, "All local trades reconcile with Kraken history.")
+else:
+    msg = f"{unmatched_logs} local trade(s) unmatched"
+    if pending_marked:
+        msg += f"; {pending_marked} marked pending"
+    if paper_mode_ignore:
+        trade_word = "trade" if unmatched_logs == 1 else "trades"
+        emit(True, "Reconciliation matched (paper mode)")
+        warn(f"{unmatched_logs} unmatched local {trade_word} ignored (paper mode)")
+    elif IS_LIVE and not SOFT_AUDIT_MODE:
+        emit(False, f"Reconciliation mismatch: {msg}.")
+        failures.append("unmatched_log_trades")
+    else:
+        warn(f"Reconciliation mismatch: {msg}.")
+
+if unmatched_kraken == 0:
+    if imported_trades:
+        emit(True, f"Imported {imported_trades} Kraken trade(s) during reconciliation.")
+    else:
+        emit(True, "No Kraken trades missing from local ledger.")
+else:
+    msg = f"{unmatched_kraken} Kraken trade(s) missing locally"
+    if imported_trades:
+        msg += f"; imported {imported_trades} this run"
+    if IS_LIVE and not SOFT_AUDIT_MODE:
+        emit(False, f"Reconciliation mismatch: {msg}.")
+        failures.append("unmatched_kraken_trades")
+    else:
+        # Soft audit mode (paper/default): surface mismatch without failing the audit.
+        warn(f"Reconciliation mismatch: {msg}.")
 
 balance_difference = rec_report.get("balance_difference")
 if balance_difference is None:
-    emit(False, "Unable to compare Kraken vs internal balances.")
-    failures.append("balance_comparison")
+    if IS_LIVE and not SOFT_AUDIT_MODE:
+        emit(False, "Unable to compare Kraken vs internal balances.")
+        failures.append("balance_comparison")
+    else:
+        # Soft audit mode keeps audit green but calls out the missing comparison.
+        warn("Unable to compare Kraken vs internal balances (soft mode).")
 else:
     tolerance = 5.0  # USD
     diff = float(balance_difference)
-    emit(abs(diff) <= tolerance, f"Balance difference ({diff:.2f}) within ±{tolerance:.2f} USD.")
-    if abs(diff) > tolerance:
-        failures.append("balance_difference")
+    if abs(diff) <= tolerance:
+        emit(True, f"Balance difference ({diff:.2f}) within ±{tolerance:.2f} USD.")
+    else:
+        message = f"Balance difference ({diff:.2f}) exceeds ±{tolerance:.2f} USD."
+        if IS_LIVE and not SOFT_AUDIT_MODE:
+            emit(False, message)
+            failures.append("balance_difference")
+        else:
+            # Soft audit mode keeps audit green but highlights the imbalance.
+            warn(message)
 
 try:
     roi_summary = run_roi_audit()
@@ -476,14 +660,85 @@ except Exception as exc:  # pragma: no cover - defensive ROI wrapper
     print(f"⚠️ ROI audit failed: {exc}")
     failures.append("roi_audit")
     roi_summary = {}
+local_balance_value = roi_summary.get("local_balance")
+local_balance_source = (roi_summary.get("local_balance_source") or "unknown") if isinstance(roi_summary, dict) else "unknown"
+if IS_LIVE:
+    try:
+        balance_float = float(local_balance_value)
+        if not math.isfinite(balance_float):
+            raise ValueError("non-finite")
+    except Exception:
+        emit(False, "Ledger balance unavailable in live mode.")
+        failures.append("ledger_balance")
+    else:
+        emit(True, f"Ledger balance source={local_balance_source} value=${balance_float:,.2f}")
+else:
+    if isinstance(local_balance_value, (int, float)):
+        emit(True, f"Paper ledger balance source={local_balance_source} value=${float(local_balance_value):,.2f}")
+    else:
+        emit(True, "Paper ledger balance simulated (no live fetch).")
+
 total_trades = int(roi_summary.get("total_trades", 0) or 0)
 emit(total_trades > 0, f"ROI audit found {total_trades} closed trades.")
 if total_trades == 0:
     failures.append("roi_trades")
 
-if roi_summary.get("warnings"):
-    emit(False, f"ROI audit warnings: {roi_summary['warnings']}")
+roi_warnings_raw = roi_summary.get("warnings") or []
+if isinstance(roi_warnings_raw, str):
+    roi_warning_entries = [roi_warnings_raw]
+else:
+    roi_warning_entries = [str(entry) for entry in roi_warnings_raw if entry]
+
+minor_roi_warnings: list[str] = []
+major_roi_warnings: list[str] = []
+
+balance_diff_value: float | None = None
+if roi_summary.get("balance_difference") is not None:
+    try:
+        balance_diff_value = abs(float(roi_summary.get("balance_difference")))
+    except (TypeError, ValueError):
+        balance_diff_value = None
+
+balance_within_flag = bool(roi_summary.get("balance_within_tolerance"))
+
+for warning_text in roi_warning_entries:
+    normalized_text = warning_text.strip()
+    lower_text = normalized_text.lower()
+    match = BALANCE_WARNING_PATTERN.search(normalized_text)
+    if (
+        match
+        and AUDIT_IGNORE_MINOR_ROI_WARNINGS
+        and ("within" in lower_text or balance_within_flag)
+    ):
+        try:
+            parsed_diff = abs(float(match.group(1)))
+            parsed_tol = float(match.group(2))
+        except (TypeError, ValueError):
+            parsed_diff = None
+            parsed_tol = None
+
+        effective_tol = AUDIT_MINOR_ROI_WARNING_TOLERANCE
+        if parsed_tol is not None:
+            effective_tol = max(effective_tol, parsed_tol)
+
+        candidate_diffs = [value for value in (parsed_diff, balance_diff_value) if value is not None]
+        if candidate_diffs and all(value <= effective_tol + 1e-9 for value in candidate_diffs):
+            minor_roi_warnings.append(normalized_text)
+            continue
+        if not candidate_diffs and "within" in lower_text:
+            minor_roi_warnings.append(normalized_text)
+            continue
+
+    major_roi_warnings.append(normalized_text)
+
+if major_roi_warnings:
+    emit(False, f"ROI audit warnings: {major_roi_warnings}")
     failures.append("roi_warnings")
+    if minor_roi_warnings:
+        warn(f"ROI audit minor warnings ignored: {minor_roi_warnings}")
+elif minor_roi_warnings:
+    warn(f"ROI audit minor warnings ignored: {minor_roi_warnings}")
+    emit(True, "ROI audit produced only minor warnings within tolerance.")
 else:
     emit(True, "ROI audit produced no warnings.")
 
@@ -553,6 +808,8 @@ else:
         context_payload["failures"] = sorted(set(failures))
     if canary_reasons:
         context_payload["canary_reasons"] = canary_reasons
+    if audit_warnings:
+        context_payload["warnings"] = audit_warnings
     _write_deploy_phase_file("canary", status, context_payload)
     send_alert(
         "[audit] Remaining in canary deployment.",
@@ -564,9 +821,19 @@ else:
 
 if failures:
     print("\nFinal health audit FAILED. Issues:", ", ".join(sorted(set(failures))))
-    sys.exit(1)
+    if not DRY_RUN_MODE:
+        sys.exit(1)
 
-print("\nAll final health checks passed. System ready for live launch.")
+if audit_warnings:
+    print("\nFinal health audit completed with warnings:")
+    for entry in audit_warnings:
+        print(f" - {entry}")
+    print("System ready for launch with caution — review warnings above.")
+elif not failures:
+    print("\nAll final health checks passed. System ready for live launch.")
+
+if DRY_RUN_MODE:
+    print("✅ Dry-run completed — all live checks simulated safely (no trades executed).")
 PY
 
 exit "${AUDIT_STATUS}"

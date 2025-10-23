@@ -777,11 +777,22 @@ def _submit_live_trade(
 
     _clear_kraken_failure_pause()
 
-    txid = response.get("txid")
-    if isinstance(txid, list) and txid:
-        txid_repr = txid[0]
+    # Kraken returns txid values as a list; unwrap singletons for convenience while retaining the list.
+    txid_list = response.get("txid")
+    if not isinstance(txid_list, list):
+        alt_list = response.get("txid_list")
+        txid_list = alt_list if isinstance(alt_list, list) else []
+    if txid_list and len(txid_list) == 1:
+        response["txid_list"] = txid_list
+        response["txid_single"] = txid_list[0]
+        response["txid"] = txid_list[0]
+        txid_repr = txid_list[0]
     else:
-        txid_repr = txid
+        response["txid_list"] = txid_list
+        if txid_list:
+            response["txid_single"] = txid_list[0]
+            response["txid"] = txid_list
+        txid_repr = response.get("txid_single") if len(txid_list) <= 1 else txid_list
     descr = response.get("descr")
 
     logger.info(
@@ -793,7 +804,9 @@ def _submit_live_trade(
         txid_repr,
         descr,
     )
-    return True
+    # Downstream callers treat response["txid"] as a convenience string for single fills, while
+    # response["txid_list"] always preserves the original list returned by Kraken.
+    return response
 
 
 def _log_capital(amount: float, source: str) -> None:
@@ -1897,7 +1910,7 @@ def evaluate_signals_and_trade(
 
                 trade_side = signal
                 start_latency = time.perf_counter()
-                submitted_live = _submit_live_trade(
+                order_result = _submit_live_trade(
                     pair=pair,
                     side=trade_side,
                     size=adjusted_size,
@@ -1905,6 +1918,7 @@ def evaluate_signals_and_trade(
                     strategy=strategy_name,
                     confidence=confidence,
                 )
+                submitted_live = bool(order_result)
                 live_latency = time.perf_counter() - start_latency if is_live else None
 
                 if is_live and not submitted_live:
@@ -1938,6 +1952,25 @@ def evaluate_signals_and_trade(
 
                 entry_raw = safe_prices[-1]
                 # Let ledger apply entry slippage consistently; pass raw price
+                fill_context = order_result if isinstance(order_result, dict) else {}
+                txid_list_for_ledger = fill_context.get("txid_list")
+                if not isinstance(txid_list_for_ledger, list):
+                    txid_list_candidate = fill_context.get("txid")
+                    if isinstance(txid_list_candidate, list):
+                        txid_list_for_ledger = txid_list_candidate
+                    elif isinstance(txid_list_candidate, str):
+                        txid_list_for_ledger = [txid_list_candidate]
+                ledger_kwargs = {
+                    "txid": txid_list_for_ledger,
+                    "fills": fill_context.get("fills"),
+                    "gross_amount": fill_context.get("gross_amount"),
+                    "fee": fill_context.get("fee"),
+                    "net_amount": fill_context.get("net_amount"),
+                    "balance_delta": fill_context.get("balance_delta"),
+                    "fill_price": fill_context.get("average_price"),
+                    "filled_volume": fill_context.get("filled_volume"),
+                }
+
                 ledger.log_trade(
                     trading_pair=pair,
                     trade_size=adjusted_size,
@@ -1950,6 +1983,7 @@ def evaluate_signals_and_trade(
                     capital_buffer=buffer,
                     rsi=rsi_val,
                     adx=adx_val,
+                    **{k: v for k, v in ledger_kwargs.items() if v is not None},
                 )
                 # Use the exact entry_price and timestamp
                 # as written by the ledger (after slippage & rounding)
@@ -1989,6 +2023,14 @@ def evaluate_signals_and_trade(
                         },
                     )
 
+                txid_for_summary = None
+                if submitted_live:
+                    ctx_txid = fill_context.get("txid")
+                    if isinstance(ctx_txid, list):
+                        txid_for_summary = ctx_txid[0]
+                    else:
+                        txid_for_summary = ctx_txid
+
                 trade_summary_context = {
                     "trade_id": trade_id,
                     "pair": pair,
@@ -1998,6 +2040,7 @@ def evaluate_signals_and_trade(
                     "phase": DEPLOY_PHASE,
                     "live_latency_seconds": live_latency,
                     "submitted_live": bool(submitted_live),
+                    "kraken_txid": txid_for_summary,
                 }
                 if limit_context:
                     trade_summary_context["deploy_limit"] = limit_context

@@ -3,10 +3,13 @@
 # pylint: disable=protected-access
 
 import base64
+import hashlib
+import hmac
 import logging
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from crypto_trading_bot import config as config_module
 from crypto_trading_bot.bot import market_data, trading_logic
@@ -40,6 +43,8 @@ def test_decode_secret_padding():
 def test_place_order_invalid_secret(monkeypatch):
     """Invalid base64 secrets should surface a structured error without HTTP calls."""
 
+    monkeypatch.setenv("KRAKEN_API_KEY", "")
+    monkeypatch.setenv("KRAKEN_API_SECRET", "")
     monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_key", "unit-test-key")
     monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_secret", "!!!invalid!!!")
 
@@ -57,7 +62,7 @@ def test_place_order_invalid_secret(monkeypatch):
     assert response.get("ok") is False
     assert response.get("code") == "auth"
     assert response.get("endpoint") == "AddOrder"
-    assert "Invalid Kraken API secret" in (response.get("error") or "")
+    assert "EAuth:Invalid secret" in (response.get("error") or "")
     assert called is False
 
 
@@ -71,6 +76,7 @@ def test_set_live_mode_missing_credentials(monkeypatch, caplog):
     )
     monkeypatch.setenv("KRAKEN_API_KEY", "")
     monkeypatch.setenv("KRAKEN_API_SECRET", "")
+    monkeypatch.setattr(config_module, "_kraken_client", None, raising=False)
     monkeypatch.setitem(config_module.CONFIG, "kraken_api_key", "")
     monkeypatch.setitem(config_module.CONFIG, "kraken_api_secret", "")
 
@@ -95,6 +101,7 @@ def test_set_live_mode_bad_secret(monkeypatch, caplog):
     )
     monkeypatch.setenv("KRAKEN_API_KEY", "")
     monkeypatch.setenv("KRAKEN_API_SECRET", "")
+    monkeypatch.setattr(config_module, "_kraken_client", None, raising=False)
     monkeypatch.setitem(config_module.CONFIG, "kraken_api_key", "")
     monkeypatch.setitem(config_module.CONFIG, "kraken_api_secret", "")
 
@@ -141,6 +148,99 @@ def test_sanitize_base64_secret_helper():
     dirty = "  'Zm9vYmFy?%$#'  "
     sanitized = config_module._sanitize_base64_secret(dirty)
     assert sanitized == "Zm9vYmFy=="
+
+
+def test_sign_request_consistency():
+    """_sign_request matches the documented Kraken HMAC signature."""
+
+    secret_raw = b"unit-test-secret"
+    secret = base64.b64encode(secret_raw).decode()
+    nonce = "1616492376594"
+    postdata = "nonce=1616492376594&pair=XXBTZUSD"
+    uri_path = "/0/private/Balance"
+
+    expected = base64.b64encode(
+        hmac.new(
+            base64.b64decode(secret),
+            uri_path.encode() + hashlib.sha256((nonce + postdata).encode()).digest(),
+            hashlib.sha512,
+        ).digest()
+    ).decode()
+
+    actual = kraken_client._sign_request(uri_path, nonce, postdata, secret)  # type: ignore[attr-defined]
+
+    assert actual == expected
+
+
+def test_http_post_success(monkeypatch):
+    """_http_post returns parsed JSON when the transport succeeds."""
+
+    payload = {"result": {"foo": "bar"}}
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(kraken_client.requests, "post", lambda *args, **kwargs: DummyResponse())
+
+    result = kraken_client._http_post("https://example.com", "nonce=1", {}, 5.0)
+
+    assert result == payload
+
+
+def test_http_post_handles_http_error(monkeypatch):
+    """HTTP errors surface as KrakenAPIError."""
+
+    def _raise_http_error(*_, **__):
+        raise requests.exceptions.HTTPError("boom")
+
+    monkeypatch.setattr(kraken_client.requests, "post", _raise_http_error)
+
+    with pytest.raises(kraken_client.KrakenAPIError):
+        kraken_client._http_post("https://example.com", "nonce=1", {}, 5.0)
+
+
+def test_http_post_invalid_json(monkeypatch):
+    """Invalid JSON responses raise KrakenAPIError."""
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr(kraken_client.requests, "post", lambda *args, **kwargs: DummyResponse())
+
+    with pytest.raises(kraken_client.KrakenAPIError):
+        kraken_client._http_post("https://example.com", "nonce=1", {}, 5.0)
+
+
+def test_private_request_missing_credentials(monkeypatch):
+    """Missing credentials should short-circuit before HTTP transport."""
+
+    monkeypatch.setenv("KRAKEN_API_KEY", "")
+    monkeypatch.setenv("KRAKEN_API_SECRET", "")
+    monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_key", "")
+    monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_secret", "")
+
+    called = False
+
+    def fake_http_post(*_, **__):
+        nonlocal called
+        called = True
+        raise AssertionError("transport should not be invoked when credentials missing")
+
+    monkeypatch.setattr(kraken_client, "_http_post", fake_http_post)
+
+    response = kraken_client.kraken_place_order("BTC/USDC", "buy", 0.01, price=20_000.0)
+
+    assert response.get("ok") is False
+    assert response.get("code") == "auth"
+    assert called is False
 
 
 def test_place_order_success_with_valid_secret(monkeypatch):
@@ -418,7 +518,11 @@ def test_submit_live_trade_boundary_executes(monkeypatch):
         confidence=1.0,
     )
 
-    assert result is True
+    assert isinstance(result, dict)
+    # _submit_live_trade unwraps the single-element txid list for convenience
+    assert result.get("txid") == "test"
+    # ...while retaining the original list so downstream components can persist it verbatim
+    assert result.get("txid_list") == ["test"]
     assert captured_payload["size"] == pytest.approx(0.01000091)
     assert captured_payload["price"] == pytest.approx(5.1234)
 

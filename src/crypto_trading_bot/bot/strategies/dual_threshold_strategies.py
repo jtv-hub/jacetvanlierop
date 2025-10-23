@@ -48,7 +48,7 @@ class DualThresholdStrategy:
         lower = avg * 0.98
         upper = avg * 1.02
         debug_msg = (
-            f"[DEBUG] Close: {close_price}, RecentAvg: {avg:.4f}, " f"Bands: lower={lower:.4f}, upper={upper:.4f}"
+            "[DEBUG] Close: " f"{close_price}, RecentAvg: {avg:.4f}, " f"Bands: lower={lower:.4f}, upper={upper:.4f}"
         )
         print(debug_msg)
 

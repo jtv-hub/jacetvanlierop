@@ -108,13 +108,13 @@ def _load_seed_file() -> None:
 
 
 def _attempt_live_history(pair: str, min_len: int) -> List[Tuple[str, float]]:
-    """Retry Kraken OHLC before resorting to mock data so live mode only runs on real candles."""
+    """Retry Kraken OHLC before using mock data so live mode stays on real candles."""
     key = pair.upper()
     target = max(min_len, _LIVE_HISTORY_LIMIT)
     for attempt in range(_LIVE_HISTORY_ATTEMPTS):
         try:
             rows = get_ohlc_data(pair, interval=1, limit=target)
-        except Exception as exc:  # pragma: no cover - network dependent  # pylint: disable=broad-exception-caught
+        except (RuntimeError, ValueError) as exc:  # pragma: no cover - network dependent
             logger.warning(
                 "Live history fetch attempt %d/%d failed for %s: %s",
                 attempt + 1,
@@ -125,6 +125,9 @@ def _attempt_live_history(pair: str, min_len: int) -> List[Tuple[str, float]]:
             if attempt < _LIVE_HISTORY_ATTEMPTS - 1:
                 time.sleep(_LIVE_HISTORY_BACKOFF_SECONDS * (attempt + 1))
             continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Unexpected live history error for %s: %s", pair, exc)
+            raise
 
         if not rows:
             logger.debug("Kraken OHLC returned no rows for %s", pair)

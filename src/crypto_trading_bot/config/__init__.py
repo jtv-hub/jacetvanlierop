@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from crypto_trading_bot.utils.kraken_client import get_client
 from crypto_trading_bot.utils.secrets_manager import SecretNotFound, get_secret
 
 try:  # pragma: no cover - optional dependency
@@ -57,10 +58,14 @@ except ImportError:  # pragma: no cover - optional dependency
 
 if _kraken_client is not None:
     KrakenAPIError = _kraken_client.KrakenAPIError  # type: ignore[attr-defined]
+    KrakenAuthError = _kraken_client.KrakenAuthError  # type: ignore[attr-defined]
 else:  # pragma: no cover - fallback when client is unavailable
 
     class KrakenAPIError(RuntimeError):
         """Placeholder exception when Kraken client is not importable."""
+
+    class KrakenAuthError(RuntimeError):
+        """Placeholder auth error when Kraken client is unavailable."""
 
 
 _WITHDRAW_WARNING_LOGGED = False
@@ -172,7 +177,14 @@ def _assert_no_withdraw_rights() -> None:
             _WITHDRAW_WARNING_LOGGED = True
         return
 
-    permissions = query_api_key_permissions()
+    try:
+        permissions = query_api_key_permissions()
+    except _kraken_client.KrakenAPIError as exc:
+        logger.error("Kraken permissions check failed: %s", exc)
+        raise ConfigurationError(f"Kraken credential validation failed: {exc}") from exc
+    except _kraken_client.KrakenAuthError as exc:
+        logger.error("Kraken credential error during permissions check: %s", exc)
+        raise ConfigurationError(f"Kraken credential validation failed: {exc}") from exc
     if permissions is None:
         return
 
@@ -418,15 +430,15 @@ def _validate_credentials() -> Tuple[str, str]:
     )
 
     missing: list[str] = []
-    if not key:
+    if not key or key.strip() == "":
         missing.append("KRAKEN_API_KEY")
-    if not secret_raw:
+    if not secret_raw or secret_raw.strip() == "":
         missing.append("KRAKEN_API_SECRET")
 
     if missing:
-        message = "Kraken credential(s) missing: " + ", ".join(missing)
+        message = "Kraken credential(s) missing or empty: " + ", ".join(missing)
         logger.error(
-            "%s. Checked environment variables, credential files, secrets manager, " "and CONFIG fallback.",
+            "%s. Checked environment variables, credential files, secrets manager, and CONFIG fallback.",
             message,
         )
         raise ConfigurationError(message)
@@ -482,6 +494,27 @@ def _validate_credentials() -> Tuple[str, str]:
         CONFIG.get("_kraken_key_origin"),
         CONFIG.get("_kraken_secret_origin"),
     )
+
+    try:
+        client = _kraken_client or get_client(CONFIG)
+    except KrakenAuthError as exc:  # type: ignore[attr-defined]
+        logger.error("Credential client acquisition failed: %s", exc)
+        raise ConfigurationError(f"Credential validation failed: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - unexpected loader issues
+        logger.debug("Credential client acquisition encountered non-auth error: %s", exc)
+        client = None
+    if hasattr(client, "_private_request"):
+        try:
+            response = client._private_request("Balance", {})  # type: ignore[attr-defined]
+            if not response.get("ok"):
+                raise ConfigurationError(f"Credential validation failed: {response.get('error')}")
+        except KrakenAuthError as exc:  # type: ignore[attr-defined]
+            logger.error("Credential test failed: %s", exc)
+            raise ConfigurationError(f"Credential validation failed: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - network/transport issues
+            logger.debug("Credential live-check encountered non-auth error: %s", exc)
+            raise ConfigurationError(f"Unexpected error during credential validation: {exc}") from exc
+
     return key, secret_sanitized
 
 
@@ -491,10 +524,18 @@ def set_live_mode(flag: bool) -> None:
     if flag:
         try:
             _validate_credentials()
+            _assert_no_withdraw_rights()
         except ConfigurationError as exc:
+            logger.debug("set_live_mode caught ConfigurationError during credential validation: %s", exc)
             logger.error("Kraken API key/secret validation failed: %s", exc)
             raise
-        _assert_no_withdraw_rights()
+        except KrakenAuthError as exc:
+            logger.debug("set_live_mode caught KrakenAuthError: %s", exc)
+            logger.error("Kraken credential error during live mode activation: %s", exc)
+            raise ConfigurationError(f"Kraken credential validation failed: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - unexpected issues
+            logger.error("Unexpected exception during live mode activation: %s", exc)
+            raise ConfigurationError(f"Unexpected error during credential check: {exc}") from exc
     globals()["is_live"] = bool(flag)
     globals()["IS_LIVE"] = bool(flag)
     CONFIG["is_live"] = bool(flag)
@@ -592,13 +633,24 @@ def _load_tradable_pairs() -> list[str]:
             rejected.append(pair)
             continue
 
-        quote = str(meta.get("quote", "")).upper()
-        altname = str(meta.get("altname", "")).upper()
-        if quote == "USDC" or altname.endswith("USDC"):
+        quote = str(meta.get("quote") or "").upper()
+        altname = str(meta.get("altname") or "").upper()
+        alt_suffixes = {
+            altname[-4:] if len(altname) >= 4 else "",
+            altname[-5:] if len(altname) >= 5 else "",
+        }
+        acceptable_quotes = {"USDC", "ZUSD"}
+        if quote in acceptable_quotes or alt_suffixes.intersection(acceptable_quotes):
+            validated.append(pair)
+        elif not quote and not altname:
+            logger.warning(
+                "Pair %s accepted with sparse Kraken metadata (quote/altname blank).",
+                pair,
+            )
             validated.append(pair)
         else:
             logger.critical(
-                "Pair %s rejected: Kraken metadata quote=%s altname=%s (expected USDC)",
+                "Pair %s rejected: Kraken metadata quote=%s altname=%s (expected USDC or ZUSD)",
                 pair,
                 quote,
                 altname,

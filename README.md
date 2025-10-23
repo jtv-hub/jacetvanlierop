@@ -14,6 +14,19 @@ pre-commit install && pre-commit run -a
 ruff check .
 ```
 
+## Audit & Verification
+
+All deployment audits rely on the existing, battle-tested commands below—no extra scripts are required:
+
+```bash
+venv/bin/python -m pytest
+bash scripts/final_health_audit.sh --dry-run
+# When Kraken credentials are live and verified:
+bash scripts/final_health_audit.sh
+```
+
+These cover functional correctness, Kraken API integration, trade-log reconciliation, and risk guards; introducing additional audits would duplicate effort and slow down go-live.
+
 ## Autonomous Execution
 
 To keep the trading pipeline running while VS Code is closed, load the provided launchd agents:

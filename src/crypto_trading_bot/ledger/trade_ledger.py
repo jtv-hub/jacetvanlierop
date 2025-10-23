@@ -16,14 +16,16 @@ import random
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from crypto_trading_bot import config as bot_config
 from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
-from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.config import CONFIG, IS_LIVE
+from crypto_trading_bot.utils.kraken_client import get_usdc_balance, kraken_get_balance
 from crypto_trading_bot.utils.system_logger import (
     SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
 )
@@ -65,6 +67,7 @@ _MISSING_TRADE_WINDOW_SECONDS = float(os.getenv("MISSING_TRADE_ALERT_WINDOW", "3
 _DUPLICATE_WINDOW_SECONDS = float(os.getenv("TRADE_DUPLICATE_WINDOW_SECONDS", "90"))
 _DUPLICATE_SIZE_REL_TOL = float(os.getenv("TRADE_DUPLICATE_SIZE_REL_TOL", "0.001"))
 _DUPLICATE_SIZE_ABS_TOL = float(os.getenv("TRADE_DUPLICATE_SIZE_ABS_TOL", "1e-6"))
+_DECIMAL_TWO_PLACES = Decimal("0.01")
 
 _EXIT_REASON_CANONICAL_MAP = {
     "STOP_LOSS": "sl_triggered",
@@ -87,6 +90,53 @@ _EXIT_REASON_CANONICAL_MAP = {
     "KILL_SWITCH": "emergency_stop",
     "EMERGENCY_STOP": "emergency_stop",
 }
+
+
+def _to_decimal(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return Decimal(str(value))
+    try:
+        candidate = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return candidate if candidate.is_finite() else None
+
+
+def _round_balance(value: Any) -> Optional[float]:
+    decimal_value = _to_decimal(value)
+    if decimal_value is None:
+        return None
+    try:
+        rounded = decimal_value.quantize(_DECIMAL_TWO_PLACES, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return None
+    return float(rounded)
+
+
+def _safe_float(value: Any) -> float | None:
+    decimal_value = _to_decimal(value)
+    if decimal_value is None:
+        return None
+    return float(decimal_value)
+
+
+def _calculate_balance_delta(entry_balance: Any, exit_balance: Any) -> float | None:
+    entry_decimal = _to_decimal(entry_balance)
+    exit_decimal = _to_decimal(exit_balance)
+    if entry_decimal is None or exit_decimal is None:
+        return None
+    delta = exit_decimal - entry_decimal
+    try:
+        quantized = delta.quantize(_DECIMAL_TWO_PLACES, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return None
+    return float(quantized)
 
 
 def _canonical_exit_reason(*candidates: Any) -> tuple[str, str]:
@@ -238,6 +288,32 @@ def validate_trade_entry(trade: dict) -> dict:
     return trade
 
 
+def _ensure_closed_trade_metadata(trade: dict) -> bool:
+    """Ensure legacy closed trades have required metadata populated."""
+
+    if trade.get("status") != "closed":
+        return False
+
+    mutated = False
+
+    norm_side = _normalize_side(
+        trade.get("side"),
+        strategy=trade.get("strategy"),
+        roi=trade.get("roi"),
+    )
+    side_value = trade.get("side")
+    if not isinstance(side_value, str) or side_value.strip().lower() not in {"long", "short"}:
+        trade["side"] = norm_side
+        mutated = True
+
+    buffer_value = trade.get("capital_buffer")
+    if not isinstance(buffer_value, (int, float)):
+        trade["capital_buffer"] = 0.25
+        mutated = True
+
+    return mutated
+
+
 class TradeLedger:
     """
     A class to manage trade lifecycle logging, updating, and validation.
@@ -257,7 +333,107 @@ class TradeLedger:
         self._missing_trade_window: Dict[str, Dict[str, Any]] = {}
         self._pause_new_trades_once = False
         self._pause_reason: str | None = None
+        self.account_balance: Optional[float] = None
+        self.txid_index: dict[str, str] = {}
+        self._balance_source: str = "unknown"
         self.reload_trades()
+
+    def _fetch_runtime_balance(self) -> Optional[float]:
+        """Return the current USDC balance from portfolio/market data helpers."""
+
+        try:
+            balance = get_usdc_balance()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            system_logger.warning("USDC balance fetch failed: %s", exc)
+            return None
+
+        value = _safe_float(balance)
+        if value is None:
+            system_logger.warning("USDC balance fetch returned non-numeric value: %r", balance)
+            return None
+
+        if math.isclose(value, 0.0, abs_tol=1e-9):
+            system_logger.warning("USDC balance fetch returned zero. Verify live balance configuration.")
+        system_logger.info("Fetched runtime USDC balance %.2f", value)
+        return value
+
+    def _apply_runtime_balance(
+        self,
+        trade: Dict[str, Any],
+        *,
+        entry_balance: Optional[float] = None,
+    ) -> None:
+        """Inject the latest account balance into ``trade`` if available."""
+
+        existing_balance = trade.get("account_balance")
+        existing_delta = trade.get("balance_delta")
+
+        balance_value = self._fetch_runtime_balance()
+        if balance_value is None:
+            if existing_balance is None:
+                trade["account_balance"] = None
+            if entry_balance is not None:
+                if existing_delta is None:
+                    trade["balance_delta"] = None
+                system_logger.warning(
+                    "Missing live balance when closing trade %s; balance_delta unavailable.",
+                    trade.get("trade_id"),
+                )
+            else:
+                if existing_balance is None:
+                    system_logger.warning(
+                        "Missing live balance when logging trade %s; account_balance unavailable.",
+                        trade.get("trade_id"),
+                    )
+            return
+
+        rounded_balance = _round_balance(balance_value)
+        if rounded_balance is None:
+            if existing_balance is None:
+                trade["account_balance"] = None
+            if entry_balance is not None:
+                if existing_delta is None:
+                    trade["balance_delta"] = None
+                system_logger.warning(
+                    "Unable to round live balance for trade %s; balance_delta unavailable.",
+                    trade.get("trade_id"),
+                )
+            else:
+                if existing_balance is None:
+                    system_logger.warning(
+                        "Unable to round live balance for trade %s; account_balance unavailable.",
+                        trade.get("trade_id"),
+                    )
+            return
+
+        self.account_balance = rounded_balance
+        trade["account_balance"] = rounded_balance
+        system_logger.info(
+            "Trade %s balance snapshot=%s",
+            trade.get("trade_id"),
+            rounded_balance,
+        )
+
+        if entry_balance is not None:
+            delta_value = _calculate_balance_delta(entry_balance, rounded_balance)
+            trade["balance_delta"] = delta_value
+            if delta_value is None:
+                system_logger.warning(
+                    "Unable to compute balance_delta for trade %s (entry=%s exit=%s).",
+                    trade.get("trade_id"),
+                    entry_balance,
+                    rounded_balance,
+                )
+            else:
+                system_logger.info(
+                    "Trade %s balance lifecycle entry=%.2f exit=%.2f delta=%.2f",
+                    trade.get("trade_id"),
+                    entry_balance,
+                    rounded_balance,
+                    delta_value,
+                )
+        else:
+            trade["balance_delta"] = existing_delta
 
     def _find_recent_duplicate(self, trade: dict) -> dict | None:
         """Return an existing trade that matches the provided signature."""
@@ -383,6 +559,20 @@ class TradeLedger:
             if not isinstance(entry_price_val, (int, float)) or entry_price_val <= 0:
                 raise ValueError(f"[Ledger] Invalid entry_price: {entry_price_val}")
 
+        fills = kwargs.get("fills")
+        txid = kwargs.get("txid")
+        gross_amount = kwargs.get("gross_amount")
+        fee_amount = kwargs.get("fee")
+        net_amount = kwargs.get("net_amount")
+        fill_price_override = kwargs.get("fill_price")
+        filled_volume = kwargs.get("filled_volume")
+        reconciled_flag = bool(kwargs.get("reconciled", False))
+        pending_flag = bool(kwargs.get("pending_reconciliation", False))
+        source_flag = kwargs.get("source") or ("kraken" if reconciled_flag else "local")
+        pending_at = kwargs.get("pending_reconciliation_at")
+        if isinstance(pending_at, datetime):
+            pending_at = pending_at.isoformat()
+
         trade_id = kwargs.get("trade_id") or str(uuid.uuid4())
         entry_price = kwargs.get("entry_price", 18000 + 250 * (0.5 - random.random()))
         # Normalize side to long/short; map to order side for slippage
@@ -398,9 +588,48 @@ class TradeLedger:
             order_side,
         )
 
+        if filled_volume is not None:
+            try:
+                filled_volume = float(filled_volume)
+                if filled_volume > 0:
+                    trade_size = float(filled_volume)
+            except (TypeError, ValueError):
+                filled_volume = None
+
+        if fill_price_override:
+            try:
+                entry_price_adj = float(fill_price_override)
+            except (TypeError, ValueError):
+                pass
+
         capital_buffer = kwargs.get("capital_buffer", 0.25)
         tax_method = kwargs.get("tax_method", "FIFO")
         regime = kwargs.get("regime", "unknown")
+
+        normalized_txid = None
+        if txid:
+            if isinstance(txid, (list, tuple)):
+                normalized_txid = [str(item) for item in txid if item]
+            else:
+                normalized_txid = [str(txid)]
+
+        # If Kraken provided a precise cost basis, prefer it.
+        gross_amount_float = _safe_float(gross_amount)
+        fee_amount_float = _safe_float(fee_amount)
+        net_amount_float = _safe_float(net_amount)
+
+        if gross_amount_float is not None:
+            cost_basis = abs(gross_amount_float)
+        else:
+            cost_basis = round(entry_price_adj * trade_size, 4)
+
+        try:
+            if fill_price_override is not None:
+                fill_price_value = float(fill_price_override)
+            else:
+                fill_price_value = None
+        except (TypeError, ValueError):
+            fill_price_value = None
 
         trade = {
             "trade_id": trade_id,
@@ -412,7 +641,7 @@ class TradeLedger:
             "status": "executed",
             "capital_buffer": capital_buffer,
             "tax_method": tax_method,
-            "cost_basis": round(entry_price_adj * trade_size, 4),
+            "cost_basis": round(cost_basis, 4),
             "entry_price": entry_price_adj,
             # Persist side so downstream logic can apply correct exit behavior
             "side": side_norm,
@@ -428,6 +657,19 @@ class TradeLedger:
             # Slippage metadata
             "entry_slippage_rate": round(slip_rate, 6),
             "entry_slippage_amount": slippage_amount_entry,
+            "fills": fills if isinstance(fills, list) else None,
+            "gross_amount": (round(gross_amount_float, 8) if gross_amount_float is not None else None),
+            "fee": round(fee_amount_float, 8) if fee_amount_float is not None else None,
+            "net_amount": (round(net_amount_float, 8) if net_amount_float is not None else None),
+            "balance_delta": None,
+            "account_balance": None,
+            "fill_price": fill_price_value,
+            "filled_volume": (float(filled_volume) if isinstance(filled_volume, (int, float)) else None),
+            "txid": normalized_txid,
+            "reconciled": reconciled_flag,
+            "pending_reconciliation": pending_flag,
+            "source": source_flag,
+            "pending_reconciliation_at": pending_at,
         }
 
         # Debug: emit the trade being logged for diagnostics (opt-in)
@@ -515,10 +757,47 @@ class TradeLedger:
             )
             return existing_id
 
+        balance_delta_value = None
+        balance_delta_provided = "balance_delta" in kwargs and kwargs.get("balance_delta") is not None
+        if balance_delta_provided:
+            balance_delta_value = _safe_float(kwargs.get("balance_delta"))
+        if balance_delta_value is None:
+            balance_delta_value = net_amount_float
+
+        existing_balance = _safe_float(self.account_balance)
+        if balance_delta_value is not None:
+            updated_balance = (existing_balance or 0.0) + balance_delta_value
+            self.account_balance = updated_balance
+            trade["balance_delta"] = balance_delta_value
+            trade["account_balance"] = updated_balance
+        else:
+            trade["balance_delta"] = None
+            trade["account_balance"] = _round_balance(existing_balance)
+
+        if not balance_delta_provided:
+            previous_balance = trade.get("account_balance")
+            previous_delta = trade.get("balance_delta")
+
+            # Attach live/paper balance snapshot for diagnostics.
+            self._apply_runtime_balance(trade)
+
+            if trade.get("account_balance") is None and previous_balance is not None:
+                trade["account_balance"] = previous_balance
+            if trade.get("balance_delta") is None and previous_delta is not None:
+                trade["balance_delta"] = previous_delta
+            if trade.get("account_balance") is None:
+                system_logger.warning(
+                    "Trade %s logged without account_balance; review live balance configuration.",
+                    trade_id,
+                )
+
         # Write compact, one-line JSON to trades.log via trade_logger
         trade_logger.info(json.dumps(trade, separators=(",", ":")))
         self.trades.append(trade)
         self.trade_index[trade_id] = trade
+        if normalized_txid:
+            for tx in normalized_txid:
+                self.txid_index[tx] = trade_id
         return trade_id
 
     def _register_missing_trade(
@@ -775,6 +1054,17 @@ class TradeLedger:
                         roi=t_obj.get("roi"),
                     )
                     exit_side = "buy" if norm_side == "short" else "sell"
+
+                    # Ensure critical metadata is populated before we persist updates.
+                    if not isinstance(cur_side, str) or not cur_side.strip():
+                        t_obj["side"] = norm_side
+                    else:
+                        t_obj["side"] = cur_side.strip().lower()
+                    capital_buffer_value = t_obj.get("capital_buffer")
+                    if not isinstance(capital_buffer_value, (int, float)):
+                        capital_buffer_value = 0.25
+                    t_obj["capital_buffer"] = round(float(capital_buffer_value), 6)
+
                     exit_adj, exit_slippage_amount, slip_rate = _apply_slippage(
                         t_obj.get("pair"),
                         float(exit_price),
@@ -829,6 +1119,40 @@ class TradeLedger:
                             "exit_slippage_amount": exit_slippage_amount,
                         }
                     )
+                    pre_update_balance = t_obj.get("account_balance")
+                    pre_update_delta = t_obj.get("balance_delta")
+                    entry_balance_snapshot = _safe_float(pre_update_balance)
+                    self._apply_runtime_balance(
+                        t_obj,
+                        entry_balance=entry_balance_snapshot,
+                    )
+                    if t_obj.get("account_balance") is None and pre_update_balance is not None:
+                        t_obj["account_balance"] = pre_update_balance
+                    if (
+                        entry_balance_snapshot is not None
+                        and t_obj.get("balance_delta") is None
+                        and t_obj.get("account_balance") is not None
+                    ):
+                        fallback_delta = _calculate_balance_delta(
+                            entry_balance_snapshot,
+                            t_obj.get("account_balance"),
+                        )
+                        if fallback_delta is not None:
+                            t_obj["balance_delta"] = fallback_delta
+                    if t_obj.get("balance_delta") is None and pre_update_delta is not None:
+                        t_obj["balance_delta"] = pre_update_delta
+                    if t_obj.get("account_balance") is None:
+                        system_logger.warning(
+                            "Trade %s closed without account_balance; review live balance configuration.",
+                            trade_id,
+                        )
+                    elif entry_balance_snapshot is not None and t_obj.get("balance_delta") is None:
+                        system_logger.warning(
+                            "Trade %s closed without balance_delta (entry=%s exit=%s).",
+                            trade_id,
+                            entry_balance_snapshot,
+                            t_obj.get("account_balance"),
+                        )
                     # Revalidate updated trade; log anomaly but do not abort update flow
                     try:
                         validate_trade_schema(t_obj)
@@ -963,6 +1287,8 @@ class TradeLedger:
         Returns the list of trades.
         """
         self.trades = []
+        self.txid_index = {}
+        legacy_mutations = False
         if os.path.exists(TRADES_LOG_PATH):
             with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
                 for line in f:
@@ -971,6 +1297,24 @@ class TradeLedger:
                     try:
                         trade = json.loads(line)
                         if trade.get("trade_id"):
+                            # Populate defaults for backward compatibility
+                            trade.setdefault("txid", None)
+                            trade.setdefault("gross_amount", None)
+                            trade.setdefault("fee", None)
+                            trade.setdefault("net_amount", None)
+                            trade.setdefault("balance_delta", None)
+                            trade.setdefault("account_balance", None)
+                            trade.setdefault("reconciled", False)
+                            trade.setdefault("pending_reconciliation", False)
+                            trade.setdefault("source", "local")
+                            trade.setdefault("pending_reconciliation_at", None)
+                            tx_field = trade.get("txid")
+                            if isinstance(tx_field, str):
+                                trade["txid"] = [tx_field]
+                            elif not isinstance(tx_field, list):
+                                trade["txid"] = []
+                            if _ensure_closed_trade_metadata(trade):
+                                legacy_mutations = True
                             self.trades.append(trade)
                     except json.JSONDecodeError as e:
                         raw = line.strip()
@@ -987,10 +1331,161 @@ class TradeLedger:
                 trade_id = trade.get("trade_id")
                 if trade_id:
                     self.trade_index[trade_id] = trade
+                tx_values = trade.get("txid")
+                if isinstance(tx_values, list):
+                    for tx in tx_values:
+                        if isinstance(tx, str):
+                            self.txid_index[tx] = trade_id
             system_logger.info("Reloaded %s trades from trades.log", len(self.trades))
         else:
             system_logger.info("No trades.log file found.")
+        if legacy_mutations:
+            system_logger.info("Detected legacy trade entries missing metadata; rewriting trades.log.")
+            self._rewrite_trades_file()
+        latest_balance: Optional[float] = None
+        for trade in self.trades:
+            acct_value = _safe_float(trade.get("account_balance"))
+            if acct_value is not None:
+                latest_balance = acct_value
+        self.account_balance = latest_balance
         return self.trades
+
+    def _rewrite_trades_file(self) -> None:
+        """Rewrite trades.log with current in-memory trades."""
+
+        directory = os.path.dirname(TRADES_LOG_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(TRADES_LOG_PATH, "w", encoding="utf-8") as handle:
+            for trade in self.trades:
+                handle.write(json.dumps(trade, separators=(",", ":")) + "\n")
+
+    def mark_pending_reconciliation(
+        self,
+        trade_id: str,
+        *,
+        pending: bool = True,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        """Toggle the pending reconciliation flag for ``trade_id``."""
+
+        trade = self.trade_index.get(trade_id)
+        if not trade:
+            return
+        trade["pending_reconciliation"] = pending
+        if pending:
+            trade["reconciled"] = False
+            trade["pending_reconciliation_at"] = (timestamp or datetime.now(timezone.utc)).isoformat()
+        if "account_balance" not in trade or trade["account_balance"] is None:
+            trade["account_balance"] = _round_balance(self.account_balance)
+        if not pending:
+            trade["pending_reconciliation_at"] = None
+        self._rewrite_trades_file()
+
+    def mark_reconciled(self, trade_id: str) -> None:
+        """Mark ``trade_id`` as reconciled and persist the ledger update."""
+
+        trade = self.trade_index.get(trade_id)
+        if not trade:
+            return
+        trade["reconciled"] = True
+        trade["pending_reconciliation"] = False
+        trade["pending_reconciliation_at"] = None
+        if "account_balance" not in trade or trade["account_balance"] is None:
+            trade["account_balance"] = _round_balance(self.account_balance)
+        self._rewrite_trades_file()
+
+    def find_trade_by_txid(self, txid: str) -> Optional[dict]:
+        """Return the trade entry associated with a Kraken transaction id."""
+
+        trade_id = self.txid_index.get(txid)
+        if not trade_id:
+            return None
+        return self.trade_index.get(trade_id)
+
+    def get_account_balance(self) -> float:
+        """Return the latest known account balance tracked by the ledger."""
+
+        if IS_LIVE:
+            asset = (CONFIG.get("kraken", {}) or {}).get("balance_asset", "USDC")
+            try:
+                response = kraken_get_balance(asset)
+            except Exception as exc:  # pylint: disable=broad-except
+                system_logger.error("[BALANCE] Kraken balance fetch failed: %s", exc)
+                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.") from exc
+
+            if not isinstance(response, dict):
+                system_logger.error("[BALANCE] Kraken balance response malformed: %r", response)
+                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.")
+
+            balance_value = response.get("balance")
+            if balance_value is None:
+                payload = response.get("result")
+                if isinstance(payload, dict):
+                    candidates = [
+                        asset,
+                        asset.upper(),
+                        "USDC",
+                        "USD",
+                        "ZUSD",
+                    ]
+                    for key in candidates:
+                        if key in payload and payload[key] is not None:
+                            balance_value = payload[key]
+                            break
+
+            try:
+                balance_float = float(balance_value)
+            except (TypeError, ValueError):
+                balance_float = None
+
+            if balance_float is None or not math.isfinite(balance_float) or balance_float < 0:
+                detail = response.get("error") or response.get("code") or "missing-balance"
+                system_logger.error(
+                    "[BALANCE] Kraken balance invalid asset=%s detail=%s payload=%s",
+                    asset,
+                    detail,
+                    response,
+                )
+                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.")
+
+            system_logger.info("[BALANCE] Live Kraken balance fetched: $%.2f", balance_float)
+            self.account_balance = balance_float
+            self._balance_source = "kraken_live"
+            return balance_float
+
+        fallback = None
+        paper_cfg = CONFIG.get("paper_mode", {}) or {}
+        if "starting_balance" in paper_cfg:
+            fallback = paper_cfg.get("starting_balance")
+        if fallback is None:
+            fallback = CONFIG.get("initial_capital")
+        if fallback is None:
+            fallback = 100_000.0
+
+        try:
+            tracked_balance = float(self.account_balance)
+        except (TypeError, ValueError):
+            tracked_balance = None
+        if tracked_balance is not None and (tracked_balance != 0.0 or self.trades):
+            system_logger.info("[BALANCE] Using tracked ledger balance: $%.2f", tracked_balance)
+            self._balance_source = "paper_tracked"
+            return tracked_balance
+
+        try:
+            balance_float = float(fallback)
+        except (TypeError, ValueError):
+            balance_float = 100_000.0
+
+        system_logger.info("[BALANCE] Using simulated paper balance: $%.2f", balance_float)
+        self.account_balance = balance_float
+        self._balance_source = "paper_simulated"
+        return balance_float
+
+    def get_balance_source(self) -> str:
+        """Return the most recent balance source identifier."""
+
+        return getattr(self, "_balance_source", "unknown")
 
     def verify_trade_update(self, target_trade_id):
         """

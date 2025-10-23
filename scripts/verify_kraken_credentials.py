@@ -45,7 +45,11 @@ def _build_private_request(
     body["nonce"] = nonce
     postdata = urlencode(body, doseq=True)
     api_sign = kraken_client._sign_request(f"/0/private/{endpoint}", nonce, postdata, api_secret)
-    headers = kraken_client._build_headers(api_key, api_sign)
+    headers = kraken_client.build_request_headers(
+        api_key,
+        api_sign,
+        user_agent="crypto-trading-bot/verify-credentials",
+    )
     return nonce, postdata, headers
 
 
@@ -156,7 +160,26 @@ def verify() -> int:
         )
         logger.debug("Balance nonce=%s", nonce)
         _log_private_request("Balance", headers)
-        _post("Balance", postdata, headers)
+        response = _post("Balance", postdata, headers)
+        result_block = response.get("result") if isinstance(response, dict) else None
+        usdc_balance = None
+        if isinstance(result_block, dict):
+            for key in ("USDC", "ZUSD", "USD"):
+                candidate = result_block.get(key)
+                if candidate is not None:
+                    usdc_balance = candidate
+                    break
+        if usdc_balance is not None:
+            try:
+                balance_float = float(usdc_balance)
+            except (TypeError, ValueError):
+                balance_float = None
+            if balance_float is not None:
+                logger.info("Detected Kraken USDC balance: %.8f", balance_float)
+            else:
+                logger.info("Detected Kraken USDC balance: %s", usdc_balance)
+        else:
+            logger.warning("Unable to detect USDC balance in response: %s", result_block)
     except (KrakenAPIError, TimeoutError, OSError, ValueError) as exc:
         logger.exception("Balance verification failed: %s", exc)
     else:

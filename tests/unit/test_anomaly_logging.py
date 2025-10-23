@@ -15,10 +15,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
-from src.crypto_trading_bot.indicators import rsi
-from src.crypto_trading_bot.learning.confidence_audit import log_anomaly
-from src.crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
+from crypto_trading_bot.indicators import rsi
+from crypto_trading_bot.learning.confidence_audit import log_anomaly
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
 
 def _stub_numpy_and_dotenv():
@@ -133,7 +133,7 @@ def test_trade_ledger_schema_error_logs():
 
     # Intentionally pass wrong type for regime to trigger schema validation error
     with pytest.raises(TypeError):
-        tl.log_trade("BTC/USDC", 0.01, "PytestStrategy", confidence=0.5, regime=123)
+        tl.log_trade("BTC/USDC", 0.01, "PytestStrategy", confidence=0.6, regime=123)
 
     # Find a recent schema error line
     lines = _read_anomalies_lines_tail()
@@ -173,7 +173,7 @@ def test_missing_exit_price_anomaly_logged():
         trading_pair="BTC/USDC",
         trade_size=0.001,
         strategy_name="TestStrat",
-        confidence=0.5,
+        confidence=0.6,
         entry_price=20000.0,
     )
 

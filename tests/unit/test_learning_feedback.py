@@ -13,8 +13,11 @@ from datetime import datetime, timezone
 import numpy as np
 
 
-def test_learning_feedback_writes_suggestions(_tmp_path):
-    """Generate dummy trades, run learning, and assert suggestions written."""
+def test_learning_feedback_writes_suggestions(tmp_path):
+    # Fixture kept for compatibility with earlier versions; discard to avoid lint warnings.
+    del tmp_path
+
+    # Generate dummy trades, run learning, and assert suggestions written.
     # Sanity-check numpy behaves normally (array creation and boolean mask ops)
     arr = np.array([1.0, -0.5, 0.2], dtype=float)
     wins = int((arr > 0).sum())
@@ -62,7 +65,7 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
     # running a single cycle and generating simple suggestions
     import importlib  # pylint: disable=import-outside-toplevel
 
-    lm = importlib.import_module("src.crypto_trading_bot.learning.learning_machine")
+    lm = importlib.import_module("crypto_trading_bot.learning.learning_machine")
     if hasattr(lm, "run_learning_machine"):
         lm.run_learning_machine()
     else:
@@ -70,7 +73,7 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
         metrics = lm.run_learning_cycle()
         try:
             # pylint: disable-next=import-outside-toplevel
-            from src.crypto_trading_bot.learning.optimization import (
+            from crypto_trading_bot.learning.optimization import (
                 generate_suggestions,
             )
         except ImportError:
@@ -92,4 +95,7 @@ def test_learning_feedback_writes_suggestions(_tmp_path):
         lines = [ln.strip() for ln in f if ln.strip()]
     assert lines, "learning_feedback.jsonl has no entries"
     first = json.loads(lines[0])
-    assert "suggestion" in first and "confidence" in first
+    # Accept either legacy "suggestion"/"confidence" keys or the newer schema with strategy/confidence_* fields.
+    has_legacy_keys = "suggestion" in first and "confidence" in first
+    has_modern_keys = {"strategy", "confidence_after", "status"}.issubset(first.keys())
+    assert has_legacy_keys or has_modern_keys, f"Unexpected suggestion schema: {first}"
