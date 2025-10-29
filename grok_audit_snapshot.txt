@@ -20,14 +20,11 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
 
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
-
 from crypto_trading_bot import config as bot_config
 from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG, IS_LIVE
-from crypto_trading_bot.utils.file_locks import _locked_file
 from crypto_trading_bot.utils.kraken_client import get_usdc_balance, kraken_get_balance
 from crypto_trading_bot.utils.system_logger import (
     SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
@@ -46,7 +43,6 @@ SLIPPAGE = 0.002  # default fallback; per-asset slippage from CONFIG overrides t
 
 # System logger (warnings/errors/debug) to logs/system.log
 system_logger = get_system_logger()
-
 
 # Trade logger (message-only JSON lines) to logs/trades.log
 trade_logger = logging.getLogger("trade_ledger.trades")
@@ -141,18 +137,6 @@ def _calculate_balance_delta(entry_balance: Any, exit_balance: Any) -> float | N
     except InvalidOperation:
         return None
     return float(quantized)
-
-
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=16),
-    retry=retry_if_exception_type((RuntimeError, OSError, ValueError)),
-)
-def _kraken_get_balance_retry(asset: str):
-    """Retry wrapper around Kraken balance fetch."""
-
-    return kraken_get_balance(asset)
 
 
 def _canonical_exit_reason(*candidates: Any) -> tuple[str, str]:
@@ -352,58 +336,7 @@ class TradeLedger:
         self.account_balance: Optional[float] = None
         self.txid_index: dict[str, str] = {}
         self._balance_source: str = "unknown"
-        self._drawdown_guard_active = False
         self.reload_trades()
-
-    def _current_max_drawdown(self, *, sample: int = 500) -> float:
-        """Return absolute drawdown from recent closed trades."""
-
-        if not self.trades and os.path.exists(TRADES_LOG_PATH):
-            self.reload_trades()
-
-        rois: list[float] = []
-        for trade in self.trades[-sample:]:
-            if (trade.get("status") or "").lower() != "closed":
-                continue
-            roi_val = _safe_float(trade.get("roi"))
-            if roi_val is not None:
-                rois.append(roi_val)
-        equity = 1.0
-        peak = 1.0
-        max_dd = 0.0
-        for roi in rois:
-            equity *= 1.0 + roi
-            if equity > peak:
-                peak = equity
-            if peak > 0:
-                drawdown = (equity - peak) / peak
-                if drawdown < max_dd:
-                    max_dd = drawdown
-        return abs(max_dd)
-
-    def _guard_drawdown_limit(self, *, limit: float = 0.10) -> None:
-        """Raise if cumulative drawdown breaches ``limit``."""
-
-        drawdown = self._current_max_drawdown()
-        if drawdown < limit:
-            self._drawdown_guard_active = False
-            return
-
-        message = f"[Ledger] Drawdown guard triggered — {drawdown:.2%} ≥ {limit:.2%}"
-        system_logger.error(message)
-        if not self._drawdown_guard_active:
-            send_alert(
-                "Trading halted: drawdown guard tripped",
-                level="CRITICAL",
-                context={"drawdown_pct": round(drawdown, 6), "limit_pct": round(limit, 6)},
-            )
-        self._drawdown_guard_active = True
-        raise RuntimeError(message)
-
-    def get_current_drawdown(self) -> float:
-        """Return the absolute drawdown observed across recent closed trades."""
-
-        return self._current_max_drawdown()
 
     def _fetch_runtime_balance(self) -> Optional[float]:
         """Return the current USDC balance from portfolio/market data helpers."""
@@ -621,7 +554,6 @@ class TradeLedger:
         min_sz = float(CONFIG.get("trade_size", {}).get("min", 0.0001))
         max_sz = float(CONFIG.get("trade_size", {}).get("max", max(trade_size, 1.0)))
         trade_size = max(min_sz, min(trade_size, max_sz))
-        self._guard_drawdown_limit(limit=0.10)
         if "entry_price" in kwargs:
             entry_price_val = kwargs["entry_price"]
             if not isinstance(entry_price_val, (int, float)) or entry_price_val <= 0:
@@ -862,10 +794,6 @@ class TradeLedger:
         # Write compact, one-line JSON to trades.log via trade_logger
         trade_logger.info(json.dumps(trade, separators=(",", ":")))
         self.trades.append(trade)
-        unique_trades = {}
-        for t in self.trades:
-            unique_trades[t.get("trade_id")] = t
-        self.trades = list(unique_trades.values())
         self.trade_index[trade_id] = trade
         if normalized_txid:
             for tx in normalized_txid:
@@ -1215,7 +1143,7 @@ class TradeLedger:
                         t_obj["balance_delta"] = pre_update_delta
                     if t_obj.get("account_balance") is None:
                         system_logger.warning(
-                            "Trade %s closed without account_balance; " "review live balance configuration.",
+                            "Trade %s closed without account_balance; review live balance configuration.",
                             trade_id,
                         )
                     elif entry_balance_snapshot is not None and t_obj.get("balance_delta") is None:
@@ -1297,18 +1225,24 @@ class TradeLedger:
                     try:
                         if os.path.exists(POSITIONS_PATH):
                             tmp_pos = POSITIONS_PATH + ".tmp"
-                            with _locked_file(POSITIONS_PATH, "r") as src:
-                                with _locked_file(tmp_pos, "w") as dst:
-                                    for line in src:
-                                        try:
-                                            obj = json.loads(line)
-                                            if obj.get("trade_id") == trade_id:
-                                                # skip removed position
-                                                continue
-                                        except json.JSONDecodeError:
-                                            # preserve unparseable lines as-is
-                                            pass
-                                        dst.write(line)
+                            with open(POSITIONS_PATH, "r", encoding="utf-8") as src:
+                                with open(tmp_pos, "w", encoding="utf-8") as dst:
+                                    fcntl.flock(dst, fcntl.LOCK_EX)
+                                    try:
+                                        for line in src:
+                                            try:
+                                                obj = json.loads(line)
+                                                if obj.get("trade_id") == trade_id:
+                                                    # skip removed position
+                                                    continue
+                                            except json.JSONDecodeError:
+                                                # preserve unparseable lines as-is
+                                                pass
+                                            dst.write(line)
+                                        dst.flush()
+                                        os.fsync(dst.fileno())
+                                    finally:
+                                        fcntl.flock(dst, fcntl.LOCK_UN)
                             os.replace(tmp_pos, POSITIONS_PATH)
                             system_logger.debug(
                                 "Synchronized positions.jsonl — removed closed position %s",
@@ -1356,7 +1290,7 @@ class TradeLedger:
         self.txid_index = {}
         legacy_mutations = False
         if os.path.exists(TRADES_LOG_PATH):
-            with _locked_file(TRADES_LOG_PATH, "r") as f:
+            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -1390,13 +1324,6 @@ class TradeLedger:
                             redacted,
                             e,
                         )
-            unique_trades: dict[str, dict] = {}
-            for trade in self.trades:
-                tid = trade.get("trade_id")
-                if tid and tid not in unique_trades:
-                    unique_trades[tid] = trade
-            self.trades = list(unique_trades.values())
-
             self.trade_index = {}
             for trade in self.trades:
                 if not trade:
@@ -1429,7 +1356,7 @@ class TradeLedger:
         directory = os.path.dirname(TRADES_LOG_PATH)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with _locked_file(TRADES_LOG_PATH, "w") as handle:
+        with open(TRADES_LOG_PATH, "w", encoding="utf-8") as handle:
             for trade in self.trades:
                 handle.write(json.dumps(trade, separators=(",", ":")) + "\n")
 
@@ -1482,16 +1409,13 @@ class TradeLedger:
         if IS_LIVE:
             asset = (CONFIG.get("kraken", {}) or {}).get("balance_asset", "USDC")
             try:
-                response = _kraken_get_balance_retry(asset)
+                response = kraken_get_balance(asset)
             except Exception as exc:  # pylint: disable=broad-except
                 system_logger.error("[BALANCE] Kraken balance fetch failed: %s", exc)
                 raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.") from exc
 
             if not isinstance(response, dict):
-                system_logger.error(
-                    "[BALANCE] Kraken balance response malformed: %r",
-                    response,
-                )
+                system_logger.error("[BALANCE] Kraken balance response malformed: %r", response)
                 raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.")
 
             balance_value = response.get("balance")
@@ -1583,3 +1507,758 @@ class TradeLedger:
             return True
         system_logger.info("Trade found but not fully updated: %s", latest)
         return False
+"""
+Learning Machine for Crypto Trading Bot.
+
+Reads closed trades from trades.log, calculates performance metrics, and can
+emit learning suggestions to logs/learning_feedback.jsonl for the dashboard.
+
+This module provides both function-level APIs (run_learning_cycle) and a small
+wrapper class (LearningMachine) for compatibility with scripts that expect a
+class interface with generate_report().
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import math
+import os
+from typing import Dict, List
+
+try:
+    import numpy as np  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    np = None  # type: ignore[assignment]
+
+from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
+
+logger = logging.getLogger("learning_machine")
+logger.setLevel(logging.INFO)
+if not logger.hasHandlers():
+    # Review report log (historical)
+    logger.addHandler(get_rotating_handler("learning_review.log"))
+    # Dedicated debug/ops log for this module as requested
+    logger.addHandler(get_rotating_handler("learning_machine.log"))
+    logger.propagate = False
+
+
+def _is_valid_learning_trade(trade: dict) -> bool:
+    """Return True if the trade should influence learning decisions."""
+
+    confidence = trade.get("confidence")
+    try:
+        confidence_val = float(confidence)
+    except (TypeError, ValueError):
+        logger.warning("Skipping trade %s — confidence missing or invalid", trade.get("trade_id"))
+        return False
+
+    if confidence_val <= 0 or confidence_val > 1:
+        logger.warning(
+            "Skipping trade %s — confidence %.4f outside acceptable range",
+            trade.get("trade_id"),
+            confidence_val,
+        )
+        return False
+
+    if math.isclose(confidence_val, 0.5, abs_tol=1e-6):
+        logger.warning(
+            "Skipping trade %s — confidence %.4f flagged as deprecated placeholder",
+            trade.get("trade_id"),
+            confidence_val,
+        )
+        return False
+
+    roi = trade.get("roi")
+    try:
+        roi_val = float(roi)
+    except (TypeError, ValueError):
+        logger.warning("Skipping trade %s — ROI missing or invalid", trade.get("trade_id"))
+        return False
+
+    # Reject outliers that indicate synthetic or corrupted entries
+    if abs(roi_val) > 1.5:
+        logger.warning(
+            "Skipping trade %s — ROI %.4f outside learning bounds",
+            trade.get("trade_id"),
+            roi_val,
+        )
+        return False
+
+    return True
+
+
+def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
+    """Load closed trades with valid ROI from the trades log.
+
+    Skips malformed lines and never raises so the learning loop is resilient.
+    """
+    trades: List[dict] = []
+    if not os.path.exists(log_path):
+        return trades
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                trade = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            status = (trade.get("status") or "").lower()
+            roi = trade.get("roi")
+            size = trade.get("size")
+            if (
+                status == "closed"
+                and isinstance(roi, (int, float))
+                and isinstance(size, (int, float))
+                and float(size) > 0.0
+                and _is_valid_learning_trade(trade)
+            ):
+                trades.append(trade)
+    return trades
+
+
+def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
+    """Calculate core ROI-based metrics from closed trades."""
+    total_trades = len(trades)
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "avg_roi": 0.0,
+            "cumulative_return": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            # convenience extras for suggestion heuristics
+            "roi_percent": 0.0,
+            "sortino_ratio": 0.0,
+        }
+
+    roi_values = [float(trade["roi"]) for trade in trades]
+    wins = sum(1 for roi in roi_values if roi > 0)
+    losses = total_trades - wins
+    win_rate = float(wins) / float(total_trades)
+    logger.info(
+        "Learning cycle win rate computed",
+        extra={"wins": wins, "losses": losses, "total_trades": total_trades, "win_rate": win_rate},
+    )
+
+    if np is not None:
+        rois = np.array(roi_values, dtype=float)
+        avg_roi = float(np.mean(rois))
+        cumulative_return = float(np.prod(1 + rois) - 1)
+
+        std = float(np.std(rois))
+        sharpe_ratio = float(np.mean(rois) / std) if std > 0 else 0.0
+
+        downside = rois[rois < 0]
+        dd = float(np.std(downside)) if downside.size > 0 else 0.0
+        sortino_ratio = float(np.mean(rois) / dd) if dd > 0 else 0.0
+
+        cumulative = np.cumprod(1 + rois)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdowns = (cumulative - running_max) / running_max
+        max_drawdown = float(np.min(drawdowns)) if drawdowns.size > 0 else 0.0
+    else:
+        avg_roi = sum(roi_values) / float(total_trades)
+
+        cumulative_product = 1.0
+        for roi in roi_values:
+            cumulative_product *= 1 + roi
+        cumulative_return = cumulative_product - 1.0
+
+        if total_trades > 1:
+            variance = sum((roi - avg_roi) ** 2 for roi in roi_values) / float(total_trades)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        sharpe_ratio = avg_roi / std if std > 0 else 0.0
+
+        downside_values = [roi for roi in roi_values if roi < 0]
+        if downside_values:
+            variance_downside = sum(roi**2 for roi in downside_values) / float(len(downside_values))
+            dd = math.sqrt(variance_downside)
+        else:
+            dd = 0.0
+        sortino_ratio = avg_roi / dd if dd > 0 else 0.0
+
+        running_balance = 1.0
+        running_max = 1.0
+        max_drawdown = 0.0
+        for roi in roi_values:
+            running_balance *= 1 + roi
+            running_max = max(running_max, running_balance)
+            if running_max > 0:
+                drawdown = (running_balance - running_max) / running_max
+                if drawdown < max_drawdown:
+                    max_drawdown = drawdown
+
+    return {
+        "total_trades": int(total_trades),
+        "wins": int(wins),
+        "losses": int(losses),
+        "win_rate": round(win_rate, 6),
+        "avg_roi": round(avg_roi, 6),
+        "cumulative_return": round(cumulative_return, 6),
+        "sharpe_ratio": round(sharpe_ratio, 6),
+        "sortino_ratio": round(sortino_ratio, 6),
+        "max_drawdown": round(max_drawdown, 6),
+        # convenience for heuristics/UX
+        "roi_percent": round(cumulative_return * 100.0, 4),
+    }
+
+
+def run_learning_cycle() -> Dict[str, float | int | str]:
+    """Run a single learning cycle and return metrics (with timestamp/buffer)."""
+    trades = load_trades()
+    metrics = calculate_metrics(trades)
+    metrics["timestamp"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    metrics["capital_buffer"] = get_dynamic_buffer()
+    return metrics
+
+
+class LearningMachine:
+    """Lightweight wrapper exposing a class interface used by some scripts."""
+
+    def generate_report(self) -> Dict[str, float | int | str]:  # pragma: no cover - thin wrapper
+        """Return the latest learning cycle metrics."""
+        return run_learning_cycle()
+
+
+def _load_shadow_results(path: str = "logs/shadow_test_results.jsonl") -> List[dict]:
+    """Load shadow test results without raising on malformed rows."""
+    if not os.path.exists(path):
+        return []
+    rows: List[dict] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _evaluate_shadow_promotions(
+    *,
+    output_path: str,
+    timestamp: str,
+    shadow_path: str = "logs/shadow_test_results.jsonl",
+) -> None:
+    """Track shadow test streaks and flag promotion candidates."""
+    rows = _load_shadow_results(shadow_path)
+    if not rows:
+        return
+
+    stats: Dict[str, Dict[str, float]] = {}
+    counts: Dict[str, int] = {}
+
+    for record in rows:
+        strategy = record.get("strategy") or record.get("strategy_name") or "Unknown"
+        if not isinstance(strategy, str):
+            continue
+        success = record.get("success_rate")
+        if success is None:
+            success = record.get("win_rate")
+        try:
+            success_val = float(success)
+        except (TypeError, ValueError):
+            continue
+        counts[strategy] = counts.get(strategy, 0) + 1
+        stats[strategy] = stats.get(strategy, {"success_sum": 0.0})
+        stats[strategy]["success_sum"] += success_val
+
+    promotion_records: List[dict] = []
+    for strategy, total_runs in counts.items():
+        if total_runs == 0:
+            continue
+        success_sum = stats[strategy]["success_sum"]
+        average_success = success_sum / total_runs
+        if total_runs >= 10000 and average_success >= 0.99:
+            msg = (
+                f"[Promotion] Strategy '{strategy}' reached promotion threshold "
+                f"(runs={total_runs}, success_rate={average_success:.2%})."
+            )
+            logger.info(msg)
+            promotion_records.append(
+                {
+                    "timestamp": timestamp,
+                    "type": "promotion_decision",
+                    "strategy": strategy,
+                    "shadow_runs": int(total_runs),
+                    "shadow_success_rate": round(average_success, 6),
+                    "status": "promoted",
+                    "action": "manual_promotion_recorded",
+                    "approval": "manual",
+                }
+            )
+            continue
+        if total_runs >= 100 and average_success > 0.7:
+            msg = (
+                f"[Promotion] Strategy '{strategy}' qualifies as a promotion candidate "
+                f"(runs={total_runs}, success_rate={average_success:.2%})."
+            )
+            logger.info(msg)
+            promotion_record = {
+                "timestamp": timestamp,
+                "type": "promotion_candidate",
+                "strategy": strategy,
+                "shadow_runs": int(total_runs),
+                "shadow_success_rate": round(average_success, 6),
+                "status": "promotion_candidate",
+                "action": "pending_manual_promotion",
+            }
+            promotion_records.append(promotion_record)
+
+    if not promotion_records:
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "a", encoding="utf-8") as handle:
+        for rec in promotion_records:
+            handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> int:
+    """Generate simple learning suggestions and append to JSONL file.
+
+    Uses run_learning_cycle() metrics and the optimization.generate_suggestions
+    helper to produce a compact suggestion record. Returns count written.
+    """
+    try:
+        # Imported lazily to avoid circulars and heavy deps at import time
+        # pylint: disable=import-outside-toplevel
+        from .optimization import generate_suggestions  # type: ignore
+    except ImportError:  # pragma: no cover - fallback path
+
+        def generate_suggestions(_report):  # type: ignore
+            return [{"suggestion": "Monitor performance", "confidence": 0.7, "reason": "fallback"}]
+
+    # Load closed trades for diagnostics and diversity checks
+    trades = load_trades()
+    total_trades = len(trades)
+    # Confidence stats (graceful parsing)
+    valid_conf: List[float] = []
+    for t in trades:
+        try:
+            c = float(t.get("confidence"))
+            valid_conf.append(c)
+        except (TypeError, ValueError):
+            continue
+    n_conf_not_half = sum(1 for v in valid_conf if abs(v - 0.5) > 1e-9)
+
+    # Strategy distribution
+    by_strategy: Dict[str, int] = {}
+    recent_samples: List[str] = []
+    for t in trades[-10:]:
+        tid = t.get("trade_id")
+        strat = t.get("strategy") or "Unknown"
+        ts = t.get("timestamp")
+        if isinstance(strat, str):
+            by_strategy[strat] = by_strategy.get(strat, 0) + 1
+        if isinstance(tid, str) and isinstance(ts, str):
+            recent_samples.append(f"{ts} • {tid} • {strat}")
+
+    strategies_considered = len(by_strategy)
+
+    # Emit debug summary to both console and log
+    summary_line = (
+        f"[LearningMachine] Loaded {total_trades} closed trades "
+        f"({len(valid_conf)} with valid confidence, {n_conf_not_half} != 0.5). "
+        f"Strategies={strategies_considered}: {by_strategy}"
+    )
+    logger.info(summary_line)
+    if recent_samples:
+        for line in recent_samples:
+            logger.info("[LearningMachine] Sample: %s", line)
+
+    # Compute report metrics and generate suggestions
+    report = run_learning_cycle()
+    suggestions = generate_suggestions(report) or []
+
+    # If no suggestions, write a diagnostic entry to learning_feedback.jsonl
+    if not suggestions:
+        if total_trades == 0:
+            reason = "No closed trades available"
+        elif valid_conf and n_conf_not_half == 0:
+            reason = "All trades had confidence = 0.5"
+        elif strategies_considered == 0:
+            reason = "No strategies detected in closed trades"
+        else:
+            reason = "Optimizer returned no suggestions"
+
+        # heuristically set strategy label for diagnostics
+        strat_label = (
+            "Multiple"
+            if strategies_considered > 1
+            else (next(iter(by_strategy.keys())) if strategies_considered == 1 else "Unknown")
+        )
+
+        diag = {
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "type": "no_suggestions_generated",
+            "strategy": strat_label,
+            "status": "no_suggestions_generated",
+            "reason": reason,
+            "total_trades": total_trades,
+        }
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(diag, separators=(",", ":")) + "\n")
+        msg = (
+            f"[LearningMachine] No suggestions generated — reason='{reason}', "
+            f"total_trades={total_trades}, strategies={strategies_considered}"
+        )
+        logger.info(msg)
+        return 0
+
+    # Otherwise, append generated suggestions
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    ts = datetime.datetime.now(datetime.UTC).isoformat()
+    wrote = 0
+    with open(output_path, "a", encoding="utf-8") as f:
+        for s in suggestions:
+            # Normalize required fields for dashboard/report compatibility
+            primary_label = s.get("strategy") or s.get("strategy_name")
+            strategy_name = primary_label or s.get("category") or "Unknown"
+            confidence_before = s.get("confidence_before") or s.get("current_confidence")
+            confidence_after = (
+                s.get("confidence_after")
+                or s.get("suggested_confidence")
+                or s.get("confidence")  # fallback: suggestion confidence score
+            )
+            status_val = s.get("status") or "pending"
+
+            rec = {
+                "timestamp": ts,
+                "type": "learning_suggestion",
+                "strategy": strategy_name,
+                "confidence_before": confidence_before,
+                "confidence_after": confidence_after,
+                "reason": s.get("reason", ""),
+                "status": status_val,
+            }
+            # Preserve any additional fields from the generator for transparency
+            for k in ("parameter", "old_value", "new_value", "suggestion", "category"):
+                if k in s and k not in rec:
+                    rec[k] = s[k]
+
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            wrote += 1
+
+            log_msg = "".join(
+                [
+                    "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s ",
+                    "status=%s reason=%s",
+                ]
+            )
+            logger.info(
+                log_msg,
+                wrote,
+                rec.get("strategy"),
+                rec.get("confidence_before"),
+                rec.get("confidence_after"),
+                rec.get("status"),
+                rec.get("reason"),
+            )
+    # Shadow test recent performance per suggested strategy
+    try:
+        _shadow_log_path = "logs/shadow_test_results.jsonl"
+        os.makedirs(os.path.dirname(_shadow_log_path), exist_ok=True)
+        recent_trades = load_trades()
+        recent_trades = recent_trades[-100:]
+        if recent_trades and suggestions:
+            # Aggregate by strategy from recent closed trades
+            by_strategy: Dict[str, List[dict]] = {}
+            for t in recent_trades:
+                strat = t.get("strategy") or "Unknown"
+                by_strategy.setdefault(strat, []).append(t)
+            with open(_shadow_log_path, "a", encoding="utf-8") as sf:
+                for s in suggestions:
+                    strat = s.get("strategy") or s.get("strategy_name") or "Unknown"
+                    rows = by_strategy.get(strat, [])
+                    if not rows:
+                        continue
+                    rois = []
+                    for r in rows:
+                        try:
+                            rois.append(float(r.get("roi")))
+                        except (TypeError, ValueError):
+                            continue
+                    if not rois:
+                        continue
+                    wins = sum(1 for x in rois if x > 0)
+                    total = len(rois)
+                    success_rate = wins / total if total else 0.0
+                    avg_roi = float(sum(rois) / total) if total else 0.0
+                    conf_val = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
+                    rec = {
+                        "timestamp": ts,
+                        "strategy": strat,
+                        "success_rate": round(success_rate, 4),
+                        "avg_roi": round(avg_roi, 6),
+                        "confidence": conf_val,
+                    }
+                    sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                    logger.info(
+                        "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f",
+                        strat,
+                        success_rate * 100,
+                        avg_roi,
+                    )
+    except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
+        logger.info("Shadow test logging skipped: %s", _e)
+
+    # Bayesian optimization for confidence (optional dependency)
+    try:
+        from skopt import gp_minimize  # type: ignore  # pylint: disable=import-outside-toplevel
+        from skopt.space import Real  # type: ignore  # pylint: disable=import-outside-toplevel
+
+        def _sharpe_like(conf: float, rois: List[float]) -> float:
+            arr = np.asarray(rois, dtype=float)
+            if arr.size == 0:
+                return 0.0
+            mu = float(arr.mean()) * conf
+            sd = float(arr.std())
+            return 0.0 if sd == 0 else mu / sd
+
+        # Build objective from recent trades regardless of strategy
+        rois_all: List[float] = []
+        for t in recent_trades:
+            try:
+                rois_all.append(float(t.get("roi")))
+            except (TypeError, ValueError):
+                continue
+        if rois_all:
+
+            def objective(x):
+                conf = x[0]
+                return -_sharpe_like(conf, rois_all)
+
+            res = gp_minimize(
+                objective,
+                [Real(0.1, 1.0, name="confidence")],
+                n_calls=20,
+                random_state=0,
+            )
+            best_conf = float(res.x[0])
+            best_score = float(-res.fun)
+            out_rec = {
+                "timestamp": ts,
+                "strategy": "SimpleRSIStrategy",
+                "suggested_confidence": round(best_conf, 4),
+                "sharpe": round(best_score, 4),
+                "source": "bayesian_optimization",
+            }
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
+            opt_msg = f"[OPTIMIZER] Suggested confidence={best_conf:.4f} " f"with Sharpe={best_score:.4f}"
+            logger.info(opt_msg)
+    except (ImportError, ValueError, TypeError) as _e:  # pragma: no cover - optional dep fallback
+        logger.info("Bayesian optimizer unavailable or failed: %s", _e)
+
+    # Auto-apply suggestions based on shadow tests
+    try:
+        shadow_path = "logs/shadow_test_results.jsonl"
+        if os.path.exists(shadow_path):
+            by_strat: Dict[str, List[dict]] = {}
+            with open(shadow_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sname = rec.get("strategy") or "Unknown"
+                    by_strat.setdefault(sname, []).append(rec)
+            for sname, rows in by_strat.items():
+                if len(rows) >= 100:
+                    sr = float(rows[-1].get("success_rate", 0.0))
+                    if sr >= 0.70:
+                        # find latest suggestion for this strategy
+                        latest_conf = None
+                        try:
+                            with open(output_path, "r", encoding="utf-8") as lf:
+                                for line in lf:
+                                    try:
+                                        j = json.loads(line)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    has_after = j.get("confidence_after")
+                                    has_suggested = j.get("suggested_confidence")
+                                    if j.get("strategy") == sname and (has_after or has_suggested):
+                                        latest_conf = has_after or has_suggested
+                        except FileNotFoundError:
+                            pass
+                        if latest_conf is not None:
+                            applied = {
+                                "timestamp": ts,
+                                "strategy": sname,
+                                "status": "applied",
+                                "applied_confidence": latest_conf,
+                                "source": "auto_apply_from_shadow_test",
+                            }
+                            with open(output_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(applied, separators=(",", ":")) + "\n")
+                            apply_msg = f"[LEARNING APPLY] {sname} updated with " f"confidence={float(latest_conf):.3f}"
+                            logger.info(apply_msg)
+    except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
+        logger.info("Auto-apply skipped: %s", _e)
+    _evaluate_shadow_promotions(output_path=output_path, timestamp=ts)
+
+    logger.info("Wrote %s suggestion(s) to %s", wrote, output_path)
+    return wrote
+
+
+def _debug_main() -> None:  # pragma: no cover
+    """Run a single learning cycle and emit suggestions for manual inspection."""
+
+    result = run_learning_cycle()
+    logger.info("Learning Machine metrics", extra={"metrics": result})
+    try:
+        suggestions_written = run_learning_machine()
+        logger.info(
+            "Suggestions written via debug run",
+            extra={"count": suggestions_written},
+        )
+    except (OSError, RuntimeError, ValueError) as exc:  # safety for ad-hoc runs
+        logger.error("Failed to write suggestions in debug mode", extra={"error": str(exc)})
+
+
+if __name__ == "__main__":  # pragma: no cover
+    _debug_main()
+"""
+Exit Check Script
+
+Loads open positions, fetches latest prices (live where available),
+evaluates exit conditions using PositionManager, and updates the trade log.
+"""
+
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
+from crypto_trading_bot.bot.trading_logic import position_manager
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.kraken_api import get_ticker_price
+
+logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    # Preserve console output format
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # Add rotating file handler for exit checks
+    os.makedirs("logs", exist_ok=True)
+    file_handler = RotatingFileHandler(
+        filename="logs/exit_check.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(file_handler)
+
+
+def get_live_prices(positions) -> dict:
+    """Fetch live prices for all pairs present in open positions.
+
+    Falls back to the first seen entry_price for a pair if live fetch fails.
+    """
+    prices: dict[str, float] = {}
+    pairs = {p.get("pair") for p in positions if p.get("pair")}
+    if not pairs:
+        logger.info("No open positions — skipping price fetch.")
+        return {}
+
+    # Precompute first valid entry_price per pair to avoid repeated scans.
+    fallback_prices: dict[str, float] = {}
+    for pos in positions:
+        pair = pos.get("pair")
+        entry = pos.get("entry_price")
+        if pair and pair not in fallback_prices and isinstance(entry, (int, float)) and entry > 0:
+            fallback_prices[pair] = float(entry)
+
+    for pair in pairs:
+        # First, attempt to fetch from API
+        try:
+            raw_px = get_ticker_price(pair)
+        except Exception as api_err:  # pylint: disable=broad-exception-caught
+            logger.warning("Failed to fetch live price for %s: %s", pair, api_err)
+            raw_px = None
+
+        # Then, attempt to parse/cast
+        px = None
+        if raw_px is not None:
+            try:
+                px = float(raw_px)
+            except (TypeError, ValueError) as parse_err:
+                logger.warning(
+                    "Failed to parse live price for %s: %r (%s)",
+                    pair,
+                    raw_px,
+                    parse_err,
+                )
+
+        if px is None or px <= 0:
+            entry = fallback_prices.get(pair)
+            if isinstance(entry, (int, float)) and entry > 0:
+                prices[pair] = float(entry)
+        else:
+            prices[pair] = float(px)
+
+    if not prices:
+        logger.warning("No prices available; cannot evaluate exits.")
+        return {}
+    return prices
+
+
+def main():
+    """Load positions, build a current price map, evaluate exits, and update the ledger."""
+
+    # Ensure positions in memory
+    position_manager.load_positions_from_file()
+
+    # Sync trade ledger state with reloaded trades
+    ledger = TradeLedger(position_manager)
+    ledger.reload_trades()
+
+    # Build current prices from live Kraken feed (with fallback to entry price)
+    current_prices = get_live_prices(position_manager.positions.values())
+
+    # Optional enhancement: incorporate RSI-based exits using historical prices.
+
+    if not current_prices:
+        return
+
+    try:
+        exits = position_manager.check_exits(current_prices)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("Exit evaluation failed")
+        return
+    for trade_id, exit_price, reason in exits:
+        logger.info("Closing trade %s at %s: %s", trade_id, exit_price, reason)
+        try:
+            ledger.update_trade(trade_id=trade_id, exit_price=exit_price, reason=reason)
+            # Force trades.log sync
+            with open("logs/trades.log", "a", encoding="utf-8") as f:
+                f.flush()
+                os.fsync(f.fileno())
+        except (IOError, ValueError):
+            logger.exception("Failed to update trade %s", trade_id)
+
+    if not exits:
+        logger.info("No exit conditions triggered or already updated.")
+
+
+if __name__ == "__main__":
+    main()

@@ -11,32 +11,32 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-from crypto_trading_bot.bot.state.portfolio_state import (
-    load_portfolio_state,
-    refresh_portfolio_state,
-)
-from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
-from crypto_trading_bot.bot.utils.log_rotation import (
-    get_anomalies_logger,
-    get_rotating_handler,
-)
-from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, is_live
-from crypto_trading_bot.learning.confidence_audit import (
+from ..config import CONFIG, ConfigurationError, get_mode_label, is_live
+from ..learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
-from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
-from crypto_trading_bot.learning.optimization import detect_outliers
-from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
-from crypto_trading_bot.safety.confirmation import require_live_confirmation
-from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
-from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
-from crypto_trading_bot.scripts.shadow_confidence_test import run_shadow_confidence_test
-from crypto_trading_bot.scripts.suggest_top_configs import (
+from ..learning.learning_machine import run_learning_cycle, run_learning_machine
+from ..learning.optimization import detect_outliers
+from ..learning.shadow_test_runner import run_shadow_tests
+from ..safety.confirmation import require_live_confirmation
+from ..scripts.check_exit_conditions import main as run_exit_checks
+from ..scripts.daily_heartbeat import run_daily_tasks
+from ..scripts.shadow_confidence_test import run_shadow_confidence_test
+from ..scripts.suggest_top_configs import (
     export_suggestions,
     generate_parameter_suggestions,
 )
-from crypto_trading_bot.scripts.sync_validator import SyncValidator
-from crypto_trading_bot.utils.system_logger import get_system_logger
+from ..scripts.sync_validator import SyncValidator
+from ..utils.system_logger import get_system_logger
+from .state.portfolio_state import (
+    load_portfolio_state,
+    refresh_portfolio_state,
+)
+from .trading_logic import evaluate_signals_and_trade
+from .utils.log_rotation import (
+    get_anomalies_logger,
+    get_rotating_handler,
+)
 
 # Constants for task intervals in seconds
 TRADE_INTERVAL = 5 * 60  # Every 5 minutes
@@ -238,9 +238,9 @@ def should_run_anomaly_audit(last_audit_time):
 def run_scheduler():
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
     logger.info("Scheduler started; running bot tasks")
-    if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-        logger.warning("Live mode disabled in configuration — scheduler will not start.")
-        return
+    paper_mode = not CONFIG.get("is_live") and not CONFIG.get("test_mode")
+    if paper_mode:
+        logger.warning("Live mode disabled in configuration — running scheduler in paper simulation mode.")
     mode_label = get_mode_label()
     logger.info("Operating mode resolved", extra={"mode": mode_label, "is_live": is_live})
 
@@ -294,11 +294,6 @@ def run_scheduler():
 
     while True:
         try:
-            if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-                logger.info("Live mode disabled — scheduler idle.")
-                time.sleep(TRADE_INTERVAL)
-                continue
-
             if is_live:
                 require_live_confirmation()
 

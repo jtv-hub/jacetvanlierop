@@ -25,6 +25,9 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+import crypto_trading_bot.utils.price_feed as price_feed_module
 from crypto_trading_bot.bot.state.portfolio_state import (
     load_portfolio_state,
     refresh_portfolio_state,
@@ -42,14 +45,18 @@ from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.utils.file_locks import _locked_file
 from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
     KrakenAuthError,
     _invalidate_pair_cache,
     kraken_get_asset_pair_meta,
-    kraken_place_order,
 )
+from crypto_trading_bot.utils.kraken_client import (
+    kraken_place_order as _kraken_place_order,
+)
+from crypto_trading_bot.utils.kraken_client import kraken_place_order as kraken_place_order
 from crypto_trading_bot.utils.kraken_pairs import ensure_usdc_pair
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import (
@@ -82,6 +89,8 @@ logger = get_system_logger().getChild("trading_logic")
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
+PRICE_STALE_THRESHOLD = datetime.timedelta(minutes=5)
+DRAWDOWN_GUARD_LIMIT = 0.10
 
 _DISK_GUARD_THRESHOLD_MB = float(os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_MB", "500"))
 _DISK_GUARD_PATH = os.getenv("CRYPTO_TRADING_BOT_DISK_GUARD_PATH", os.getcwd())
@@ -100,6 +109,18 @@ TEST_MODE = os.getenv("CRYPTO_TRADING_BOT_TEST_MODE", "0").strip().lower() in _T
 
 _VOLUME_CACHE: dict[str, tuple[float, float]] = {}
 _VOLUME_CACHE_TTL_SECONDS = 60.0
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=16),
+    retry=retry_if_exception_type((KrakenAPIError, RuntimeError, OSError)),
+)
+def _kraken_place_order_retry(*args, **kwargs):
+    """Resilient wrapper around Kraken order placement."""
+
+    return _kraken_place_order(*args, **kwargs)
 
 
 def _resolve_trade_size_bounds(pair: str) -> tuple[float, float]:
@@ -138,11 +159,12 @@ class _RuntimeState:
     emergency_stop_triggered: bool = False
     kill_switch_auto_cleared: bool = False
     disk_space_block_active: bool = False
+    drawdown_block_active: bool = False
 
 
 _STATE = _RuntimeState()
 _KRAKEN_FAILURE_PAUSE_SECONDS = 60.0
-_KRAKEN_FAILURE_PAUSE_UNTIL: float | None = None
+_KRAKEN_FAILURE_PAUSE_UNTIL: float | None = 0.0
 
 getcontext().prec = 18
 
@@ -160,6 +182,7 @@ def _set_kraken_failure_pause(pause_until: float) -> None:
     """Record the Kraken failure pause deadline for tests and runtime guards."""
 
     global _KRAKEN_FAILURE_PAUSE_UNTIL  # pylint: disable=global-statement
+    pause_until = float(pause_until)
     _KRAKEN_FAILURE_PAUSE_UNTIL = pause_until
     _STATE.kraken_failure_pause_until = pause_until
     _STATE.kraken_pause_until = pause_until
@@ -424,7 +447,7 @@ def _consecutive_losses(limit: int) -> int:
 
     count = 0
     try:
-        with open(TRADES_LOG_PATH, "r", encoding="utf-8") as handle:
+        with _locked_file(TRADES_LOG_PATH, "r") as handle:
             lines = handle.readlines()
     except OSError:
         return 0
@@ -584,7 +607,7 @@ def _submit_live_trade(
     try:
         pair_meta = kraken_get_asset_pair_meta(pair)
     except KrakenAPIError as exc:
-        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = _monotonic_now() + _KRAKEN_FAILURE_PAUSE_SECONDS
         _set_kraken_failure_pause(pause_until)
         logger.error(
             "Kraken pair metadata failed; pause %.0fs for %s (%s)",
@@ -638,7 +661,7 @@ def _submit_live_trade(
     attempted_cost = float(attempted_cost_dec)
 
     try:
-        response = kraken_place_order(
+        response = _kraken_place_order_retry(
             pair,
             side,
             size,
@@ -648,7 +671,7 @@ def _submit_live_trade(
             min_cost_threshold=effective_cost_threshold,
         )
     except (KrakenAuthError, KrakenAPIError) as exc:
-        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = _monotonic_now() + _KRAKEN_FAILURE_PAUSE_SECONDS
         _set_kraken_failure_pause(pause_until)
         logger.error(
             "Kraken order error; pause %.0fs | pair=%s side=%s err=%s",
@@ -664,7 +687,7 @@ def _submit_live_trade(
         )
         return False
     except Exception:  # pylint: disable=broad-exception-caught
-        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = _monotonic_now() + _KRAKEN_FAILURE_PAUSE_SECONDS
         _set_kraken_failure_pause(pause_until)
         logger.exception(
             "Unexpected Kraken order issue; pause %.0fs | pair=%s side=%s",
@@ -680,7 +703,7 @@ def _submit_live_trade(
         return False
 
     if not isinstance(response, dict):
-        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = _monotonic_now() + _KRAKEN_FAILURE_PAUSE_SECONDS
         _set_kraken_failure_pause(pause_until)
         logger.error(
             "Kraken order rejected; pause %.0fs | pair=%s side=%s err=%s",
@@ -696,7 +719,10 @@ def _submit_live_trade(
         )
         return False
 
-    if not response.get("ok"):
+    success_response = None
+    if response.get("ok", False):
+        success_response = response
+    else:
         response_code = response.get("code")
         response_error = response.get("error")
         response_cost = response.get("attempted_cost", attempted_cost)
@@ -752,7 +778,7 @@ def _submit_live_trade(
             )
             return False
 
-        pause_until = now + _KRAKEN_FAILURE_PAUSE_SECONDS
+        pause_until = _monotonic_now() + _KRAKEN_FAILURE_PAUSE_SECONDS
         _set_kraken_failure_pause(pause_until)
         logger.error(
             "Kraken order rejected; pause %.0fs | pair=%s side=%s err=%s code=%s",
@@ -774,6 +800,8 @@ def _submit_live_trade(
             },
         )
         return False
+
+    response = success_response
 
     _clear_kraken_failure_pause()
 
@@ -1035,10 +1063,8 @@ class PositionManager:
         }
         try:
             os.makedirs("logs", exist_ok=True)
-            with open("logs/positions.jsonl", "a", encoding="utf-8") as f:
+            with _locked_file("logs/positions.jsonl", "a") as f:
                 f.write(json.dumps(self.positions[trade_id]) + "\n")
-                f.flush()  # Ensure write
-                os.fsync(f.fileno())  # Sync to disk
             logger.debug("Position persisted", extra={"trade_id": trade_id, "pair": pair, "size": size})
         except (OSError, IOError) as e:
             logger.error("Failed writing positions.jsonl", extra={"error": str(e)})
@@ -1139,7 +1165,7 @@ class PositionManager:
         self.positions = {}
         if os.path.exists(file_path):
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
+                with _locked_file(file_path, "r") as f:
                     seen_trade_ids = set()
                     for line in f:
                         try:
@@ -1382,6 +1408,26 @@ def evaluate_signals_and_trade(
             logger.info("Auto-pause cleared; resuming trade evaluation.")
             _STATE.auto_paused_reason = None
 
+    drawdown = ledger.get_current_drawdown()
+    if drawdown >= DRAWDOWN_GUARD_LIMIT:
+        if not _STATE.drawdown_block_active:
+            logger.error(
+                "Drawdown guard active %.2f%% ≥ limit %.2f%%; halting trade evaluation.",
+                drawdown * 100,
+                DRAWDOWN_GUARD_LIMIT * 100,
+            )
+            send_alert(
+                "[risk] Drawdown guard triggered",
+                level="CRITICAL",
+                context={"drawdown_pct": round(drawdown, 6), "limit_pct": round(DRAWDOWN_GUARD_LIMIT, 6)},
+            )
+        _STATE.drawdown_block_active = True
+        ledger.request_pause_new_trades("drawdown_guard_active")
+        return
+    if _STATE.drawdown_block_active:
+        logger.info("Drawdown guard cleared; resuming trade evaluation.")
+        _STATE.drawdown_block_active = False
+
     if reinvestment_rate is None:
         reinvestment_rate = float(state_snapshot.get("reinvestment_rate", 0.0))
 
@@ -1390,19 +1436,44 @@ def evaluate_signals_and_trade(
     current_prices: dict[str, float] = {}
     current_volumes: dict[str, float] = {}
     historical_price_cache: dict[str, list[float]] = {}
+    price_times: dict[str, datetime.datetime] = {}
+    missing_pairs: set[str] = set()
+    cache_map = getattr(price_feed_module, "_cache", {})
     for pair in pairs:
         price_now = get_current_price(pair)
         asset = pair.split("/")[0]
         if price_now is not None and price_now > 0:
             current_prices[pair] = price_now
             logger.debug("Price feed update", extra={"asset": asset, "pair": pair, "price": price_now})
+            # Access the internal cache timestamp to detect stale prices safely.
+            cache_entry = None
+            if isinstance(cache_map, dict):
+                cache_entry = cache_map.get(pair.upper())
+            if cache_entry and isinstance(cache_entry, tuple) and cache_entry:
+                cache_epoch = cache_entry[0]
+                try:
+                    cache_dt = datetime.datetime.fromtimestamp(float(cache_epoch), datetime.UTC)
+                except (TypeError, ValueError, OSError):
+                    cache_dt = datetime.datetime.now(datetime.UTC)
+            else:
+                cache_dt = datetime.datetime.now(datetime.UTC)
+            price_times[pair] = cache_dt
             volume_estimate = _fetch_recent_volume(pair, fallback=float(MIN_VOLUME))
             if volume_estimate is not None and volume_estimate > 0:
                 current_volumes[pair] = volume_estimate
             else:
                 logger.warning("No volume data for %s; skipping volume map entry", pair)
         else:
+            missing_pairs.add(pair)
             logger.warning("No current price available; skipping price map entry", extra={"pair": pair})
+
+    now_ts = datetime.datetime.now(datetime.UTC)
+    stale_pairs = [pair for pair, ts in price_times.items() if now_ts - ts > PRICE_STALE_THRESHOLD]
+    if stale_pairs or missing_pairs:
+        affected = sorted(set(stale_pairs).union(missing_pairs))
+        logger.warning("Price data stale or missing for %s; halting trade evaluation.", affected)
+        ledger.request_pause_new_trades("stale_price_data")
+        return
 
     # Preload seeded history for all pairs (startup fallback)
     try:
@@ -1437,7 +1508,7 @@ def evaluate_signals_and_trade(
                 return 0
             today = datetime.datetime.now(datetime.UTC).date().isoformat()
             count = 0
-            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+            with _locked_file(TRADES_LOG_PATH, "r") as f:
                 for line in f:
                     try:
                         rec = json.loads(line)
@@ -1460,7 +1531,7 @@ def evaluate_signals_and_trade(
         try:
             if not os.path.exists(TRADES_LOG_PATH):
                 return items
-            with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
+            with _locked_file(TRADES_LOG_PATH, "r") as f:
                 for line in f:
                     try:
                         rec = json.loads(line)
@@ -2137,9 +2208,8 @@ def evaluate_signals_and_trade(
             reason_display,
             DEPLOY_PHASE,
         )
-        with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
-            f.flush()
-            os.fsync(f.fileno())  # Sync after update
+        with _locked_file(TRADES_LOG_PATH, "a"):
+            pass
         try:
             refresh_portfolio_state()
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -2150,7 +2220,7 @@ def evaluate_signals_and_trade(
     # Shadow test result logging
     shadow_path = "logs/shadow_test_results.jsonl"
     win_count = sum(1 for e in exits if e[2] == "TAKE_PROFIT")
-    with open(shadow_path, "a", encoding="utf-8") as f:
+    with _locked_file(shadow_path, "a") as f:
         f.write(
             json.dumps(
                 {

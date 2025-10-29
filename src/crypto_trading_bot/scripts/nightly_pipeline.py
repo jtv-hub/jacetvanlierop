@@ -5,12 +5,17 @@ Coordinates ingestion, gatekeeping, and learning into a single nightly run.
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
-from learning import learning_pipeline
+if __name__ == "__main__" and __package__ is None:
+    print(
+        "This module must be executed as 'python -m crypto_trading_bot.scripts.nightly_pipeline'.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
-# === Imports from scripts and learning ===
-from scripts import gatekeeper, ingest_paper_trades
+from ..learning import learning_pipeline
 
 # === Setup rotating logger ===
 os.makedirs("logs", exist_ok=True)
@@ -38,6 +43,8 @@ def run_pipeline():
     3. Trigger learning pipeline
     """
     logger.info("🚀 Starting nightly pipeline")
+
+    from . import gatekeeper, ingest_paper_trades  # Lazy import to avoid side effects during module import.
 
     # Step 1: Ingest trades
     logger.info("Step 1: Ingesting paper trades...")

@@ -1,6 +1,6 @@
 """Unit tests for Kraken integration safety checks."""
 
-# pylint: disable=protected-access
+# pylint: disable=protected-access,missing-function-docstring,missing-class-docstring
 
 import base64
 import hashlib
@@ -51,6 +51,7 @@ def test_place_order_invalid_secret(monkeypatch):
     called = False
 
     def fake_http_post(*_, **__):
+        """Ensure HTTP transport is skipped when secrets are invalid."""
         nonlocal called
         called = True
         raise AssertionError("HTTP should not be reached when secret is invalid")
@@ -167,7 +168,12 @@ def test_sign_request_consistency():
         ).digest()
     ).decode()
 
-    actual = kraken_client._sign_request(uri_path, nonce, postdata, secret)  # type: ignore[attr-defined]
+    actual = kraken_client._sign_request(  # type: ignore[attr-defined]
+        uri_path,
+        nonce,
+        postdata,
+        secret,
+    )
 
     assert actual == expected
 
@@ -178,10 +184,14 @@ def test_http_post_success(monkeypatch):
     payload = {"result": {"foo": "bar"}}
 
     class DummyResponse:
+        """Stub HTTP response returning a static payload."""
+
         def raise_for_status(self):
+            """Do nothing for the dummy response."""
             return None
 
         def json(self):
+            """Return the mocked payload."""
             return payload
 
     monkeypatch.setattr(kraken_client.requests, "post", lambda *args, **kwargs: DummyResponse())
@@ -195,6 +205,8 @@ def test_http_post_handles_http_error(monkeypatch):
     """HTTP errors surface as KrakenAPIError."""
 
     def _raise_http_error(*_, **__):
+        """Raise a simulated HTTP error."""
+
         raise requests.exceptions.HTTPError("boom")
 
     monkeypatch.setattr(kraken_client.requests, "post", _raise_http_error)
@@ -207,10 +219,14 @@ def test_http_post_invalid_json(monkeypatch):
     """Invalid JSON responses raise KrakenAPIError."""
 
     class DummyResponse:
+        """Stub response object raising a JSON decode error."""
+
         def raise_for_status(self):
+            """Do nothing for the dummy response."""
             return None
 
         def json(self):
+            """Simulate a JSON parsing error."""
             raise ValueError("not json")
 
     monkeypatch.setattr(kraken_client.requests, "post", lambda *args, **kwargs: DummyResponse())
@@ -230,6 +246,7 @@ def test_private_request_missing_credentials(monkeypatch):
     called = False
 
     def fake_http_post(*_, **__):
+        """Raise an assertion to ensure HTTP transport is not reached."""
         nonlocal called
         called = True
         raise AssertionError("transport should not be invoked when credentials missing")
@@ -251,6 +268,7 @@ def test_place_order_success_with_valid_secret(monkeypatch):
     monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_secret", valid_secret)
 
     def fake_private_request(endpoint, *args, **kwargs):  # pylint: disable=unused-argument
+        """Return a mocked private-response payload for successful order tests."""
         return {
             "ok": True,
             "error": None,
@@ -278,6 +296,7 @@ def test_place_order_validate_only_success(monkeypatch):
     captured_payload = {}
 
     def fake_private_request(endpoint, payload=None, **_):  # pylint: disable=unused-argument
+        """Capture payloads for validate-only order submissions."""
         captured_payload.update(payload or {})
         return {
             "ok": True,
@@ -315,6 +334,7 @@ def test_place_order_cost_minimum_not_met(monkeypatch):
         payload=None,
         **_,
     ):  # pylint: disable=unused-argument
+        """Return a structured cost-minimum error payload."""
         return {
             "ok": False,
             "error": "EOrder:Cost minimum not met",
@@ -365,6 +385,7 @@ def test_kraken_place_order_rate_limit_code(monkeypatch):
     monkeypatch.setitem(kraken_client.CONFIG, "kraken_api_secret", valid_secret)
 
     def fake_private_request(endpoint, payload=None, **_):  # pylint: disable=unused-argument
+        """Return a simulated rate-limit API error payload."""
         return {
             "ok": False,
             "error": "EOrder:Rate limit exceeded",
@@ -383,6 +404,8 @@ def test_kraken_place_order_rate_limit_code(monkeypatch):
 
 
 def _reset_trading_state():
+    """Reset trading logic state between Kraken integration tests."""
+
     trading_logic.is_live = True
     trading_logic._live_block_logged = False  # type: ignore[attr-defined]
     trading_logic._KRAKEN_FAILURE_PAUSE_UNTIL = None  # type: ignore[attr-defined]
@@ -416,11 +439,12 @@ def test_submit_live_trade_skips_volume_min(monkeypatch):
     called = False
 
     def fake_place_order(*_args, **_kwargs):
+        """Simulate a cost-minimum rejection."""
         nonlocal called
         called = True
         return {"ok": True, "code": "ok"}
 
-    monkeypatch.setattr(trading_logic, "kraken_place_order", fake_place_order)
+    monkeypatch.setattr(trading_logic, "_kraken_place_order_retry", fake_place_order)
 
     result = trading_logic._submit_live_trade(  # pylint: disable=protected-access
         pair="USDC/USD",
@@ -460,11 +484,12 @@ def test_submit_live_trade_skips_cost_min(monkeypatch):
     called = False
 
     def fake_place_order(*_args, **_kwargs):  # pragma: no cover - should not run
+        """Should not execute when credentials invalid."""
         nonlocal called
         called = True
         return {"ok": True, "code": "ok"}
 
-    monkeypatch.setattr(trading_logic, "kraken_place_order", fake_place_order)
+    monkeypatch.setattr(trading_logic, "_kraken_place_order_retry", fake_place_order)
 
     result = trading_logic._submit_live_trade(  # pylint: disable=protected-access
         pair="USDC/USD",
@@ -502,6 +527,7 @@ def test_submit_live_trade_boundary_executes(monkeypatch):
     captured_payload = {}
 
     def fake_place_order(pair, side, size, price, **kwargs):  # pylint: disable=unused-argument
+        """Capture order payload for boundary validation tests."""
         payload = {"pair": pair, "side": side, "size": size, "price": price}
         payload.update(kwargs)
         captured_payload.update(payload)
@@ -557,6 +583,7 @@ def test_submit_live_trade_rate_limit_pause(monkeypatch):
     )
 
     def fake_place_order(*_args, **_kwargs):  # pylint: disable=unused-argument
+        """Simulate a rate-limit error from Kraken."""
         return {
             "ok": False,
             "code": "rate_limit",

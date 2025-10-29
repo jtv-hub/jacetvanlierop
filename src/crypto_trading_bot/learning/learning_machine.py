@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import os
-from typing import Dict, List
+from typing import Callable, Dict, Iterable, List
 
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
+from crypto_trading_bot.utils.file_locks import _locked_file
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)
@@ -34,6 +35,90 @@ if not logger.hasHandlers():
     # Dedicated debug/ops log for this module as requested
     logger.addHandler(get_rotating_handler("learning_machine.log"))
     logger.propagate = False
+
+_CONFIDENCE_MIN = 0.1
+_CONFIDENCE_MAX = 1.0
+_MAX_CONFIDENCE_DELTA = 0.1
+_SHADOW_SUCCESS_THRESHOLD = 0.7
+_SHADOW_MIN_SUCCESSFUL_RUNS = 100
+_DRAW_DOWN_HALT_THRESHOLD = 0.05
+_TRADE_DECAY_DAYS = 30
+_MIN_WEIGHT = 0.05
+
+
+def _compute_trade_weight(trade: dict, *, now: datetime.datetime | None = None) -> float:
+    """Return an exponentially decayed weight for ``trade`` based on age."""
+
+    timestamp = trade.get("timestamp")
+    now = now or datetime.datetime.now(datetime.UTC)
+    if not isinstance(timestamp, str):
+        return 1.0
+    try:
+        trade_ts = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0
+    if trade_ts.tzinfo is None:
+        trade_ts = trade_ts.replace(tzinfo=datetime.UTC)
+    age = now - trade_ts
+    if age <= datetime.timedelta(days=_TRADE_DECAY_DAYS):
+        return 1.0
+    excess_days = max(age.days - _TRADE_DECAY_DAYS, 0)
+    # Exponential decay after the threshold with a 30-day half-life.
+    decay = math.exp(-excess_days / float(_TRADE_DECAY_DAYS))
+    return max(_MIN_WEIGHT, min(1.0, decay))
+
+
+def _safe_float(value: object) -> float | None:
+    """Best-effort conversion of ``value`` to float, returning None when invalid."""
+
+    try:
+        candidate = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return candidate if math.isfinite(candidate) else None
+
+
+def _validate_feedback_record(record: dict) -> None:
+    """Ensure ``record`` follows the expected JSONL schema before persistence."""
+
+    required_fields = {
+        "timestamp": str,
+        "type": str,
+        "strategy": str,
+        "status": str,
+    }
+    for field, expected in required_fields.items():
+        if field not in record:
+            raise ValueError(f"Missing required feedback field: {field}")
+        if not isinstance(record[field], expected):
+            raise TypeError(f"Field '{field}' must be {expected}, got {type(record[field])}")
+
+    # When confidence fields are present, validate their ranges.
+    for key in ("confidence_before", "confidence_after", "suggested_confidence", "applied_confidence"):
+        if key in record and record[key] is not None:
+            value = _safe_float(record[key])
+            if value is None:
+                raise TypeError(f"Field '{key}' must be numeric when provided.")
+            if not (_CONFIDENCE_MIN <= value <= _CONFIDENCE_MAX):
+                raise ValueError(f"Confidence {value} for '{key}' outside [{_CONFIDENCE_MIN}, {_CONFIDENCE_MAX}]")
+
+
+def _append_jsonl(
+    path: str,
+    records: Iterable[dict],
+    *,
+    validator: Callable[[dict], None] | None = None,
+) -> int:
+    """Append ``records`` to ``path`` with a locked write, returning count written."""
+
+    written = 0
+    with _locked_file(path, "a") as handle:
+        for record in records:
+            if validator is not None:
+                validator(record)
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            written += 1
+    return written
 
 
 def _is_valid_learning_trade(trade: dict) -> bool:
@@ -90,7 +175,8 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
     if not os.path.exists(log_path):
         return trades
 
-    with open(log_path, "r", encoding="utf-8") as f:
+    now = datetime.datetime.now(datetime.UTC)
+    with _locked_file(log_path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -109,6 +195,7 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
                 and float(size) > 0.0
                 and _is_valid_learning_trade(trade)
             ):
+                trade["_weight"] = _compute_trade_weight(trade, now=now)
                 trades.append(trade)
     return trades
 
@@ -131,49 +218,107 @@ def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
             "sortino_ratio": 0.0,
         }
 
-    roi_values = [float(trade["roi"]) for trade in trades]
-    wins = sum(1 for roi in roi_values if roi > 0)
-    losses = total_trades - wins
-    win_rate = float(wins) / float(total_trades)
+    roi_values: List[float] = []
+    weights: List[float] = []
+    for trade in trades:
+        roi_val = _safe_float(trade.get("roi"))
+        if roi_val is None:
+            continue
+        weight = _safe_float(trade.get("_weight"))
+        if weight is None or weight <= 0:
+            weight = 1.0
+        weights.append(weight)
+        roi_values.append(roi_val)
+
+    if not roi_values:
+        # All trades invalid; return zeroed metrics.
+        return {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "avg_roi": 0.0,
+            "cumulative_return": 0.0,
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "roi_percent": 0.0,
+        }
+
+    total_weight = sum(weights) or float(len(roi_values))
+    wins_weight = sum(w for roi, w in zip(roi_values, weights) if roi > 0)
+    losses_weight = total_weight - wins_weight
+    win_rate = wins_weight / total_weight if total_weight > 0 else 0.0
+    wins_count = sum(1 for roi in roi_values if roi > 0)
+    losses_count = len(roi_values) - wins_count
+
     logger.info(
         "Learning cycle win rate computed",
-        extra={"wins": wins, "losses": losses, "total_trades": total_trades, "win_rate": win_rate},
+        extra={
+            "wins": wins_weight,
+            "losses": losses_weight,
+            "total_trades": total_trades,
+            "win_rate": win_rate,
+        },
     )
+
+    # Apply exponential decay weights to ROI contributions to minimize drift.
+    adjusted_rois = [roi * min(1.0, max(_MIN_WEIGHT, weight)) for roi, weight in zip(roi_values, weights)]
 
     if np is not None:
         rois = np.array(roi_values, dtype=float)
-        avg_roi = float(np.mean(rois))
-        cumulative_return = float(np.prod(1 + rois) - 1)
+        w = np.array(weights, dtype=float)
+        if np.allclose(w.sum(), 0.0):
+            w = np.ones_like(rois)
 
-        std = float(np.std(rois))
+        avg_roi = float(np.average(rois, weights=w))
+        cumulative_return = float(np.prod(1 + np.array(adjusted_rois, dtype=float)) - 1)
+
+        mean_roi = avg_roi
+        variance = np.average((rois - mean_roi) ** 2, weights=w)
+        std = float(np.sqrt(variance))
         sharpe_ratio = float(np.mean(rois) / std) if std > 0 else 0.0
 
         downside = rois[rois < 0]
-        dd = float(np.std(downside)) if downside.size > 0 else 0.0
-        sortino_ratio = float(np.mean(rois) / dd) if dd > 0 else 0.0
+        if downside.size > 0:
+            downside_weights = w[rois < 0]
+            downside_mean = float(np.average(downside, weights=downside_weights))
+            downside_variance = np.average(
+                (downside - downside_mean) ** 2,
+                weights=downside_weights,
+            )
+            dd = float(np.sqrt(downside_variance))
+        else:
+            dd = 0.0
+        sortino_ratio = float(mean_roi / dd) if dd > 0 else 0.0
 
-        cumulative = np.cumprod(1 + rois)
+        cumulative = np.cumprod(1 + np.array(adjusted_rois, dtype=float))
         running_max = np.maximum.accumulate(cumulative)
         drawdowns = (cumulative - running_max) / running_max
         max_drawdown = float(np.min(drawdowns)) if drawdowns.size > 0 else 0.0
     else:
-        avg_roi = sum(roi_values) / float(total_trades)
+        avg_roi = sum(roi * weight for roi, weight in zip(roi_values, weights)) / total_weight
 
         cumulative_product = 1.0
-        for roi in roi_values:
+        for roi in adjusted_rois:
             cumulative_product *= 1 + roi
         cumulative_return = cumulative_product - 1.0
 
-        if total_trades > 1:
-            variance = sum((roi - avg_roi) ** 2 for roi in roi_values) / float(total_trades)
+        if len(roi_values) > 1:
+            variance = sum(weight * (roi - avg_roi) ** 2 for roi, weight in zip(roi_values, weights)) / total_weight
             std = math.sqrt(variance)
         else:
             std = 0.0
         sharpe_ratio = avg_roi / std if std > 0 else 0.0
 
-        downside_values = [roi for roi in roi_values if roi < 0]
+        downside_values = [(roi, weight) for roi, weight in zip(roi_values, weights) if roi < 0]
         if downside_values:
-            variance_downside = sum(roi**2 for roi in downside_values) / float(len(downside_values))
+            weighted_sum = sum(weight * roi for roi, weight in downside_values)
+            downside_weight = sum(weight for _, weight in downside_values) or 1.0
+            downside_mean = weighted_sum / downside_weight
+            variance_downside = (
+                sum(weight * (roi - downside_mean) ** 2 for roi, weight in downside_values) / downside_weight
+            )
             dd = math.sqrt(variance_downside)
         else:
             dd = 0.0
@@ -182,7 +327,7 @@ def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
         running_balance = 1.0
         running_max = 1.0
         max_drawdown = 0.0
-        for roi in roi_values:
+        for roi in adjusted_rois:
             running_balance *= 1 + roi
             running_max = max(running_max, running_balance)
             if running_max > 0:
@@ -192,8 +337,8 @@ def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
 
     return {
         "total_trades": int(total_trades),
-        "wins": int(wins),
-        "losses": int(losses),
+        "wins": int(wins_count),
+        "losses": int(losses_count),
         "win_rate": round(win_rate, 6),
         "avg_roi": round(avg_roi, 6),
         "cumulative_return": round(cumulative_return, 6),
@@ -227,7 +372,7 @@ def _load_shadow_results(path: str = "logs/shadow_test_results.jsonl") -> List[d
     if not os.path.exists(path):
         return []
     rows: List[dict] = []
-    with open(path, "r", encoding="utf-8") as handle:
+    with _locked_file(path, "r") as handle:
         for line in handle:
             line = line.strip()
             if not line:
@@ -313,10 +458,7 @@ def _evaluate_shadow_promotions(
     if not promotion_records:
         return
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "a", encoding="utf-8") as handle:
-        for rec in promotion_records:
-            handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    _append_jsonl(output_path, promotion_records, validator=_validate_feedback_record)
 
 
 def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> int:
@@ -374,6 +516,11 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
 
     # Compute report metrics and generate suggestions
     report = run_learning_cycle()
+    drawdown_val = _safe_float(report.get("max_drawdown"))
+    if drawdown_val is not None and abs(drawdown_val) > _DRAW_DOWN_HALT_THRESHOLD:
+        logger.info("Pausing learning due to drawdown.")
+        return 0
+
     suggestions = generate_suggestions(report) or []
 
     # If no suggestions, write a diagnostic entry to learning_feedback.jsonl
@@ -402,9 +549,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             "reason": reason,
             "total_trades": total_trades,
         }
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(diag, separators=(",", ":")) + "\n")
+        _append_jsonl(output_path, [diag], validator=_validate_feedback_record)
         msg = (
             f"[LearningMachine] No suggestions generated — reason='{reason}', "
             f"total_trades={total_trades}, strategies={strategies_considered}"
@@ -413,99 +558,114 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
         return 0
 
     # Otherwise, append generated suggestions
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     ts = datetime.datetime.now(datetime.UTC).isoformat()
-    wrote = 0
-    with open(output_path, "a", encoding="utf-8") as f:
-        for s in suggestions:
-            # Normalize required fields for dashboard/report compatibility
-            primary_label = s.get("strategy") or s.get("strategy_name")
-            strategy_name = primary_label or s.get("category") or "Unknown"
-            confidence_before = s.get("confidence_before") or s.get("current_confidence")
-            confidence_after = (
-                s.get("confidence_after")
-                or s.get("suggested_confidence")
-                or s.get("confidence")  # fallback: suggestion confidence score
-            )
-            status_val = s.get("status") or "pending"
+    accepted_records: List[dict] = []
+    for index, suggestion in enumerate(suggestions, start=1):
+        primary_label = suggestion.get("strategy") or suggestion.get("strategy_name")
+        strategy_name = primary_label or suggestion.get("category") or "Unknown"
 
-            rec = {
-                "timestamp": ts,
-                "type": "learning_suggestion",
-                "strategy": strategy_name,
-                "confidence_before": confidence_before,
-                "confidence_after": confidence_after,
-                "reason": s.get("reason", ""),
-                "status": status_val,
-            }
-            # Preserve any additional fields from the generator for transparency
-            for k in ("parameter", "old_value", "new_value", "suggestion", "category"):
-                if k in s and k not in rec:
-                    rec[k] = s[k]
+        before_raw = (
+            suggestion.get("confidence_before") or suggestion.get("current_confidence") or suggestion.get("confidence")
+        )
+        after_raw = (
+            suggestion.get("confidence_after") or suggestion.get("suggested_confidence") or suggestion.get("confidence")
+        )
 
-            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-            wrote += 1
+        confidence_after = _safe_float(after_raw)
+        if confidence_after is None:
+            logger.warning("Rejecting suggestion with invalid confidence_after: %s", after_raw)
+            continue
 
-            log_msg = "".join(
-                [
-                    "[LearningMachine] Suggestion #%s: strategy=%s before=%s after=%s ",
-                    "status=%s reason=%s",
-                ]
+        confidence_before = _safe_float(before_raw)
+        if confidence_before is None:
+            confidence_before = confidence_after
+
+        # Cap confidence change
+        if abs(confidence_after - confidence_before) > _MAX_CONFIDENCE_DELTA:
+            logger.warning(
+                "Rejecting drastic confidence change: %s → %s",
+                confidence_before,
+                confidence_after,
             )
-            logger.info(
-                log_msg,
-                wrote,
-                rec.get("strategy"),
-                rec.get("confidence_before"),
-                rec.get("confidence_after"),
-                rec.get("status"),
-                rec.get("reason"),
-            )
+            continue
+
+        # Clamp to safe range
+        if not (_CONFIDENCE_MIN <= confidence_after <= _CONFIDENCE_MAX):
+            logger.warning("Invalid confidence: %s", confidence_after)
+            continue
+
+        status_val = suggestion.get("status") or "pending"
+        rec = {
+            "timestamp": ts,
+            "type": "learning_suggestion",
+            "strategy": strategy_name,
+            "confidence_before": round(confidence_before, 6),
+            "confidence_after": round(confidence_after, 6),
+            "reason": suggestion.get("reason", ""),
+            "status": status_val,
+        }
+        for key in ("parameter", "old_value", "new_value", "suggestion", "category"):
+            if key in suggestion and key not in rec:
+                rec[key] = suggestion[key]
+        accepted_records.append(rec)
+        logger.info(
+            "[LearningMachine] Suggestion #%s: strategy=%s before=%.4f after=%.4f status=%s reason=%s",
+            index,
+            rec["strategy"],
+            rec["confidence_before"],
+            rec["confidence_after"],
+            rec["status"],
+            rec.get("reason"),
+        )
+
+    if suggestions and not accepted_records:
+        logger.warning("All suggestions rejected by safety filters; nothing written.")
+
+    wrote = _append_jsonl(output_path, accepted_records, validator=_validate_feedback_record) if accepted_records else 0
     # Shadow test recent performance per suggested strategy
     try:
         _shadow_log_path = "logs/shadow_test_results.jsonl"
-        os.makedirs(os.path.dirname(_shadow_log_path), exist_ok=True)
         recent_trades = load_trades()
         recent_trades = recent_trades[-100:]
-        if recent_trades and suggestions:
-            # Aggregate by strategy from recent closed trades
+        shadow_records: List[dict] = []
+        if recent_trades and accepted_records:
             by_strategy: Dict[str, List[dict]] = {}
-            for t in recent_trades:
-                strat = t.get("strategy") or "Unknown"
-                by_strategy.setdefault(strat, []).append(t)
-            with open(_shadow_log_path, "a", encoding="utf-8") as sf:
-                for s in suggestions:
-                    strat = s.get("strategy") or s.get("strategy_name") or "Unknown"
-                    rows = by_strategy.get(strat, [])
-                    if not rows:
-                        continue
-                    rois = []
-                    for r in rows:
-                        try:
-                            rois.append(float(r.get("roi")))
-                        except (TypeError, ValueError):
-                            continue
-                    if not rois:
-                        continue
-                    wins = sum(1 for x in rois if x > 0)
-                    total = len(rois)
-                    success_rate = wins / total if total else 0.0
-                    avg_roi = float(sum(rois) / total) if total else 0.0
-                    conf_val = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
-                    rec = {
+            for trade in recent_trades:
+                strat = trade.get("strategy") or "Unknown"
+                by_strategy.setdefault(strat, []).append(trade)
+            for record in accepted_records:
+                strat = record.get("strategy") or "Unknown"
+                rows = by_strategy.get(strat, [])
+                if not rows:
+                    continue
+                rois = []
+                for entry in rows:
+                    roi_candidate = _safe_float(entry.get("roi"))
+                    if roi_candidate is not None:
+                        rois.append(roi_candidate)
+                if not rois:
+                    continue
+                wins = sum(1 for value in rois if value > 0)
+                total = len(rois)
+                success_rate = wins / total if total else 0.0
+                avg_roi = sum(rois) / total if total else 0.0
+                shadow_records.append(
+                    {
                         "timestamp": ts,
                         "strategy": strat,
                         "success_rate": round(success_rate, 4),
                         "avg_roi": round(avg_roi, 6),
-                        "confidence": conf_val,
+                        "confidence": record.get("confidence_after"),
                     }
-                    sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                    logger.info(
-                        "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f",
-                        strat,
-                        success_rate * 100,
-                        avg_roi,
-                    )
+                )
+                logger.info(
+                    "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f",
+                    strat,
+                    success_rate * 100,
+                    avg_roi,
+                )
+        if shadow_records:
+            _append_jsonl(_shadow_log_path, shadow_records)
     except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Shadow test logging skipped: %s", _e)
 
@@ -545,13 +705,18 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             best_score = float(-res.fun)
             out_rec = {
                 "timestamp": ts,
+                "type": "learning_suggestion",
                 "strategy": "SimpleRSIStrategy",
+                "confidence_before": None,
+                "confidence_after": round(best_conf, 4),
                 "suggested_confidence": round(best_conf, 4),
                 "sharpe": round(best_score, 4),
+                "reason": "bayesian_optimizer",
+                "status": "analysis",
                 "source": "bayesian_optimization",
             }
-            with open(output_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
+            _append_jsonl(output_path, [out_rec], validator=_validate_feedback_record)
+            wrote += 1
             opt_msg = f"[OPTIMIZER] Suggested confidence={best_conf:.4f} " f"with Sharpe={best_score:.4f}"
             logger.info(opt_msg)
     except (ImportError, ValueError, TypeError) as _e:  # pragma: no cover - optional dep fallback
@@ -562,45 +727,71 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
         shadow_path = "logs/shadow_test_results.jsonl"
         if os.path.exists(shadow_path):
             by_strat: Dict[str, List[dict]] = {}
-            with open(shadow_path, "r", encoding="utf-8") as f:
-                for line in f:
+            with _locked_file(shadow_path, "r") as handle:
+                for line in handle:
                     try:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
                     sname = rec.get("strategy") or "Unknown"
                     by_strat.setdefault(sname, []).append(rec)
+            applied_records: List[dict] = []
             for sname, rows in by_strat.items():
-                if len(rows) >= 100:
-                    sr = float(rows[-1].get("success_rate", 0.0))
-                    if sr >= 0.70:
-                        # find latest suggestion for this strategy
-                        latest_conf = None
-                        try:
-                            with open(output_path, "r", encoding="utf-8") as lf:
-                                for line in lf:
-                                    try:
-                                        j = json.loads(line)
-                                    except json.JSONDecodeError:
-                                        continue
-                                    has_after = j.get("confidence_after")
-                                    has_suggested = j.get("suggested_confidence")
-                                    if j.get("strategy") == sname and (has_after or has_suggested):
-                                        latest_conf = has_after or has_suggested
-                        except FileNotFoundError:
-                            pass
-                        if latest_conf is not None:
-                            applied = {
-                                "timestamp": ts,
-                                "strategy": sname,
-                                "status": "applied",
-                                "applied_confidence": latest_conf,
-                                "source": "auto_apply_from_shadow_test",
-                            }
-                            with open(output_path, "a", encoding="utf-8") as f:
-                                f.write(json.dumps(applied, separators=(",", ":")) + "\n")
-                            apply_msg = f"[LEARNING APPLY] {sname} updated with " f"confidence={float(latest_conf):.3f}"
-                            logger.info(apply_msg)
+                success_runs = sum(
+                    1
+                    for rec in rows
+                    if (rate := _safe_float(rec.get("success_rate"))) is not None and rate >= _SHADOW_SUCCESS_THRESHOLD
+                )
+                if success_runs < _SHADOW_MIN_SUCCESSFUL_RUNS:
+                    continue
+
+                latest_conf = None
+                try:
+                    with _locked_file(output_path, "r") as lf:
+                        for line in lf:
+                            try:
+                                entry = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            has_after = entry.get("confidence_after")
+                            has_suggested = entry.get("suggested_confidence")
+                            if entry.get("strategy") == sname and (has_after or has_suggested):
+                                latest_conf = has_after or has_suggested
+                except FileNotFoundError:
+                    latest_conf = None
+
+                confidence_val = _safe_float(latest_conf)
+                if confidence_val is None:
+                    continue
+                if not (_CONFIDENCE_MIN <= confidence_val <= _CONFIDENCE_MAX):
+                    logger.warning(
+                        "Auto-apply confidence out of range for %s: %s",
+                        sname,
+                        latest_conf,
+                    )
+                    continue
+
+                applied_record = {
+                    "timestamp": ts,
+                    "type": "learning_suggestion",
+                    "strategy": sname,
+                    "confidence_before": confidence_val,
+                    "confidence_after": confidence_val,
+                    "status": "applied",
+                    "applied_confidence": confidence_val,
+                    "reason": "auto_apply_from_shadow_test",
+                    "source": "auto_apply_from_shadow_test",
+                }
+                applied_records.append(applied_record)
+                logger.info(
+                    "[LEARNING APPLY] %s updated with confidence=%.3f (success_runs=%s)",
+                    sname,
+                    confidence_val,
+                    success_runs,
+                )
+
+            if applied_records:
+                wrote += _append_jsonl(output_path, applied_records, validator=_validate_feedback_record)
     except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Auto-apply skipped: %s", _e)
     _evaluate_shadow_promotions(output_path=output_path, timestamp=ts)

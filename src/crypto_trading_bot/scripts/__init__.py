@@ -1,1 +1,3 @@
-# Auto-created to make this a Python package
+"""Runtime scripts for managing the trading bot."""
+
+__all__: list[str] = []

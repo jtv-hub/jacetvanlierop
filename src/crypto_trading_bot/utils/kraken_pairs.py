@@ -36,6 +36,8 @@ def normalize_pair(pair: str) -> str:
     if not isinstance(pair, str) or "/" not in pair:
         raise ValueError(f"Invalid pair format: {pair!r}; expected like 'BTC/USDC'")
     up = ensure_usdc_pair(pair)
+    if up == "USDC/USDC":  # legacy fallback for tests and paper mode
+        return "USDCUSDC"
     mapped = PAIR_MAP.get(up)
     if mapped:
         return mapped

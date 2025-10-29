@@ -1,34 +1,45 @@
-"""
-Test runner for the nightly pipeline.
+"""Import smoke tests for pipeline modules."""
 
-This script ensures the nightly pipeline can be imported and executed
-without relative import issues.
-"""
-
-import logging
+import importlib.util
 import sys
+from importlib import import_module
 from pathlib import Path
 
-# Ensure project root is in sys.path for IDE + runtime consistency
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+import pytest
 
-try:
-    # Import directly from scripts (since PROJECT_ROOT is crypto_trading_bot/)
-    from scripts import nightly_pipeline
-except ModuleNotFoundError as e:
-    logging.error("[test] Import failed: %s", e)
-    sys.exit(1)
+SRC_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = SRC_ROOT.parent
+
+if str(SRC_ROOT) in sys.path:
+    sys.path.remove(str(SRC_ROOT))
+sys.path.insert(0, str(SRC_ROOT))
+
+if str(PROJECT_ROOT) in sys.path:
+    sys.path.remove(str(PROJECT_ROOT))
+    sys.path.append(str(PROJECT_ROOT))
 
 
-# Ensure nightly_pipeline is referenced so it's not flagged as unused
-if __name__ == "__main__":
-    # Smoke test: ensure nightly_pipeline can run without errors
-    try:
-        nightly_pipeline.run_nightly_pipeline()
-        logging.info("[test] Nightly pipeline executed successfully.")
-    except (RuntimeError, ImportError, Exception) as e:
-        # Catch common expected errors, log them, and exit
-        logging.error("[test] Nightly pipeline execution failed: %s", e)
-        sys.exit(1)
+@pytest.mark.smoke
+def test_nightly_pipeline_importable():
+    """Ensure the nightly pipeline script can be imported via the package."""
+    base_spec = importlib.util.find_spec("crypto_trading_bot")
+    scripts_spec = importlib.util.find_spec("crypto_trading_bot.scripts")
+    spec = importlib.util.find_spec("crypto_trading_bot.scripts.nightly_pipeline")
+    assert base_spec is not None, f"crypto_trading_bot missing; sys.path={sys.path}"
+    assert scripts_spec is not None, f"crypto_trading_bot.scripts missing; sys.path={sys.path}"
+    if spec is None:
+        import pkgutil
+
+        discovered = sorted(name for _, name, _ in pkgutil.iter_modules(scripts_spec.submodule_search_locations or []))
+        pytest.fail(
+            f"crypto_trading_bot.scripts.nightly_pipeline missing; discovered={discovered}; sys.path={sys.path}"
+        )
+    module = import_module("crypto_trading_bot.scripts.nightly_pipeline")
+    assert hasattr(module, "run_nightly_pipeline")
+
+
+@pytest.mark.skip(reason="Nightly pipeline requires external services; import check is sufficient.")
+def test_nightly_pipeline_execution_placeholder():
+    """Placeholder to document execution expectations without invoking external side effects."""
+    module = import_module("crypto_trading_bot.scripts.nightly_pipeline")
+    module.run_nightly_pipeline()

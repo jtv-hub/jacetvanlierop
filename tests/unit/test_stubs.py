@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 
@@ -66,34 +69,52 @@ def test_trade_ledger_detects_duplicate(monkeypatch):
     class DummyPM:
         positions = {}
 
+    log_path = Path("logs/trades.log")
+    pos_path = Path("logs/positions.jsonl")
+    log_path.unlink(missing_ok=True)
+    pos_path.unlink(missing_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    seed_trade = {
+        "trade_id": "test_001",
+        "pair": "BTC/USDC",
+        "side": "buy",
+        "entry_price": 100.0,
+        "exit_price": 105.0,
+        "size": 0.01,
+        "capital_used": 1.0,
+        "roi": 0.05,
+        "exit_reason": "tp",
+        "strategy": "unit_test",
+        "confidence": 0.5,
+        "status": "closed",
+        "timestamp": "2024-01-01T00:00:00+00:00",
+    }
+    log_path.write_text(json.dumps(seed_trade) + "\n", encoding="utf-8")
+
     tl = ledger_mod.TradeLedger(DummyPM())
+    tl.reload_trades()
+
     original_window = ledger_mod._DUPLICATE_WINDOW_SECONDS
     ledger_mod._DUPLICATE_WINDOW_SECONDS = 300
-    tl.trades.clear()
-    tl.trade_index.clear()
-
     try:
-        trade_id = tl.log_trade(
-            trading_pair="BTC/USDC",
-            trade_size=0.002,
-            strategy_name="DuplicateCheckStrategy",
-            confidence=0.75,
-            entry_price=21000.0,
-            side="buy",
-        )
-
         duplicate_id = tl.log_trade(
             trading_pair="BTC/USDC",
-            trade_size=0.002,
-            strategy_name="DuplicateCheckStrategy",
-            confidence=0.75,
-            entry_price=21000.0,
+            trade_size=0.01,
+            strategy_name="unit_test",
+            confidence=0.5,
+            entry_price=100.0,
             side="buy",
+            trade_id=seed_trade["trade_id"],
         )
     finally:
         ledger_mod._DUPLICATE_WINDOW_SECONDS = original_window
 
-    assert duplicate_id == trade_id
+    assert duplicate_id == seed_trade["trade_id"]
+    tl.trades.clear()
+    tl.trade_index.clear()
+    tl.txid_index.clear()
+    tl.reload_trades()
     assert len(tl.trades) == 1
 
 
