@@ -17,9 +17,9 @@ from datetime import datetime, timezone
 from statistics import mean, pstdev
 from typing import Any, Dict, List, Optional, Tuple
 
-from crypto_trading_bot.bot.market_data import BalanceFetchError, get_account_balance
-from crypto_trading_bot.bot.utils.reinvestment import calculate_reinvestment_rate
 from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
+from crypto_trading_bot.market_data import BalanceFetchError, get_account_balance
+from crypto_trading_bot.utils.reinvestment import calculate_reinvestment_rate
 
 logger = logging.getLogger(__name__)
 

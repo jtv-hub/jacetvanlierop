@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency guard
     np = None  # type: ignore[assignment]
 
-from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
+from crypto_trading_bot.utils.log_rotation import get_anomalies_logger
 
 anomalies_logger = get_anomalies_logger()
 

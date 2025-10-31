@@ -8,10 +8,10 @@ import logging
 import os
 
 import crypto_trading_bot.config as bot_config
-from crypto_trading_bot.bot.scheduler import run_scheduler
-from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, set_live_mode
 from crypto_trading_bot.safety.prelaunch_guard import run_prelaunch_guard
+from crypto_trading_bot.scheduler import run_scheduler
+from crypto_trading_bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 
 # Configure root logger for DEBUG output (ensures [RSI DEBUG] logs are visible)

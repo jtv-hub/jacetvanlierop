@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import logging
 
-from crypto_trading_bot.bot.market_data import BalanceFetchError, get_account_balance
 from crypto_trading_bot.config import CONFIG, ConfigurationError, set_live_mode
+from crypto_trading_bot.market_data import BalanceFetchError, get_account_balance
 from crypto_trading_bot.utils.kraken_client import kraken_place_order
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

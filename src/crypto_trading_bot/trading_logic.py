@@ -28,23 +28,31 @@ except ImportError:  # pragma: no cover - optional dependency
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 import crypto_trading_bot.utils.price_feed as price_feed_module
-from crypto_trading_bot.bot.state.portfolio_state import (
-    load_portfolio_state,
-    refresh_portfolio_state,
-)
-from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import (
     CANARY_MAX_FRACTION,
     CONFIG,
     DEPLOY_PHASE,
+    FORCE_PPO_LIVE,
+    PPO_CONFIDENCE_TO_BUFFER,
+    PPO_ENABLED,
+    PPO_MIN_CONFIDENCE,
+    PPO_MIN_SHADOW_TRADES,
+    PPO_SHADOW_MIN_WINRATE,
     get_mode_label,
     is_live,
     set_live_mode,
 )
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.context.trading_context import TradingContext
+from crypto_trading_bot.learning.ppo_agent import get_agent
+from crypto_trading_bot.learning.state_builder import STATE_DIM, build_state_vector
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.portfolio_state import (
+    load_portfolio_state,
+    refresh_portfolio_state,
+)
 from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.utils.alerts import send_alert
 from crypto_trading_bot.utils.file_locks import _locked_file
 from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 from crypto_trading_bot.utils.kraken_client import (
@@ -52,9 +60,6 @@ from crypto_trading_bot.utils.kraken_client import (
     KrakenAuthError,
     _invalidate_pair_cache,
     kraken_get_asset_pair_meta,
-)
-from crypto_trading_bot.utils.kraken_client import (
-    kraken_place_order as _kraken_place_order,
 )
 from crypto_trading_bot.utils.kraken_client import kraken_place_order as kraken_place_order
 from crypto_trading_bot.utils.kraken_pairs import ensure_usdc_pair
@@ -64,6 +69,13 @@ from crypto_trading_bot.utils.price_history import (
     append_live_price,
     get_history_prices,
 )
+from crypto_trading_bot.utils.sqlite_logger import (
+    fetch_ppo_shadow_stats,
+    log_learning_feedback,
+)
+from crypto_trading_bot.utils.sqlite_logger import (
+    log_position as sqlite_log_position,
+)
 from crypto_trading_bot.utils.system_logger import get_system_logger
 
 # Optional RSI calculator (import may vary by environment)
@@ -72,7 +84,7 @@ try:
 except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
 
-from .strategies.advanced_strategies import (
+from crypto_trading_bot.strategies.advanced_strategies import (
     ADXStrategy,
     BollingerBandStrategy,
     CompositeStrategy,
@@ -81,8 +93,8 @@ from .strategies.advanced_strategies import (
     StochRSIStrategy,
     VWAPStrategy,
 )
-from .strategies.dual_threshold_strategies import DualThresholdStrategy
-from .strategies.simple_rsi_strategies import SimpleRSIStrategy
+from crypto_trading_bot.strategies.dual_threshold_strategies import DualThresholdStrategy
+from crypto_trading_bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
 logger = get_system_logger().getChild("trading_logic")
@@ -111,6 +123,26 @@ _VOLUME_CACHE: dict[str, tuple[float, float]] = {}
 _VOLUME_CACHE_TTL_SECONDS = 60.0
 
 
+def _ppo_buffer_from_confidence(confidence: float, fallback: float) -> float:
+    """Map PPO confidence to a capital buffer using configuration mapping."""
+
+    mapping = CONFIG.get("ppo", {}).get("confidence_to_buffer") or PPO_CONFIDENCE_TO_BUFFER
+    if not isinstance(mapping, dict):
+        mapping = PPO_CONFIDENCE_TO_BUFFER
+    selected = fallback
+    highest_threshold = float("-inf")
+    for raw_threshold, raw_buffer in mapping.items():
+        try:
+            threshold = float(raw_threshold)
+            buffer_value = float(raw_buffer)
+        except (TypeError, ValueError):
+            continue
+        if confidence >= threshold and threshold >= highest_threshold:
+            highest_threshold = threshold
+            selected = buffer_value
+    return max(selected, 0.0)
+
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(3),
@@ -120,7 +152,7 @@ _VOLUME_CACHE_TTL_SECONDS = 60.0
 def _kraken_place_order_retry(*args, **kwargs):
     """Resilient wrapper around Kraken order placement."""
 
-    return _kraken_place_order(*args, **kwargs)
+    return kraken_place_order(*args, **kwargs)
 
 
 def _resolve_trade_size_bounds(pair: str) -> tuple[float, float]:
@@ -1061,6 +1093,16 @@ class PositionManager:
             "entry_adx": entry_adx,
             "entry_rsi": entry_rsi,
         }
+        position_payload = dict(self.positions[trade_id])
+        position_payload["status"] = "open"
+        try:
+            sqlite_log_position(position_payload)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(
+                "Failed to persist position %s to SQLite: %s",
+                trade_id,
+                exc,
+            )
         try:
             os.makedirs("logs", exist_ok=True)
             with _locked_file("logs/positions.jsonl", "a") as f:
@@ -1158,6 +1200,14 @@ class PositionManager:
 
         for trade_id in keys_to_delete:
             del self.positions[trade_id]
+            try:
+                sqlite_log_position({"trade_id": trade_id, "status": "closed"})
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error(
+                    "Failed to mark position %s closed in SQLite: %s",
+                    trade_id,
+                    exc,
+                )
         return exits
 
     def load_positions_from_file(self, file_path="logs/positions.jsonl"):
@@ -1360,6 +1410,33 @@ def evaluate_signals_and_trade(
     if not pairs:
         logger.warning("No tradable_pairs configured; skipping evaluation.")
         return
+
+    ppo_agent = None
+    ppo_shadow_stats = {"accepted": 0.0, "wins": 0.0, "winrate": 0.0}
+    if PPO_ENABLED:
+        try:
+            ppo_agent = get_agent()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("PPO agent unavailable: %s", exc)
+        try:
+            ppo_shadow_stats = fetch_ppo_shadow_stats()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to load PPO shadow stats: %s", exc)
+        if np is None:
+            logger.warning("numpy unavailable; bypassing PPO for this evaluation cycle.")
+            ppo_agent = None
+    shadow_trades_count = float(ppo_shadow_stats.get("accepted", 0.0) or 0.0)
+    shadow_winrate = float(ppo_shadow_stats.get("winrate", 0.0) or 0.0)
+    ppo_shadow_ready = shadow_trades_count >= PPO_MIN_SHADOW_TRADES and shadow_winrate >= PPO_SHADOW_MIN_WINRATE
+    ppo_live_allowed = (not is_live) or FORCE_PPO_LIVE
+    if PPO_ENABLED:
+        logger.debug(
+            "PPO gating | shadow_trades=%s winrate=%.3f ready=%s live_allowed=%s",
+            shadow_trades_count,
+            shadow_winrate,
+            ppo_shadow_ready,
+            ppo_live_allowed,
+        )
 
     mode_label = get_mode_label()
     if mode_label != _STATE.last_mode_label:
@@ -1886,6 +1963,84 @@ def evaluate_signals_and_trade(
                     adjusted_size = limited_size
                     position_notional = adjusted_size * float(current_price)
 
+                trade_side = signal
+                ppo_suggestion_id: str | None = None
+                try:
+                    base_vector = build_state_vector(pair)
+                except Exception as exc:  # pragma: no cover - defensive
+                    print(f"[STATE] Failed for {pair}: {exc}")
+                    base_vector = [0.0] * STATE_DIM
+                if np is not None:
+                    state_vector_array = np.asarray(base_vector, dtype=np.float32)
+                    state_vector_list = state_vector_array.tolist()
+                else:
+                    state_vector_list = list(base_vector)
+                    state_vector_array = state_vector_list
+
+                if PPO_ENABLED and ppo_agent is not None:
+                    try:
+                        ppo_action, ppo_confidence = ppo_agent.predict(state_vector_array)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning("PPO inference failed for %s: %s", pair, exc)
+                        ppo_action, ppo_confidence = 0, 0.0
+                    suggestion_id = str(uuid.uuid4())
+                    suggestion_payload = {
+                        "suggestion_id": suggestion_id,
+                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                        "strategy": "ppo_agent",
+                        "status": "suggested",
+                        "parameters": {
+                            "model_version": getattr(ppo_agent, "model_version", "unknown"),
+                            "confidence": float(ppo_confidence),
+                            "pair": pair,
+                            "shadow_ready": bool(ppo_shadow_ready),
+                            "shadow_trades": int(shadow_trades_count),
+                            "shadow_winrate": shadow_winrate,
+                            "live_allowed": bool(ppo_live_allowed),
+                        },
+                        "state_vector": state_vector_list,
+                        "action": int(ppo_action),
+                        "accepted": False,
+                    }
+                    try:
+                        log_learning_feedback(suggestion_payload)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning("Failed to log PPO suggestion: %s", exc)
+
+                    can_use_ppo = float(ppo_confidence) >= PPO_MIN_CONFIDENCE and ppo_live_allowed and ppo_shadow_ready
+                    if can_use_ppo:
+                        if int(ppo_action) == 0:
+                            logger.info(
+                                "PPO suggested hold for %s (confidence=%.3f); skipping trade.",
+                                pair,
+                                ppo_confidence,
+                            )
+                            continue
+                        trade_side = "buy" if int(ppo_action) == 1 else "sell"
+                        confidence = float(ppo_confidence)
+                        strategy_name = "PPOAgent"
+                        previous_buffer = float(buffer or 0.0)
+                        buffer = _ppo_buffer_from_confidence(confidence, previous_buffer)
+                        size_scale = 1.0
+                        if previous_buffer > 0:
+                            size_scale = buffer / previous_buffer
+                        adjusted_size = max(min_sz, min(max_sz, adjusted_size * size_scale))
+                        if adjusted_size <= 0:
+                            logger.info("PPO sizing reduced to zero; skipping %s", pair)
+                            continue
+                        position_notional = adjusted_size * float(current_price)
+                        trade_risk *= size_scale
+                        ppo_suggestion_id = suggestion_id
+                    elif int(ppo_action) == 0:
+                        logger.info(
+                            (
+                                "PPO hold suggestion ignored due to gating "
+                                "(confidence=%.3f, shadow_ready=%s, live_allowed=%s)."
+                            ),
+                            float(ppo_confidence),
+                            ppo_shadow_ready,
+                            ppo_live_allowed,
+                        )
                 trade_data = {
                     "asset": asset,
                     "size": adjusted_size,
@@ -1979,7 +2134,6 @@ def evaluate_signals_and_trade(
 
                 logger.info("Proposed trade details", extra=trade_data)
 
-                trade_side = signal
                 start_latency = time.perf_counter()
                 order_result = _submit_live_trade(
                     pair=pair,
@@ -2040,6 +2194,8 @@ def evaluate_signals_and_trade(
                     "balance_delta": fill_context.get("balance_delta"),
                     "fill_price": fill_context.get("average_price"),
                     "filled_volume": fill_context.get("filled_volume"),
+                    "state_vector": state_vector_list,
+                    "ppo_suggestion_id": ppo_suggestion_id,
                 }
 
                 ledger.log_trade(

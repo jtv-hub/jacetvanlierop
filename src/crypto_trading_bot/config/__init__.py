@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 LIVE_MODE_LABEL = "\U0001f6a8 LIVE MODE \U0001f6a8"
 PAPER_MODE_LABEL = "PAPER MODE"
 IS_LIVE: bool = False
+IS_PAPER_MODE: bool = True
 is_live: bool = IS_LIVE
-CONFIG: dict = {}
+CONFIG: dict = {"is_live": IS_LIVE, "is_paper_mode": IS_PAPER_MODE}
 _DEFAULT_LIVE_CONFIRMATION_FILE = ".confirm_live_trade"
 _TRADE_SIZE_FALLBACK_WARNED = False
 
@@ -538,7 +539,9 @@ def set_live_mode(flag: bool) -> None:
             raise ConfigurationError(f"Unexpected error during credential check: {exc}") from exc
     globals()["is_live"] = bool(flag)
     globals()["IS_LIVE"] = bool(flag)
+    globals()["IS_PAPER_MODE"] = not bool(flag)
     CONFIG["is_live"] = bool(flag)
+    CONFIG["is_paper_mode"] = not bool(flag)
 
 
 def get_mode_label() -> str:
@@ -923,10 +926,98 @@ if IS_LIVE and not _LIVE_FORCE_ENV:
         )
         raise ConfigurationError(ERROR_CONFIRMATION_SENTINEL)
 
+# --------------------------------------------------------------------------- #
+# Risk configuration                                                          #
+# --------------------------------------------------------------------------- #
+
+STOP_LOSS_PCT = 0.02
+
+risk_cfg = CONFIG.setdefault("risk", {})
+risk_cfg["stop_loss_pct"] = STOP_LOSS_PCT
+
+# --------------------------------------------------------------------------- #
+# PPO configuration                                                           #
+# --------------------------------------------------------------------------- #
+
+_DEFAULT_PPO_CONFIDENCE_TO_BUFFER = {0.6: 0.03, 0.7: 0.06, 0.8: 0.12, 0.9: 0.18}
+
+
+def _parse_confidence_mapping(raw: str | None) -> dict[float, float]:
+    mapping = dict(_DEFAULT_PPO_CONFIDENCE_TO_BUFFER)
+    if not raw:
+        return mapping
+    candidates = {}
+    for part in raw.split(","):
+        if ":" not in part:
+            continue
+        left, right = part.split(":", 1)
+        try:
+            threshold = float(left.strip())
+            buffer_value = float(right.strip())
+        except (TypeError, ValueError):
+            continue
+        candidates[threshold] = buffer_value
+    return candidates or mapping
+
+
+PPO_ENABLED = True
+PPO_MIN_CONFIDENCE = float(os.getenv("PPO_MIN_CONFIDENCE", "0.6") or "0.6")
+PPO_CONFIDENCE_TO_BUFFER = _parse_confidence_mapping(os.getenv("PPO_CONFIDENCE_TO_BUFFER"))
+PPO_MIN_SHADOW_TRADES = int(os.getenv("PPO_MIN_SHADOW_TRADES", "75") or "75")
+PPO_SHADOW_MIN_WINRATE = float(os.getenv("PPO_SHADOW_MIN_WINRATE", "0.5") or "0.5")
+FORCE_PPO_LIVE = _to_bool(os.getenv("FORCE_PPO_LIVE"), False)
+
+ppo_cfg = CONFIG.setdefault("ppo", {})
+ppo_cfg["enabled"] = PPO_ENABLED
+ppo_cfg["min_confidence"] = PPO_MIN_CONFIDENCE
+ppo_cfg["confidence_to_buffer"] = PPO_CONFIDENCE_TO_BUFFER
+ppo_cfg["min_shadow_trades"] = PPO_MIN_SHADOW_TRADES
+ppo_cfg["shadow_min_winrate"] = PPO_SHADOW_MIN_WINRATE
+ppo_cfg["force_live"] = FORCE_PPO_LIVE
+
+# --------------------------------------------------------------------------- #
+# TWAP execution configuration                                                #
+# --------------------------------------------------------------------------- #
+
+TWAP_ENABLED = _to_bool(os.getenv("TWAP_ENABLED"), True)
+MAX_SPREAD_PCT = float(os.getenv("TWAP_MAX_SPREAD_PCT", "0.001") or "0.001")
+MIN_DEPTH_MULT = float(os.getenv("TWAP_MIN_DEPTH_MULT", "10") or "10")
+MIN_SLICES = int(os.getenv("TWAP_MIN_SLICES", "5") or "5")
+MAX_SLICES = int(os.getenv("TWAP_MAX_SLICES", "20") or "20")
+TWAP_DURATION_MIN = int(os.getenv("TWAP_DURATION_MIN", "5") or "5")
+TIMEOUT_SEC = int(os.getenv("TWAP_TIMEOUT_SEC", "300") or "300")
+
+twap_cfg = CONFIG.setdefault("twap", {})
+twap_cfg.update(
+    {
+        "enabled": TWAP_ENABLED,
+        "max_spread_pct": MAX_SPREAD_PCT,
+        "min_depth_mult": MIN_DEPTH_MULT,
+        "min_slices": MIN_SLICES,
+        "max_slices": MAX_SLICES,
+        "duration_min": TWAP_DURATION_MIN,
+        "timeout_sec": TIMEOUT_SEC,
+    }
+)
+
+
+def save_config(path: Path | None = None) -> None:
+    """Persist the in-memory CONFIG dictionary to disk."""
+
+    target = Path(path) if path is not None else Path("config.json")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as handle:
+            json.dump(CONFIG, handle, indent=2, sort_keys=True)
+    except OSError as exc:  # pragma: no cover - filesystem issues
+        logger.error("Failed to persist CONFIG to %s: %s", target, exc)
+        raise
+
 
 __all__ = [
     "CONFIG",
     "IS_LIVE",
+    "IS_PAPER_MODE",
     "DEPLOY_PHASE",
     "CANARY_MAX_FRACTION",
     "LIVE_MODE_LABEL",
@@ -936,4 +1027,19 @@ __all__ = [
     "set_live_mode",
     "ConfigurationError",
     "query_api_key_permissions",
+    "PPO_ENABLED",
+    "PPO_MIN_CONFIDENCE",
+    "PPO_CONFIDENCE_TO_BUFFER",
+    "PPO_MIN_SHADOW_TRADES",
+    "PPO_SHADOW_MIN_WINRATE",
+    "FORCE_PPO_LIVE",
+    "save_config",
+    "TWAP_ENABLED",
+    "MAX_SPREAD_PCT",
+    "MIN_DEPTH_MULT",
+    "MIN_SLICES",
+    "MAX_SLICES",
+    "TWAP_DURATION_MIN",
+    "TIMEOUT_SEC",
+    "STOP_LOSS_PCT",
 ]

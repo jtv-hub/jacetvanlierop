@@ -7,8 +7,8 @@ Usage:
 
 from __future__ import annotations
 
-from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.trading_logic import evaluate_signals_and_trade
 
 
 def main() -> None:

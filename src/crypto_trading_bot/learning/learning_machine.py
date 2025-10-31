@@ -11,11 +11,11 @@ class interface with generate_report().
 
 from __future__ import annotations
 
-import datetime
 import json
 import logging
 import math
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List
 
 try:
@@ -23,9 +23,10 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None  # type: ignore[assignment]
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
 from crypto_trading_bot.utils.file_locks import _locked_file
+from crypto_trading_bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.utils.sqlite_logger import log_learning_feedback
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)
@@ -46,21 +47,21 @@ _TRADE_DECAY_DAYS = 30
 _MIN_WEIGHT = 0.05
 
 
-def _compute_trade_weight(trade: dict, *, now: datetime.datetime | None = None) -> float:
+def _compute_trade_weight(trade: dict, *, now: datetime | None = None) -> float:
     """Return an exponentially decayed weight for ``trade`` based on age."""
 
     timestamp = trade.get("timestamp")
-    now = now or datetime.datetime.now(datetime.UTC)
+    now = now or datetime.now(timezone.utc)
     if not isinstance(timestamp, str):
         return 1.0
     try:
-        trade_ts = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        trade_ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return 1.0
     if trade_ts.tzinfo is None:
-        trade_ts = trade_ts.replace(tzinfo=datetime.UTC)
+        trade_ts = trade_ts.replace(tzinfo=timezone.utc)
     age = now - trade_ts
-    if age <= datetime.timedelta(days=_TRADE_DECAY_DAYS):
+    if age <= timedelta(days=_TRADE_DECAY_DAYS):
         return 1.0
     excess_days = max(age.days - _TRADE_DECAY_DAYS, 0)
     # Exponential decay after the threshold with a 30-day half-life.
@@ -116,6 +117,10 @@ def _append_jsonl(
         for record in records:
             if validator is not None:
                 validator(record)
+            try:
+                log_learning_feedback(record)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error("Failed to persist learning feedback to SQLite: %s", exc)
             handle.write(json.dumps(record, separators=(",", ":")) + "\n")
             written += 1
     return written
@@ -175,7 +180,7 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
     if not os.path.exists(log_path):
         return trades
 
-    now = datetime.datetime.now(datetime.UTC)
+    now = datetime.now(timezone.utc)
     with _locked_file(log_path, "r") as f:
         for line in f:
             line = line.strip()
@@ -198,6 +203,23 @@ def load_trades(log_path: str = "logs/trades.log") -> List[dict]:
                 trade["_weight"] = _compute_trade_weight(trade, now=now)
                 trades.append(trade)
     return trades
+
+
+def process_trade_confidence(strategy: str, confidence: float, regime: str = "unknown") -> None:
+    """
+    Update internal confidence tracking for a strategy.
+    Called by learning_pipeline after shadow test pass.
+    """
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "confidence_update",
+        "strategy": strategy,
+        "confidence": round(confidence, 4),
+        "regime": regime,
+        "status": "recorded",
+    }
+    log_learning_feedback(payload)
+    print(f"Confidence updated: {strategy} = {confidence}")
 
 
 def calculate_metrics(trades: List[dict]) -> Dict[str, float | int]:
@@ -354,7 +376,7 @@ def run_learning_cycle() -> Dict[str, float | int | str]:
     """Run a single learning cycle and return metrics (with timestamp/buffer)."""
     trades = load_trades()
     metrics = calculate_metrics(trades)
-    metrics["timestamp"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    metrics["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     metrics["capital_buffer"] = get_dynamic_buffer()
     return metrics
 
@@ -542,7 +564,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
         )
 
         diag = {
-            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "no_suggestions_generated",
             "strategy": strat_label,
             "status": "no_suggestions_generated",
@@ -558,7 +580,7 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
         return 0
 
     # Otherwise, append generated suggestions
-    ts = datetime.datetime.now(datetime.UTC).isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     accepted_records: List[dict] = []
     for index, suggestion in enumerate(suggestions, start=1):
         primary_label = suggestion.get("strategy") or suggestion.get("strategy_name")

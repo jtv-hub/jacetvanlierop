@@ -1,7 +1,7 @@
 """Seed a dummy BTC trade into the ledger for testing exit logic."""
 
-from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
 from crypto_trading_bot.ledger.trade_ledger import log_trade
+from crypto_trading_bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 if __name__ == "__main__":
     dummy_strategy = SimpleRSIStrategy()

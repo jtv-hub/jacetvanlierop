@@ -16,7 +16,7 @@ def get_ledger(position_manager: Any | None = None) -> TradeLedger:
 
     if _LEDGER is None:
         if position_manager is None:
-            from crypto_trading_bot.bot import trading_logic
+            from crypto_trading_bot import trading_logic
 
             position_manager = trading_logic.position_manager
 

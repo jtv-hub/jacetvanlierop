@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -22,19 +23,28 @@ from typing import Any, Dict, Optional
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from crypto_trading_bot import config as bot_config
-from crypto_trading_bot.bot.utils.alerts import send_alert
-from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
-from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG, IS_LIVE
+from crypto_trading_bot.learning.reward_shaper import compute_reward
+from crypto_trading_bot.learning.state_builder import STATE_DIM
+from crypto_trading_bot.utils.alerts import send_alert
 from crypto_trading_bot.utils.file_locks import _locked_file
-from crypto_trading_bot.utils.kraken_client import get_usdc_balance, kraken_get_balance
+from crypto_trading_bot.utils.kraken_client import (
+    get_usdc_balance,
+    kraken_get_balance,
+)
+from crypto_trading_bot.utils.log_rotation import get_anomalies_logger
+from crypto_trading_bot.utils.schema_validator import validate_trade_schema
+from crypto_trading_bot.utils.sqlite_logger import (
+    log_position as sqlite_log_position,
+)
+from crypto_trading_bot.utils.sqlite_logger import (
+    log_trade as sqlite_log_trade,
+)
+from crypto_trading_bot.utils.sqlite_logger import update_learning_feedback
 from crypto_trading_bot.utils.system_logger import (
     SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
 )
-from crypto_trading_bot.utils.system_logger import (
-    get_system_logger,
-)
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
 # Enable extra debug output when explicitly requested
 DEBUG_MODE = os.getenv("DEBUG_MODE", "0") == "1"
@@ -410,7 +420,7 @@ class TradeLedger:
 
         try:
             balance = get_usdc_balance()
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except (RuntimeError, ValueError, OSError) as exc:
             system_logger.warning("USDC balance fetch failed: %s", exc)
             return None
 
@@ -574,7 +584,7 @@ class TradeLedger:
         pair_token = str(trading_pair or "").strip().upper()
         if not pair_token:
             raise ValueError("[Ledger] Trading pair is required.")
-        live_mode = bool(getattr(bot_config, "is_live", False))
+        live_mode = bool(CONFIG.get("is_live", IS_LIVE))
         if live_mode:
             if pair_token.endswith("/USD"):
                 message = (
@@ -595,8 +605,9 @@ class TradeLedger:
                     pair_token,
                 )
         trading_pair = pair_token
+        trade_id = str(kwargs.get("trade_id") or uuid.uuid4())
         confidence = float(kwargs.get("confidence", 0.0) or 0.0)
-        if math.isclose(confidence, 0.5, abs_tol=1e-9):
+        if trade_id not in self.trade_index and math.isclose(confidence, 0.5, abs_tol=1e-9):
             message = " ".join(
                 [
                     "[Ledger] Confidence of 0.5 is no longer permitted — ensure strategies emit",
@@ -640,8 +651,33 @@ class TradeLedger:
         pending_at = kwargs.get("pending_reconciliation_at")
         if isinstance(pending_at, datetime):
             pending_at = pending_at.isoformat()
+        ppo_suggestion_id = kwargs.get("ppo_suggestion_id")
+        state_vector_raw = kwargs.get("state_vector")
+        state_vector_list: list[float] | None = None
+        if state_vector_raw is not None:
+            try:
+                candidate_list = list(state_vector_raw)
+            except TypeError:
+                candidate_list = None
+            if candidate_list is not None:
+                try:
+                    vector = [float(x) for x in candidate_list]
+                except (TypeError, ValueError):
+                    system_logger.warning("Invalid state_vector payload for %s; dropping", trade_id)
+                else:
+                    if len(vector) != STATE_DIM:
+                        system_logger.warning(
+                            "State vector length %s != %s for %s; adjusting",
+                            len(vector),
+                            STATE_DIM,
+                            trade_id,
+                        )
+                        if len(vector) < STATE_DIM:
+                            vector = vector + [0.0] * (STATE_DIM - len(vector))
+                        else:
+                            vector = vector[:STATE_DIM]
+                    state_vector_list = vector
 
-        trade_id = kwargs.get("trade_id") or str(uuid.uuid4())
         entry_price = kwargs.get("entry_price", 18000 + 250 * (0.5 - random.random()))
         # Normalize side to long/short; map to order side for slippage
         side_norm = _normalize_side(
@@ -739,6 +775,10 @@ class TradeLedger:
             "source": source_flag,
             "pending_reconciliation_at": pending_at,
         }
+        if state_vector_list is not None:
+            trade["state_vector"] = state_vector_list
+        if ppo_suggestion_id:
+            trade["ppo_suggestion_id"] = str(ppo_suggestion_id)
 
         # Debug: emit the trade being logged for diagnostics (opt-in)
         if DEBUG_MODE:
@@ -784,16 +824,13 @@ class TradeLedger:
         duplicate = self._find_recent_duplicate(trade)
         if duplicate is not None:
             existing_id = duplicate.get("trade_id") or "<unknown>"
-            system_logger.warning(
-                "Duplicate trade detected within %.0fs window; existing trade_id=%s pair=%s "
-                "size=%.8f strategy=%s. Skipping new entry %s.",
-                _DUPLICATE_WINDOW_SECONDS,
-                existing_id,
-                trade.get("pair"),
-                trade.get("size"),
-                trade.get("strategy"),
-                trade_id,
+            duplicate_message = (
+                f"Duplicate trade detected within {int(_DUPLICATE_WINDOW_SECONDS)}s window; "
+                f"existing trade_id={existing_id} pair={trade.get('pair')} "
+                f"size={trade.get('size'):.8f} strategy={trade.get('strategy')}. "
+                f"Skipping new entry {trade_id}."
             )
+            system_logger.warning(duplicate_message)
             try:
                 anomalies_logger.info(
                     json.dumps(
@@ -858,6 +895,13 @@ class TradeLedger:
                     "Trade %s logged without account_balance; review live balance configuration.",
                     trade_id,
                 )
+
+        # Persist trade to SQLite (best-effort to keep legacy log as fallback)
+        try:
+            sqlite_log_trade(trade)
+        except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+            raise
 
         # Write compact, one-line JSON to trades.log via trade_logger
         trade_logger.info(json.dumps(trade, separators=(",", ":")))
@@ -939,6 +983,14 @@ class TradeLedger:
             roi=trade.get("roi"),
         )
 
+        position_payload = dict(trade)
+        position_payload["status"] = "open"
+        try:
+            sqlite_log_position(position_payload)
+        except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+            raise
+
         with open(POSITIONS_PATH, "a", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             json.dump(trade, f)
@@ -1006,6 +1058,7 @@ class TradeLedger:
         for attempt in range(max_retries):
             try:
                 updated = False
+                updated_trade_payload = None
 
                 # Ensure we have latest trades in memory
                 trades = self.trades or []
@@ -1243,6 +1296,7 @@ class TradeLedger:
                             )
                         except (TypeError, ValueError):
                             pass
+                    updated_trade_payload = dict(t_obj)
                     updated = True
 
                     # After update, if exit_price still missing/None, log anomaly but continue
@@ -1292,6 +1346,46 @@ class TradeLedger:
                         if tid:
                             self.trade_index[tid] = trade
                     system_logger.debug("Successfully updated trade %s in trades.log", trade_id)
+
+                    if updated_trade_payload:
+                        try:
+                            sqlite_log_trade(updated_trade_payload)
+                        except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                            system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+                            raise
+                    try:
+                        sqlite_log_position({"trade_id": trade_id, "status": "closed"})
+                    except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                        system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+                        raise
+                    suggestion_id = t_obj.get("ppo_suggestion_id")
+                    if suggestion_id:
+                        try:
+                            reward_value = compute_reward(
+                                roi=t_obj.get("roi"),
+                                fee=t_obj.get("fee"),
+                                slippage=(t_obj.get("entry_slippage_amount") or 0.0)
+                                + (t_obj.get("exit_slippage_amount") or 0.0),
+                                drawdown=t_obj.get("drawdown"),
+                                risk_alloc=t_obj.get("capital_buffer"),
+                            )
+                        except (RuntimeError, ValueError) as exc:
+                            system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+                            raise
+                        try:
+                            update_learning_feedback(
+                                suggestion_id,
+                                {
+                                    "status": "trade_closed",
+                                    "accepted": True,
+                                    "actual_roi": t_obj.get("roi"),
+                                    "reward": reward_value,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                        except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                            system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+                            raise
 
                     # Safely resync positions.jsonl by removing the closed position
                     try:
@@ -1432,6 +1526,13 @@ class TradeLedger:
         with _locked_file(TRADES_LOG_PATH, "w") as handle:
             for trade in self.trades:
                 handle.write(json.dumps(trade, separators=(",", ":")) + "\n")
+        for trade in self.trades:
+            try:
+                sqlite_log_trade(trade)
+            except (sqlite3.Error, RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                trade_id = trade.get("trade_id") if isinstance(trade, dict) else "unknown"
+                system_logger.error("Operation failed for trade %s: %s", trade_id, exc)
+                raise
 
     def mark_pending_reconciliation(
         self,
@@ -1483,7 +1584,7 @@ class TradeLedger:
             asset = (CONFIG.get("kraken", {}) or {}).get("balance_asset", "USDC")
             try:
                 response = _kraken_get_balance_retry(asset)
-            except Exception as exc:  # pylint: disable=broad-except
+            except (RuntimeError, ValueError, OSError) as exc:
                 system_logger.error("[BALANCE] Kraken balance fetch failed: %s", exc)
                 raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.") from exc
 

@@ -5,12 +5,12 @@ Evaluates strategies using sample historical data and prints top parameters.
 
 import os
 
-from crypto_trading_bot.bot.strategies.dual_threshold_strategies import (
+from crypto_trading_bot.optimizer.genetic_optimizer import evaluate_fitness
+from crypto_trading_bot.strategies.dual_threshold_strategies import (
     DualThresholdStrategy,
 )
-from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
-from crypto_trading_bot.bot.utils.historical_data_loader import load_dummy_price_data
-from crypto_trading_bot.optimizer.genetic_optimizer import evaluate_fitness
+from crypto_trading_bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
+from crypto_trading_bot.utils.historical_data_loader import load_dummy_price_data
 
 # Load sample price data
 CSV_PATH = os.path.join("data", "BTCUSD_1h_sample.csv")

@@ -10,8 +10,8 @@ Used to standardize decision-making based on market conditions.
 from datetime import datetime, timezone
 from typing import Dict
 
-from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
 from crypto_trading_bot.config import CONFIG
+from crypto_trading_bot.portfolio_state import load_portfolio_state
 from crypto_trading_bot.technical_indicators.adx import calculate_adx
 
 
@@ -21,7 +21,28 @@ class TradingContext:
     Supports dynamic strategy adjustment.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        pair: str | None = None,
+        position_size: float | None = None,
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        timestamp: datetime | None = None,
+        fee: float | None = None,
+        slippage: float | None = None,
+        drawdown: float | None = None,
+        risk_alloc: float | None = None,
+    ):
+        self.pair = pair
+        self.position_size = position_size
+        self.entry_price = entry_price
+        self.exit_price = exit_price
+        self.timestamp = timestamp
+        self.fee = fee
+        self.slippage = slippage
+        self.drawdown = drawdown
+        self.risk_alloc = risk_alloc
         self.last_updated = datetime.now(timezone.utc)
         self.regime = "unknown"
         self.buffer = 0.25  # Default buffer
@@ -30,6 +51,8 @@ class TradingContext:
         self._adx_cache: dict[str, float] = {}
 
         self.update_context()
+        if self.timestamp is None:
+            self.timestamp = self.last_updated
 
     def update_context(self):
         """

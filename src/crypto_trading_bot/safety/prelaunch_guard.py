@@ -18,13 +18,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from crypto_trading_bot.bot.simulation import collect_signal_snapshot
-from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import CONFIG, IS_LIVE, ConfigurationError, is_live, set_live_mode
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.ledger.ledger_access import get_ledger
 from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.safety.confirmation import require_live_confirmation
+from crypto_trading_bot.simulation import collect_signal_snapshot
+from crypto_trading_bot.utils.alerts import send_alert
 from crypto_trading_bot.utils.price_history import get_fallback_metrics
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 

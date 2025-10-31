@@ -10,33 +10,37 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
-from ..config import CONFIG, ConfigurationError, get_mode_label, is_live
-from ..learning.confidence_audit import (
+import schedule
+
+from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, is_live
+from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
-from ..learning.learning_machine import run_learning_cycle, run_learning_machine
-from ..learning.optimization import detect_outliers
-from ..learning.shadow_test_runner import run_shadow_tests
-from ..safety.confirmation import require_live_confirmation
-from ..scripts.check_exit_conditions import main as run_exit_checks
-from ..scripts.daily_heartbeat import run_daily_tasks
-from ..scripts.shadow_confidence_test import run_shadow_confidence_test
-from ..scripts.suggest_top_configs import (
-    export_suggestions,
-    generate_parameter_suggestions,
-)
-from ..scripts.sync_validator import SyncValidator
-from ..utils.system_logger import get_system_logger
-from .state.portfolio_state import (
+from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
+from crypto_trading_bot.learning.learning_pipeline import run_learning_pipeline
+from crypto_trading_bot.learning.optimization import detect_outliers
+from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
+from crypto_trading_bot.portfolio_state import (
     load_portfolio_state,
     refresh_portfolio_state,
 )
-from .trading_logic import evaluate_signals_and_trade
-from .utils.log_rotation import (
+from crypto_trading_bot.safety.confirmation import require_live_confirmation
+from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
+from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
+from crypto_trading_bot.scripts.shadow_confidence_test import run_shadow_confidence_test
+from crypto_trading_bot.scripts.suggest_top_configs import (
+    export_suggestions,
+    generate_parameter_suggestions,
+)
+from crypto_trading_bot.scripts.sync_validator import SyncValidator
+from crypto_trading_bot.trading_logic import evaluate_signals_and_trade
+from crypto_trading_bot.utils.log_rotation import (
     get_anomalies_logger,
     get_rotating_handler,
 )
+from crypto_trading_bot.utils.system_logger import get_system_logger
 
 # Constants for task intervals in seconds
 TRADE_INTERVAL = 5 * 60  # Every 5 minutes
@@ -44,6 +48,15 @@ DAILY_TASK_HOUR = 0  # Midnight UTC
 DAILY_TASK_MINUTE = 5  # Buffer to ensure market data is updated
 ANOMALY_AUDIT_INTERVAL = 6 * 60 * 60  # 6 hours in seconds
 ALERTS_LOG_PATH = "logs/alerts.log"
+CLEAN_CONFIG_TIME = "02:45"
+
+# Daily PPO training (5am UTC)
+# 0 5 * * * PYTHONPATH=src venv/bin/python scripts/train_ppo.py --timesteps 50000
+# Nightly NSGA-III hyperparameter optimisation (2am UTC)
+# 0 2 * * * PYTHONPATH=src venv/bin/python src/crypto_trading_bot/optimization/nsga3_optimizer.py
+# TWAP execution smoke check
+# 0 5 * * * PYTHONPATH=src venv/bin/python scripts/test_twap.py
+print(f"Scheduler: clean_config.py scheduled daily at {CLEAN_CONFIG_TIME} UTC")
 
 anomalies_logger = get_anomalies_logger()
 logger = get_system_logger().getChild("scheduler")
@@ -145,6 +158,25 @@ def update_shadow_test_results():
         send_alert("update_shadow_test_results failed", context={"error": str(e)})
         # Non-fatal
         return
+
+
+def run_clean_config() -> None:
+    """Execute the config cleanup script to deduplicate min_confidence values."""
+
+    script_path = Path("src/crypto_trading_bot/scripts/clean_config.py")
+    if not script_path.exists():
+        print(f"clean_config.py: missing at {script_path}")
+        return
+    cmd = "PYTHONPATH=src python src/crypto_trading_bot/scripts/clean_config.py --force"
+    result = os.system(cmd)
+    if result == 0:
+        print("clean_config.py: SUCCESS")
+    else:
+        print(f"clean_config.py: FAILED (code {result})")
+
+
+schedule.every().day.at(CLEAN_CONFIG_TIME).do(run_clean_config)
+schedule.every(6).hours.do(run_learning_pipeline)
 
 
 def run_daily_pipeline() -> None:
@@ -346,6 +378,9 @@ def run_scheduler():
             if should_run_daily(last_daily_run):
                 run_daily_pipeline()
                 last_daily_run = datetime.now(timezone.utc)
+
+            logger.info("Running scheduled tasks...")
+            schedule.run_pending()
 
             time.sleep(TRADE_INTERVAL)
 

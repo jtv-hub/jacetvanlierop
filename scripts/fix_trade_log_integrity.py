@@ -44,13 +44,13 @@ except ImportError:  # pragma: no cover - optional
 
 # Project imports with src fallback
 try:
-    from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
+    from crypto_trading_bot.utils.schema_validator import validate_trade_schema
 except ImportError:  # pragma: no cover
     import sys
 
     REPO_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
     sys.path.insert(0, os.path.abspath(REPO_SRC))
-    from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema  # type: ignore
+    from crypto_trading_bot.utils.schema_validator import validate_trade_schema  # type: ignore
 
 
 def _normalize_side(side: Any, strategy: Any, roi: Any) -> str:

@@ -8,10 +8,10 @@ import os
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-from crypto_trading_bot.bot.trading_logic import PositionManager
 from crypto_trading_bot.learning import learning_machine
 from crypto_trading_bot.ledger import trade_ledger as trade_ledger_module
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.trading_logic import PositionManager
 
 
 def test_trade_lifecycle_integration(tmp_path, monkeypatch, request):

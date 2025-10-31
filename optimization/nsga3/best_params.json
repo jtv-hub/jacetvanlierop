@@ -1,0 +1,16 @@
+{
+  "params": {
+    "min_confidence": 0.5991090446763015,
+    "kl_threshold": 0.029791169794628133,
+    "twap_slices": 8,
+    "risk_buffer": 0.1504861664201429,
+    "drawdown_multiplier": 5.00443076723443,
+    "min_shadow_trades": 200
+  },
+  "metrics": {
+    "average_roi": 0.045051236660938354,
+    "sharpe": 1.0787886663414985,
+    "drawdown": 0.021798961685873593
+  },
+  "timestamp": "2025-10-31T20:51:20.592065+00:00"
+}

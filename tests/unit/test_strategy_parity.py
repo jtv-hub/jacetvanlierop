@@ -1,8 +1,8 @@
 """Tests ensuring strategy pipeline parity between different invocations."""
 
-from crypto_trading_bot.bot import trading_logic
-from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
-from crypto_trading_bot.bot.trading_logic import _build_strategy_pipeline
+from crypto_trading_bot import trading_logic
+from crypto_trading_bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
+from crypto_trading_bot.trading_logic import _build_strategy_pipeline
 
 
 def test_strategy_pipeline_matches_between_modes():

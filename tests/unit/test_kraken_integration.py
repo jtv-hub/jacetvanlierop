@@ -12,7 +12,7 @@ import pytest
 import requests
 
 from crypto_trading_bot import config as config_module
-from crypto_trading_bot.bot import market_data, trading_logic
+from crypto_trading_bot import market_data, trading_logic
 from crypto_trading_bot.config import ConfigurationError, set_live_mode
 from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.utils import kraken_client

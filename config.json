@@ -1,0 +1,133 @@
+{
+  "auto_pause": {
+    "max_consecutive_losses": 5,
+    "max_drawdown_pct": 0.1,
+    "max_total_roi_pct": -0.15
+  },
+  "buffer_defaults": {
+    "chop": 0.5,
+    "flat": 0.25,
+    "trending": 1.0,
+    "unknown": 0.25,
+    "volatile": 0.5
+  },
+  "correlation": {
+    "threshold": 0.7,
+    "window": 30
+  },
+  "deployment": {
+    "canary_max_fraction": 0.05,
+    "phase": "canary",
+    "phase_source": "final_health_audit",
+    "phase_status": "pending",
+    "phase_updated_at": "2025-10-29T22:35:23.501503+00:00"
+  },
+  "drawdown_multiplier": 5.00443076723443,
+  "is_live": false,
+  "kl_threshold": 0.029791169794628133,
+  "kraken": {
+    "api_base": "https://api.kraken.com",
+    "api_key": "3uQcWzC+lmnzgh9ljsct4aXjE8Gu+7ZmY8gLF48yni2EHSrTEW/mJIJa",
+    "api_secret": "SYOgn88ygUKh+85Ol46AtJ3VtnSO+mUSV4LJwOx3v8JcSQOG6gwvR86UWW5W12hT5rRe7pyowZzPFmnfEZWRLw==",
+    "balance_asset": "USDC",
+    "time_in_force": null,
+    "validate_orders": false
+  },
+  "kraken_api_key": "3uQcWzC+lmnzgh9ljsct4aXjE8Gu+7ZmY8gLF48yni2EHSrTEW/mJIJa",
+  "kraken_api_secret": "SYOgn88ygUKh+85Ol46AtJ3VtnSO+mUSV4LJwOx3v8JcSQOG6gwvR86UWW5W12hT5rRe7pyowZzPFmnfEZWRLw==",
+  "live_mode": {
+    "balance_env_var": "CRYPTO_TRADING_BOT_LIVE_BALANCE",
+    "balance_provider": null,
+    "confirmation_file": ".confirm_live_trade",
+    "drawdown_threshold": 0.1,
+    "failure_limit": 5,
+    "fallback_balance": 0.0,
+    "force_override": false,
+    "requested_via_env": false,
+    "risk_state_file": "logs/risk_guard_state.json"
+  },
+  "max_portfolio_risk": 0.1,
+  "min_confidence": 0.5991090446763015,
+  "min_shadow_trades": 200,
+  "min_volume": 100,
+  "paper_mode": {
+    "starting_balance": 100000.0
+  },
+  "ppo": {
+    "confidence_to_buffer": {
+      "0.6": 0.03,
+      "0.7": 0.06,
+      "0.8": 0.12,
+      "0.9": 0.18
+    },
+    "enabled": true,
+    "force_live": false,
+    "min_confidence": 0.6,
+    "min_shadow_trades": 75,
+    "shadow_min_winrate": 0.5
+  },
+  "prelaunch_guard": {
+    "alert_window_hours": 72,
+    "max_recent_high_severity": 50
+  },
+  "risk": {
+    "stop_loss_pct": 0.02
+  },
+  "risk_buffer": 0.1504861664201429,
+  "rsi": {
+    "exit_upper": 55,
+    "lower": 48,
+    "period": 14,
+    "upper": 75
+  },
+  "slippage": {
+    "alts_max": 0.01,
+    "alts_min": 0.005,
+    "majors": 0.001,
+    "use_random": false
+  },
+  "test_mode": false,
+  "tradable_pairs": [
+    "BTC/USDC",
+    "ETH/USDC",
+    "SOL/USDC",
+    "XRP/USDC",
+    "LINK/USDC"
+  ],
+  "trade_size": {
+    "default_max": 0.005,
+    "default_min": 0.001,
+    "per_pair": {
+      "BTC/USDC": {
+        "min_cost": 0.5,
+        "min_volume": 5e-05
+      },
+      "ETH/USDC": {
+        "min_cost": 0.5,
+        "min_volume": 0.001
+      },
+      "LINK/USDC": {
+        "min_cost": 0.5,
+        "min_volume": 0.2
+      },
+      "SOL/USDC": {
+        "min_cost": 0.5,
+        "min_volume": 0.02
+      },
+      "XRP/USDC": {
+        "min_cost": 0.5,
+        "min_volume": 1.65
+      }
+    }
+  },
+  "twap": {
+    "duration_min": 5,
+    "enabled": true,
+    "max_slices": 20,
+    "max_spread_pct": 0.001,
+    "min_depth_mult": 10.0,
+    "min_slices": 5,
+    "timeout_sec": 300
+  },
+  "twap_slices": 8
+}

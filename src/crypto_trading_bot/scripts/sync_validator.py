@@ -12,7 +12,7 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.utils.log_rotation import get_rotating_handler
 
 # Update this import path based on your project structure
 # from crypto_trading_bot.ledger.trade_ledger import TradeLedgerClass

@@ -6,8 +6,8 @@ Runs a simple loop to simulate trades and log results.
 import logging
 import time
 
-from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.config import CONFIG, get_mode_label, is_live
+from crypto_trading_bot.trading_logic import evaluate_signals_and_trade
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

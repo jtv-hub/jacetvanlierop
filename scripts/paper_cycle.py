@@ -27,12 +27,12 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 # Local imports from the package (kept after sys.path adjustment)
-from src.crypto_trading_bot.bot.trading_logic import (  # pylint: disable=wrong-import-position
-    evaluate_signals_and_trade,
-)
 from src.crypto_trading_bot.learning.confidence_audit import (  # pylint: disable=wrong-import-position
     audit_trades,
     log_anomaly,
+)
+from src.crypto_trading_bot.trading_logic import (  # pylint: disable=wrong-import-position
+    evaluate_signals_and_trade,
 )
 
 

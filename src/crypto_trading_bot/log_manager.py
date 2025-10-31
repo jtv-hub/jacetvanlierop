@@ -6,7 +6,7 @@ Handles file and console log formatting and routing.
 import logging
 import os
 
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
+from crypto_trading_bot.utils.log_rotation import get_rotating_handler
 
 
 def setup_logging():

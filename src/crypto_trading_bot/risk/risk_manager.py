@@ -6,7 +6,7 @@ from math import prod
 from typing import Iterable, List, Tuple
 
 try:
-    from crypto_trading_bot.bot.state.portfolio_state import load_closed_trades
+    from crypto_trading_bot.portfolio_state import load_closed_trades
 except ImportError:  # pragma: no cover - defensive fallback
     load_closed_trades = None  # type: ignore[assignment]
 

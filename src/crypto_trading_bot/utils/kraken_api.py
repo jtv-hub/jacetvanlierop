@@ -200,6 +200,18 @@ def _extract_ohlc_rows(payload: Dict[str, Any], pair: str) -> list[dict[str, flo
     return normalized
 
 
+def get_order_book(pair: str) -> Dict[str, list]:
+    """Mock order book used during paper trading and tests.
+
+    Provides deterministic bid/ask levels so the TWAP engine can exercise
+    order-book dependent logic without hitting the real Kraken API.
+    """
+    _ = pair  # pair kept for API parity
+    bid_level = [43200.0, 5.0]
+    ask_level = [43204.0, 5.0]
+    return {"bid": bid_level, "ask": ask_level, "bids": [bid_level], "asks": [ask_level]}
+
+
 def get_ohlc_data(
     pair: str,
     *,
@@ -305,4 +317,4 @@ try:  # Lazy import to avoid circular dependency during module init
 except ImportError:  # pragma: no cover - fallback if private client unavailable
     kraken_client = None  # type: ignore[assignment]
 
-__all__ = ["get_ticker_price", "get_ohlc_data", "PAIR_MAP", "kraken_client"]
+__all__ = ["get_ticker_price", "get_ohlc_data", "get_order_book", "PAIR_MAP", "kraken_client"]

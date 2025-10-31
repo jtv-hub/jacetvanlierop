@@ -8,8 +8,8 @@ import json
 import logging
 from copy import deepcopy
 
-from crypto_trading_bot.bot.simulation import collect_signal_snapshot
 from crypto_trading_bot.config import CONFIG, is_live, set_live_mode
+from crypto_trading_bot.simulation import collect_signal_snapshot
 
 logging.basicConfig(level=logging.INFO)
 

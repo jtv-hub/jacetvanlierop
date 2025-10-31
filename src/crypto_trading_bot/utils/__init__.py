@@ -1,17 +1,30 @@
-"""Utility modules for the crypto_trading_bot package."""
+"""Shared utility modules for the crypto_trading_bot package."""
 
 __all__ = [
+    "alert",
+    "alerts",
     "file_locks",
     "helpers",
+    "historical_data_loader",
     "kraken_api",
     "kraken_client",
     "kraken_client_config",
     "kraken_helpers",
     "kraken_pairs",
+    "log_rotation",
+    "market_data_fetcher",
     "mock_data_utils",
+    "news_filter",
+    "portfolio_risk",
     "price_feed",
     "price_history",
+    "reinvestment",
+    "schema_validator",
     "secrets_manager",
+    "signal_filter",
+    "sqlite_logger",
     "system_checks",
     "system_logger",
+    "trade_metrics",
+    "trade_validators",
 ]

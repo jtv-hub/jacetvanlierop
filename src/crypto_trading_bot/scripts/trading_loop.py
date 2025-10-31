@@ -9,9 +9,9 @@ import argparse
 import logging
 import os
 
-from crypto_trading_bot.bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, is_live
 from crypto_trading_bot.context.trading_context import TradingContext
+from crypto_trading_bot.trading_logic import evaluate_signals_and_trade
 from crypto_trading_bot.utils.system_checks import ensure_system_capacity
 
 # Optional debug toggle configured via CONFIG["logging"]["debug_mode"] or env override.

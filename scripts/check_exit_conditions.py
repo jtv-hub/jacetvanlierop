@@ -16,8 +16,8 @@ import os
 from datetime import datetime, timezone
 from typing import Dict
 
-from crypto_trading_bot.bot.trading_logic import PositionManager
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.trading_logic import PositionManager
 from crypto_trading_bot.utils.file_locks import _locked_file
 from crypto_trading_bot.utils.price_feed import get_current_price
 

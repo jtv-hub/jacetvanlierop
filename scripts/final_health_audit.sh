@@ -264,7 +264,7 @@ BALANCE_WARNING_PATTERN = re.compile(
 )
 
 try:
-    alerts_module = importlib.import_module("crypto_trading_bot.bot.utils.alerts")
+    alerts_module = importlib.import_module("crypto_trading_bot.utils.alerts")
     send_alert = alerts_module.send_alert
 except Exception:  # pragma: no cover - best-effort fallback
     def send_alert(message: str, *, level: str = "INFO", context: dict | None = None) -> None:

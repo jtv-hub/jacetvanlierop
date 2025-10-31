@@ -6,7 +6,7 @@ These tests validate shape and basic properties of the output from
 
 from datetime import datetime, timezone  # standard library first
 
-from crypto_trading_bot.bot.trading_logic import gather_signals
+from crypto_trading_bot.trading_logic import gather_signals
 
 
 def test_gather_signals_rsi_valid():

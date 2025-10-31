@@ -5,7 +5,7 @@ import pytest
 
 
 def test_trading_logic_exits_only_mode_initializes_executed_trades():
-    mod = pytest.importorskip("crypto_trading_bot.bot.trading_logic")
+    mod = pytest.importorskip("crypto_trading_bot.trading_logic")
     try:
         mod.evaluate_signals_and_trade(check_exits_only=True)
     except UnboundLocalError as e:
@@ -13,7 +13,7 @@ def test_trading_logic_exits_only_mode_initializes_executed_trades():
 
 
 def test_trading_logic_position_manager_check_exits_interface():
-    mod = pytest.importorskip("crypto_trading_bot.bot.trading_logic")
+    mod = pytest.importorskip("crypto_trading_bot.trading_logic")
     pm = mod.PositionManager()
     trade_id = "T-1"
     pm.positions[trade_id] = {
@@ -119,7 +119,7 @@ def test_trade_ledger_detects_duplicate(monkeypatch):
 
 
 def test_portfolio_risk_correlation_threshold_precedence():
-    pr_mod = pytest.importorskip("crypto_trading_bot.bot.utils.portfolio_risk")
+    pr_mod = pytest.importorskip("crypto_trading_bot.utils.portfolio_risk")
     signals = [
         {"asset": "BTC", "signal_score": 0.9, "regime": "trending", "strategy": "S"},
         {"asset": "ETH", "signal_score": 0.85, "regime": "trending", "strategy": "S"},

@@ -4,14 +4,14 @@ import math
 
 import pytest
 
-import crypto_trading_bot.bot.trading_logic as trading_logic
-from crypto_trading_bot.bot.trading_logic import (
+import crypto_trading_bot.trading_logic as trading_logic
+from crypto_trading_bot.indicators.rsi import calculate_rsi
+from crypto_trading_bot.trading_logic import (
     check_and_close_exits,
     execute_trade,
     gather_signals,
     risk_screen,
 )
-from crypto_trading_bot.indicators.rsi import calculate_rsi
 
 
 def _to_scalar(x):

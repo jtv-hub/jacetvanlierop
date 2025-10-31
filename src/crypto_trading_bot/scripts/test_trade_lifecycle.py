@@ -21,13 +21,13 @@ import time
 from datetime import datetime, timezone
 from typing import List
 
-from crypto_trading_bot.bot import trading_logic as tl
-from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
-from crypto_trading_bot.bot.trading_logic import position_manager
+from crypto_trading_bot import trading_logic as tl
 from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.indicators.rsi import calculate_rsi
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
+from crypto_trading_bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
+from crypto_trading_bot.trading_logic import position_manager
 from crypto_trading_bot.utils.kraken_api import get_ticker_price
 
 logger = logging.getLogger(__name__)

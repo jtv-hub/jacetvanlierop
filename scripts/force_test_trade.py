@@ -16,13 +16,13 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from crypto_trading_bot.bot.trading_logic import (
+from crypto_trading_bot.trading_logic import (
     CONFIG,
     evaluate_signals_and_trade,
     ledger,
 )
-from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.utils.kraken_pairs import ensure_usdc_pair
+from crypto_trading_bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.utils.price_feed import get_current_price
 from crypto_trading_bot.utils.price_history import (
     append_live_price,

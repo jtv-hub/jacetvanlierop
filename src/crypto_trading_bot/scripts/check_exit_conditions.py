@@ -9,10 +9,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, cast
 
-from ..bot.trading_logic import PositionManager
-from ..ledger.trade_ledger import TradeLedger
-from ..utils.file_locks import _locked_file
-from ..utils.price_feed import get_current_price
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.trading_logic import PositionManager
+from crypto_trading_bot.utils.file_locks import _locked_file
+from crypto_trading_bot.utils.price_feed import get_current_price
 
 if __name__ == "__main__" and __package__ is None:
     print(

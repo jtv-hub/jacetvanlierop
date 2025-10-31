@@ -9,8 +9,8 @@ import json
 import os
 from datetime import datetime, timezone
 
-from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
+from crypto_trading_bot.utils.log_rotation import get_anomalies_logger
 
 anomalies_logger = get_anomalies_logger()
 

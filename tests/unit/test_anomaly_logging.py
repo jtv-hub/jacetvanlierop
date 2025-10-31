@@ -15,10 +15,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.indicators import rsi
 from crypto_trading_bot.learning.confidence_audit import log_anomaly
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+from crypto_trading_bot.utils.log_rotation import get_anomalies_logger
 
 
 def _stub_numpy_and_dotenv():
