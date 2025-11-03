@@ -1,0 +1,595 @@
+.
+├── __init__.py
+├── .confirm_live_trade
+├── .coverage
+├── .env
+├── .flake8
+├── .gitignore
+├── .pre-commit-config.yaml
+├── .pylint
+│   ├── crypto_trading_bot_1.stats
+│   └── crypto_trading_bot.config.__init___1.stats
+├── .pylintrc
+├── .pytest_cache
+│   ├── .gitignore
+│   ├── CACHEDIR.TAG
+│   ├── README.md
+│   └── v
+│       └── cache
+│           ├── lastfailed
+│           └── nodeids
+├── .qodo
+│   ├── agents
+│   └── workflows
+├── .ruff_cache
+│   ├── .gitignore
+│   ├── 0.12.11
+│   │   ├── 11822594566041382934
+│   │   ├── 1186693679104659788
+│   │   ├── 13910730012907941830
+│   │   ├── 15537595745964574874
+│   │   ├── 1578145378357182086
+│   │   ├── 16269229002606543381
+│   │   ├── 16739832614835773529
+│   │   ├── 17504316946949153459
+│   │   ├── 2168658543806017040
+│   │   ├── 2245542225148225013
+│   │   ├── 3206815061952105440
+│   │   ├── 4900522619768065246
+│   │   ├── 6176211669926005493
+│   │   ├── 6289007940194783128
+│   │   ├── 6717721899395260424
+│   │   └── 8800316330049937591
+│   ├── 0.6.3
+│   │   ├── 10972045133367662452
+│   │   ├── 11029039409393620400
+│   │   ├── 11447920577763416125
+│   │   ├── 11715942704316100181
+│   │   ├── 12140080319608577238
+│   │   ├── 14218179646692900636
+│   │   ├── 16695793684236455250
+│   │   ├── 17961795900694249404
+│   │   ├── 4488156973826138182
+│   │   ├── 6563503385320256244
+│   │   ├── 7028331861603721858
+│   │   └── 9775694793807073759
+│   └── CACHEDIR.TAG
+├── .secrets
+│   ├── kraken_key.txt
+│   └── kraken_secret.txt
+├── .state
+│   ├── BTCUSD.size
+│   ├── ETHUSD.size
+│   └── SOLUSD.size
+├── .streamlit
+│   └── config.toml
+├── .vscode
+│   ├── settings.json
+│   └── settings.json.save
+├── bot
+│   ├── core.py
+│   ├── executor.py
+│   ├── health.py
+│   ├── ledger.py
+│   └── types.py
+├── check_structure.py
+├── config.json
+├── config.json.bak
+├── config.py
+├── dashboard.py
+├── data
+│   ├── __init__.py
+│   ├── adapters
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   └── kraken_public.py
+│   ├── backfills
+│   │   └── __init__.py
+│   ├── BTC-USD.csv
+│   ├── ETH-USD.csv
+│   ├── FAKE-USD.csv
+│   ├── learning.db
+│   ├── live
+│   │   ├── __init__.py
+│   │   ├── kraken_BTCUSD_20250812.jsonl
+│   │   ├── kraken_BTCUSD_20250813.jsonl
+│   │   ├── kraken_BTCUSD_20250814.jsonl
+│   │   ├── kraken_BTCUSD_20250815.jsonl
+│   │   ├── kraken_BTCUSD_20250816.jsonl
+│   │   ├── kraken_ETHUSD_20250814.jsonl
+│   │   ├── kraken_ETHUSD_20250815.jsonl
+│   │   ├── kraken_ETHUSD_20250816.jsonl
+│   │   ├── kraken_SOLUSD_20250814.jsonl
+│   │   ├── kraken_SOLUSD_20250815.jsonl
+│   │   └── kraken_SOLUSD_20250816.jsonl
+│   ├── portfolio_state.json
+│   ├── seeded_prices.json
+│   └── SOL-USD.csv
+├── day3-paper-launch
+├── db
+│   ├── learning_feedback.db
+│   ├── learning_feedback.db-shm
+│   ├── learning_feedback.db-wal
+│   ├── positions.db
+│   ├── positions.db-shm
+│   ├── positions.db-wal
+│   ├── trades.db
+│   ├── trades.db-shm
+│   └── trades.db-wal
+├── filters
+│   └── regime.py
+├── generate_mock_data.py
+├── go_live_checklist.md
+├── learning
+│   ├── confidence.py
+│   ├── machine.py
+│   ├── optimizer.py
+│   ├── shadow_gate.py
+│   └── suggestions.jsonl
+├── logs
+│   ├── alerts.log
+│   ├── archive
+│   │   ├── daemon_20251013221533.out
+│   │   ├── daemon_20251024165820.out
+│   │   └── trades_prelaunch_20251014T162633Z.log
+│   ├── backup
+│   │   └── trades_20250903_090818.log
+│   ├── launchd_nightly_review.out
+│   ├── launchd_stderr.log
+│   ├── launchd_stdout.log
+│   ├── learning
+│   │   ├── anomalies.log
+│   │   ├── anomalies.log.1
+│   │   ├── anomalies.log.2
+│   │   ├── anomalies.log.3
+│   │   ├── learning_feedback.jsonl
+│   │   ├── learning_machine.log
+│   │   ├── learning_pipeline.log
+│   │   ├── learning_review.log
+│   │   ├── learning_summary.out
+│   │   ├── shadow_test_results.jsonl
+│   │   └── shadow_test_runner.log
+│   ├── misc
+│   │   ├── deploy_phase.json
+│   │   ├── force_test_trade.log
+│   │   ├── paper_bot.out
+│   │   ├── portfolio_metrics.log
+│   │   ├── portfolio_state.json
+│   │   ├── risk_guard_state.json
+│   │   ├── state_snapshot.json
+│   │   └── validation_errors.log
+│   ├── nightly_reports
+│   ├── positions
+│   │   ├── backup
+│   │   │   ├── positions_backup_20250927T203413Z.jsonl
+│   │   │   ├── positions_backup.jsonl
+│   │   │   ├── positions_cleaned.jsonl
+│   │   │   └── positions_fixed.jsonl
+│   │   └── positions.jsonl
+│   ├── positions.jsonl
+│   ├── reports
+│   │   ├── audit_report.jsonl
+│   │   ├── cron_test.log
+│   │   ├── cron.log
+│   │   ├── nightly
+│   │   │   ├── 2025-09-03.log
+│   │   │   ├── nightly_pipeline.err
+│   │   │   ├── nightly_pipeline.log
+│   │   │   └── nightly_pipeline.out
+│   │   ├── paper_tick.launchd.err
+│   │   ├── paper_tick.launchd.out
+│   │   ├── pylint_report.txt
+│   │   ├── pytest_anomaly_logging.txt
+│   │   └── pytest_learning_feedback.txt
+│   ├── shadow_test_results.jsonl
+│   ├── system
+│   │   ├── alerts.log
+│   │   ├── alerts.log.1
+│   │   ├── alerts.log.2
+│   │   ├── alerts.log.3
+│   │   ├── bot_daemon.pid
+│   │   ├── daemon.out
+│   │   ├── exit_check.log
+│   │   ├── exit_check.log.1
+│   │   ├── exit_check.log.2
+│   │   ├── exit_check.log.3
+│   │   ├── full_debug.log
+│   │   ├── full_output.log
+│   │   ├── gatekeeper.log
+│   │   ├── launchd_bot_stderr.log
+│   │   ├── launchd_bot_stdout.log
+│   │   ├── launchd_nightly_review.err
+│   │   ├── launchd_nightly_review.out
+│   │   ├── launchd_stderr.log
+│   │   ├── launchd_stdout.log
+│   │   ├── pipeline.launchd.err
+│   │   ├── pipeline.launchd.out
+│   │   ├── playback.launchd.err
+│   │   ├── playback.launchd.out
+│   │   ├── system.log
+│   │   ├── system.log.1
+│   │   ├── system.log.2
+│   │   ├── system.log.3
+│   │   ├── watchdog.launchd.err
+│   │   └── watchdog.launchd.out
+│   ├── trades
+│   │   ├── backup
+│   │   │   ├── trades_backup_before_live.log
+│   │   │   ├── trades_backup_before_side_fix.jsonl
+│   │   │   ├── trades_backup.jsonl
+│   │   │   ├── trades_fixed.log
+│   │   │   └── trades_original.log
+│   │   ├── clean_trades.log
+│   │   ├── trades.log
+│   │   └── trades.log.1.gz
+│   ├── validation_errors.log
+│   ├── watchdog.launchd.err
+│   └── watchdog.launchd.out
+├── pyproject.toml
+├── pytest.ini
+├── python
+├── README.md
+├── requirements.txt
+├── rm
+├── scripts
+│   ├── run_paper.py
+│   └── run_paper.sh
+├── strategies
+│   └── simple_rsi.py
+├── streamlit_app.py
+├── tests
+│   ├── fixtures
+│   ├── test_core.py
+│   ├── test_ledger.py
+│   ├── test_shadow_testing.py
+│   ├── test_shadow.py
+│   └── test_trade_lifecycle_integration.py
+├── tmp
+├── v2_structure.txt
+└── venv
+    ├── .gitignore
+    ├── bin
+    │   ├── activate
+    │   ├── activate.csh
+    │   ├── activate.fish
+    │   ├── Activate.ps1
+    │   ├── black
+    │   ├── blackd
+    │   ├── coverage
+    │   ├── coverage-3.13
+    │   ├── coverage3
+    │   ├── dotenv
+    │   ├── f2py
+    │   ├── flake8
+    │   ├── flask
+    │   ├── fonttools
+    │   ├── get_gprof
+    │   ├── get_objgraph
+    │   ├── httpx
+    │   ├── identify-cli
+    │   ├── isort
+    │   ├── isort-identify-imports
+    │   ├── isympy
+    │   ├── jsonschema
+    │   ├── markdown_py
+    │   ├── markdown-it
+    │   ├── nodeenv
+    │   ├── normalizer
+    │   ├── numpy-config
+    │   ├── pip
+    │   ├── pip3
+    │   ├── pip3.13
+    │   ├── pre-commit
+    │   ├── py.test
+    │   ├── pyaml
+    │   ├── pycodestyle
+    │   ├── pyflakes
+    │   ├── pyftmerge
+    │   ├── pyftsubset
+    │   ├── pygmentize
+    │   ├── pylint
+    │   ├── pylint-config
+    │   ├── pyreverse
+    │   ├── pytest
+    │   ├── python -> python3.13
+    │   ├── python3 -> python3.13
+    │   ├── python3.13 -> /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13
+    │   ├── ruff
+    │   ├── streamlit
+    │   ├── streamlit.cmd
+    │   ├── symilar
+    │   ├── tensorboard
+    │   ├── torchfrtrace
+    │   ├── torchrun
+    │   ├── tqdm
+    │   ├── ttx
+    │   ├── undill
+    │   ├── virtualenv
+    │   └── wheel
+    ├── etc
+    │   └── jupyter
+    │       └── nbconfig
+    │           └── notebook.d
+    ├── include
+    │   ├── python3.13
+    │   └── site
+    │       └── python3.13
+    │           └── pygame
+    ├── lib
+    │   └── python3.13
+    │       └── site-packages
+    │           ├── __editable__.crypto_trading_bot-1.0.0.pth
+    │           ├── _black_version.py
+    │           ├── _distutils_hack
+    │           ├── _pytest
+    │           ├── _yaml
+    │           ├── 30fcd23745efe32ce681__mypyc.cpython-313-darwin.so
+    │           ├── about_time
+    │           ├── about_time-4.2.1.dist-info
+    │           ├── absl
+    │           ├── absl_py-2.3.1.dist-info
+    │           ├── ale_py
+    │           ├── ale_py-0.11.2.dist-info
+    │           ├── alive_progress
+    │           ├── alive_progress-3.3.0.dist-info
+    │           ├── altair
+    │           ├── altair-5.5.0.dist-info
+    │           ├── anyio
+    │           ├── anyio-4.11.0.dist-info
+    │           ├── astroid
+    │           ├── astroid-3.3.11.dist-info
+    │           ├── attr
+    │           ├── attrs
+    │           ├── attrs-25.3.0.dist-info
+    │           ├── autograd
+    │           ├── autograd-1.8.0.dist-info
+    │           ├── black
+    │           ├── black-25.1.0.dist-info
+    │           ├── blackd
+    │           ├── blib2to3
+    │           ├── blinker
+    │           ├── blinker-1.9.0.dist-info
+    │           ├── cachetools
+    │           ├── cachetools-6.2.0.dist-info
+    │           ├── certifi
+    │           ├── certifi-2025.8.3.dist-info
+    │           ├── cfgv-3.4.0.dist-info
+    │           ├── cfgv.py
+    │           ├── charset_normalizer
+    │           ├── charset_normalizer-3.4.3.dist-info
+    │           ├── click
+    │           ├── click-8.2.1.dist-info
+    │           ├── cloudpickle
+    │           ├── cloudpickle-3.1.1.dist-info
+    │           ├── cma
+    │           ├── cma-4.4.0.dist-info
+    │           ├── contourpy
+    │           ├── contourpy-1.3.3.dist-info
+    │           ├── coverage
+    │           ├── coverage-7.10.4.dist-info
+    │           ├── crypto_trading_bot-1.0.0.dist-info
+    │           ├── cv2
+    │           ├── cycler
+    │           ├── cycler-0.12.1.dist-info
+    │           ├── dateutil
+    │           ├── deprecated
+    │           ├── deprecated-1.3.1.dist-info
+    │           ├── dill
+    │           ├── dill-0.4.0.dist-info
+    │           ├── distlib
+    │           ├── distlib-0.4.0.dist-info
+    │           ├── distutils-precedence.pth
+    │           ├── dotenv
+    │           ├── farama_notifications
+    │           ├── Farama_Notifications-0.0.4.dist-info
+    │           ├── filelock
+    │           ├── filelock-3.19.1.dist-info
+    │           ├── flake8
+    │           ├── flake8-7.3.0.dist-info
+    │           ├── flask
+    │           ├── flask-3.1.2.dist-info
+    │           ├── fontTools
+    │           ├── fonttools-4.59.0.dist-info
+    │           ├── fsspec
+    │           ├── fsspec-2025.10.0.dist-info
+    │           ├── functorch
+    │           ├── git
+    │           ├── gitdb
+    │           ├── gitdb-4.0.12.dist-info
+    │           ├── gitpython-3.1.45.dist-info
+    │           ├── google
+    │           ├── grapheme
+    │           ├── graphemeu-0.7.2.dist-info
+    │           ├── grpc
+    │           ├── grpcio-1.76.0.dist-info
+    │           ├── gymnasium
+    │           ├── gymnasium-1.2.1.dist-info
+    │           ├── h11
+    │           ├── h11-0.16.0.dist-info
+    │           ├── httpcore
+    │           ├── httpcore-1.0.9.dist-info
+    │           ├── httpx
+    │           ├── httpx-0.28.1.dist-info
+    │           ├── identify
+    │           ├── identify-2.6.13.dist-info
+    │           ├── idna
+    │           ├── idna-3.10.dist-info
+    │           ├── iniconfig
+    │           ├── iniconfig-2.1.0.dist-info
+    │           ├── isort
+    │           ├── isort-6.0.1.dist-info
+    │           ├── isympy.py
+    │           ├── itsdangerous
+    │           ├── itsdangerous-2.2.0.dist-info
+    │           ├── jinja2
+    │           ├── jinja2-3.1.6.dist-info
+    │           ├── joblib
+    │           ├── joblib-1.5.2.dist-info
+    │           ├── jsonschema
+    │           ├── jsonschema_specifications
+    │           ├── jsonschema_specifications-2025.4.1.dist-info
+    │           ├── jsonschema-4.25.1.dist-info
+    │           ├── kiwisolver
+    │           ├── kiwisolver-1.4.9.dist-info
+    │           ├── markdown
+    │           ├── markdown_it
+    │           ├── markdown_it_py-4.0.0.dist-info
+    │           ├── markdown-3.9.dist-info
+    │           ├── markupsafe
+    │           ├── MarkupSafe-3.0.2.dist-info
+    │           ├── matplotlib
+    │           ├── matplotlib-3.10.5.dist-info
+    │           ├── mccabe-0.7.0.dist-info
+    │           ├── mccabe.py
+    │           ├── mdurl
+    │           ├── mdurl-0.1.2.dist-info
+    │           ├── mpl_toolkits
+    │           ├── mpmath
+    │           ├── mpmath-1.3.0.dist-info
+    │           ├── mypy_extensions-1.1.0.dist-info
+    │           ├── mypy_extensions.py
+    │           ├── narwhals
+    │           ├── narwhals-2.3.0.dist-info
+    │           ├── networkx
+    │           ├── networkx-3.5.dist-info
+    │           ├── nodeenv-1.9.1.dist-info
+    │           ├── nodeenv.py
+    │           ├── numpy
+    │           ├── numpy-2.2.6.dist-info
+    │           ├── opencv_python-4.12.0.88.dist-info
+    │           ├── packaging
+    │           ├── packaging-25.0.dist-info
+    │           ├── pandas
+    │           ├── pandas-2.3.1.dist-info
+    │           ├── pathspec
+    │           ├── pathspec-0.12.1.dist-info
+    │           ├── PIL
+    │           ├── pillow-11.3.0.dist-info
+    │           ├── pip
+    │           ├── pip-25.2.dist-info
+    │           ├── pkg_resources
+    │           ├── platformdirs
+    │           ├── platformdirs-4.3.8.dist-info
+    │           ├── pluggy
+    │           ├── pluggy-1.6.0.dist-info
+    │           ├── pre_commit
+    │           ├── pre_commit-4.3.0.dist-info
+    │           ├── protobuf-6.32.0.dist-info
+    │           ├── psutil
+    │           ├── psutil-7.1.2.dist-info
+    │           ├── py.py
+    │           ├── pyaml
+    │           ├── pyaml-25.7.0.dist-info
+    │           ├── pyarrow
+    │           ├── pyarrow-21.0.0.dist-info
+    │           ├── pycodestyle-2.14.0.dist-info
+    │           ├── pycodestyle.py
+    │           ├── pydeck
+    │           ├── pydeck-0.9.1.dist-info
+    │           ├── pyflakes
+    │           ├── pyflakes-3.4.0.dist-info
+    │           ├── pygame
+    │           ├── pygame-2.6.1.dist-info
+    │           ├── pygments
+    │           ├── pygments-2.19.2.dist-info
+    │           ├── pylab.py
+    │           ├── pylint
+    │           ├── pylint-3.3.7.dist-info
+    │           ├── pymoo
+    │           ├── pymoo-0.6.1.5.dist-info
+    │           ├── pyparsing
+    │           ├── pyparsing-3.2.3.dist-info
+    │           ├── pytest
+    │           ├── pytest_cov
+    │           ├── pytest_cov-6.2.1.dist-info
+    │           ├── pytest-8.4.1.dist-info
+    │           ├── pytest-cov.pth
+    │           ├── python_dateutil-2.9.0.post0.dist-info
+    │           ├── python_dotenv-1.1.1.dist-info
+    │           ├── pytz
+    │           ├── pytz-2025.2.dist-info
+    │           ├── PyYAML-6.0.2.dist-info
+    │           ├── referencing
+    │           ├── referencing-0.36.2.dist-info
+    │           ├── requests
+    │           ├── requests-2.32.5.dist-info
+    │           ├── rich
+    │           ├── rich-14.2.0.dist-info
+    │           ├── rpds
+    │           ├── rpds_py-0.27.1.dist-info
+    │           ├── ruff
+    │           ├── ruff-0.12.11.dist-info
+    │           ├── schedule
+    │           ├── schedule-1.2.2.dist-info
+    │           ├── scikit_learn-1.7.1.dist-info
+    │           ├── scikit_optimize-0.10.2.dist-info
+    │           ├── scipy
+    │           ├── scipy-1.16.1.dist-info
+    │           ├── setuptools
+    │           ├── setuptools-80.9.0.dist-info
+    │           ├── six-1.17.0.dist-info
+    │           ├── six.py
+    │           ├── sklearn
+    │           ├── skopt
+    │           ├── smmap
+    │           ├── smmap-5.0.2.dist-info
+    │           ├── sniffio
+    │           ├── sniffio-1.3.1.dist-info
+    │           ├── stable_baselines3
+    │           ├── stable_baselines3-2.7.0.dist-info
+    │           ├── streamlit
+    │           ├── streamlit_autorefresh
+    │           ├── streamlit_autorefresh-1.0.1.dist-info
+    │           ├── streamlit-1.49.1.dist-info
+    │           ├── sympy
+    │           ├── sympy-1.14.0.dist-info
+    │           ├── tenacity
+    │           ├── tenacity-9.1.2.dist-info
+    │           ├── tensorboard
+    │           ├── tensorboard_data_server
+    │           ├── tensorboard_data_server-0.7.2.dist-info
+    │           ├── tensorboard-2.20.0.dist-info
+    │           ├── threadpoolctl-3.6.0.dist-info
+    │           ├── threadpoolctl.py
+    │           ├── toml
+    │           ├── toml-0.10.2.dist-info
+    │           ├── tomlkit
+    │           ├── tomlkit-0.13.3.dist-info
+    │           ├── torch
+    │           ├── torch-2.9.0.dist-info
+    │           ├── torchaudio
+    │           ├── torchaudio-2.9.0.dist-info
+    │           ├── torchgen
+    │           ├── torchvision
+    │           ├── torchvision-0.24.0.dist-info
+    │           ├── tornado
+    │           ├── tornado-6.5.2.dist-info
+    │           ├── tqdm
+    │           ├── tqdm-4.67.1.dist-info
+    │           ├── typing_extensions-4.15.0.dist-info
+    │           ├── typing_extensions.py
+    │           ├── tzdata
+    │           ├── tzdata-2025.2.dist-info
+    │           ├── urllib3
+    │           ├── urllib3-2.5.0.dist-info
+    │           ├── virtualenv
+    │           ├── virtualenv-20.34.0.dist-info
+    │           ├── werkzeug
+    │           ├── werkzeug-3.1.3.dist-info
+    │           ├── wheel
+    │           ├── wheel-0.45.1.dist-info
+    │           ├── wrapt
+    │           ├── wrapt-2.0.0.dist-info
+    │           └── yaml
+    ├── LICENSE
+    ├── pyvenv.cfg
+    └── share
+        ├── jupyter
+        │   └── nbextensions
+        │       └── pydeck
+        └── man
+            └── man1
+                ├── isympy.1
+                └── ttx.1
+
+308 directories, 285 files
