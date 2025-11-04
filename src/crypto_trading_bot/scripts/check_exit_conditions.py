@@ -11,7 +11,7 @@ from logging.handlers import RotatingFileHandler
 
 from crypto_trading_bot.bot.trading_logic import position_manager
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
-from crypto_trading_bot.utils.kraken_api import get_ticker_price
+from crypto_trading_bot.utils.price_feed import get_current_price
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -20,7 +20,7 @@ if not logger.hasHandlers():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Add rotating file handler for exit checks
+    # Add rotating file handler for exit checks (UTF-8)
     os.makedirs("logs", exist_ok=True)
     file_handler = RotatingFileHandler(
         filename="logs/exit_check.log",
@@ -54,7 +54,7 @@ def get_live_prices(positions) -> dict:
     for pair in pairs:
         # First, attempt to fetch from API
         try:
-            raw_px = get_ticker_price(pair)
+            raw_px = get_current_price(pair)
         except Exception as api_err:  # pylint: disable=broad-exception-caught
             logger.warning("Failed to fetch live price for %s: %s", pair, api_err)
             raw_px = None

@@ -28,7 +28,8 @@ from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run
 from crypto_trading_bot.learning.optimization import detect_outliers
 from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
 from crypto_trading_bot.safety.confirmation import require_live_confirmation
-from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
+
+# from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
 from crypto_trading_bot.scripts.daily_heartbeat import run_daily_tasks
 from crypto_trading_bot.scripts.shadow_confidence_test import run_shadow_confidence_test
 from crypto_trading_bot.scripts.suggest_top_configs import (
@@ -318,8 +319,9 @@ def run_scheduler():
                     reinvestment_rate=reinvestment_rate,
                 )
 
-            logger.info("Checking exit conditions")
-            run_exit_checks()
+            # Exit checks are handled inside evaluate_signals_and_trade(); avoid double-trigger
+            # logger.info("Checking exit conditions")
+            # run_exit_checks()
 
             # Run sync validation each cycle after exits
             try:

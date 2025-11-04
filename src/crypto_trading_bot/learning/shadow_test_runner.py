@@ -21,186 +21,181 @@ handler = RotatingFileHandler(
     "logs/shadow_test_runner.log",
     maxBytes=50 * 1024 * 1024,
     backupCount=3,
-)  # 50 MB
+    encoding="utf-8",
+)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 
 if not logger.handlers:
     logger.addHandler(handler)
 
-# === File paths ===
-SUGGESTIONS_FILE = "reports/suggestions_latest.json"
-RESULTS_FILE = "reports/shadow_test_results.jsonl"
+# Canonical file paths
+DEFAULT_INPUT = "logs/learning_feedback.jsonl"
+DEFAULT_OUTPUT = "logs/shadow_test_results.jsonl"
 
 
-def run_shadow_tests(input_file: str = SUGGESTIONS_FILE, output_file: str = RESULTS_FILE):
-    """
-    Run shadow tests on suggestions from the learning engine.
-    Produces results with adaptive pass/fail threshold and audit trail.
-    """
-    if not os.path.exists(input_file):
-        os.makedirs(os.path.dirname(input_file), exist_ok=True)
-        with open(input_file, "w", encoding="utf-8"):
-            pass
-        logger.info(
-            "Created empty suggestions file (%s). Run review_learning_ledger.py to populate it.",
-            input_file,
-        )
-        return
-
-    results = []
-    confidences = []
-    strategy_stats: dict[str, dict[str, float]] = {}
-
-    try:
-        with open(input_file, "r", encoding="utf-8") as infile:
-            content = infile.read().strip()
-            if content:
-                try:
-                    suggestions = json.loads(content)
-                    if isinstance(suggestions, dict):
-                        suggestions = [suggestions]
-                    elif not isinstance(suggestions, list):
-                        raise ValueError("Invalid JSON structure")
-                except json.JSONDecodeError as e:
-                    logger.error("Invalid JSON in %s: %s", input_file, e)
-                    return
-            else:
-                suggestions = []
-
-        if not suggestions:
-            logger.warning("No valid suggestions found in %s. Skipping shadow tests.", input_file)
-            return
-
-        # === Determine adaptive threshold ===
-        for suggestion in suggestions:
-            conf = suggestion.get("confidence")
-            if isinstance(conf, (int, float)):
-                confidences.append(conf)
-
-        threshold = 0.5
-        if confidences and len(confidences) > 1:
-            median_conf = statistics.median(confidences)
-            threshold = max(0.5, median_conf)
-        logger.info(
-            "Adaptive threshold set to %.2f based on median confidence",
-            threshold,
-        )
-
-        # === Evaluate each suggestion ===
-        for suggestion in suggestions:
-            confidence = suggestion.get("confidence", 0)
-            reason_str = suggestion.get("reason", "")
-
-            def extract_metric(label, reason=reason_str):
-                try:
-                    part = reason.split(f"{label}=")[1]
-                    return float(part.split(",")[0] if "," in part else part)
-                except (IndexError, ValueError):
-                    return 0
-
-            avg_roi = extract_metric("ROI")
-            win_rate = extract_metric("Win Rate")
-            sharpe = extract_metric("Sharpe")
-
-            status = "pass" if confidence >= threshold else "fail"
-            reason = (
-                f"Confidence {confidence:.2f} below threshold {threshold:.2f}"
-                if status == "fail"
-                else "Met confidence threshold"
-            )
-            summary_template = " ".join(
-                [
-                    "Suggestion %s: %s (confidence=%.2f threshold=%.2f",
-                    "avg_roi=%.4f win_rate=%.4f sharpe=%.4f)",
-                ]
-            )
-            logger.info(
-                summary_template,
-                suggestion.get("suggestion", "unknown"),
-                status,
-                confidence,
-                threshold,
-                avg_roi,
-                win_rate,
-                sharpe,
-            )
-
-            result = {
-                "shadow_test_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(UTC).isoformat(),
-                "strategy_name": suggestion.get("strategy_name", "unknown"),
-                "param_change": suggestion.get("param_change", {}),
-                "rationale": suggestion.get("rationale", ""),
-                "confidence": confidence,
-                "avg_roi": avg_roi,
-                "win_rate": win_rate,
-                "sharpe": sharpe,
-                "threshold": threshold,
-                "status": status,
-                "reason": reason,
-                "success_rate": 1.0 if status == "pass" else 0.0,
-            }
-            results.append(result)
-            strategy_key = result["strategy_name"]
-            stats = strategy_stats.get(strategy_key) or {
-                "passes": 0.0,
-                "fails": 0.0,
-                "confidence_sum": 0.0,
-            }
-            if status == "pass":
-                stats["passes"] += 1.0
-            else:
-                stats["fails"] += 1.0
+def _load_jsonl(path: str) -> list[dict]:
+    rows: list[dict] = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                stats["confidence_sum"] += float(confidence)
-            except (TypeError, ValueError):
-                pass
-            strategy_stats[strategy_key] = stats
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rows.append(rec)
+    return rows
 
-    except OSError as e:
-        logger.error("Error reading suggestions from %s: %s", input_file, e)
-        return
-    except (ValueError, TypeError, KeyError) as e:
-        logger.error("Unexpected error parsing %s: %s", input_file, e, exc_info=True)
+
+def run_shadow_tests(input_file: str = DEFAULT_INPUT, output_file: str = DEFAULT_OUTPUT) -> None:
+    """Run shadow tests over learning suggestions in canonical JSONL format.
+
+    Rules:
+    - Only process entries where type=="learning_suggestion"
+    - Pass criteria: median(confidence) >= 0.5, win_rate >= 0.55 (if present), ROI >= 0.003 (if present)
+    - Append per-strategy summary rows
+    """
+    suggestions = _load_jsonl(input_file)
+    suggestions = [s for s in suggestions if (s.get("type") == "learning_suggestion")]
+
+    if not suggestions:
+        logger.info("No learning_suggestion rows found in %s", input_file)
         return
 
-    # === Write results ===
-    try:
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    # Collect confidences for adaptive thresholding
+    conf_values = []
+    for s in suggestions:
+        val = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
+        try:
+            conf_values.append(float(val))
+        except (TypeError, ValueError):
+            continue
+
+    threshold = 0.5
+    if len(conf_values) > 1:
+        try:
+            threshold = max(0.5, float(statistics.median(conf_values)))
+        except statistics.StatisticsError:
+            threshold = 0.5
+
+    results: list[dict] = []
+    per_strategy: dict[str, dict[str, float]] = {}
+
+    for s in suggestions:
+        strategy = s.get("strategy") or s.get("strategy_name") or "Unknown"
+        conf = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = 0.0
+
+        # Optional parameterized suggestion fields
+        p_before = s.get("param_value_before")
+        p_after = s.get("param_value_after")
+        try:
+            p_before = float(p_before) if p_before is not None else None
+        except (TypeError, ValueError):
+            p_before = None
+        try:
+            p_after = float(p_after) if p_after is not None else None
+        except (TypeError, ValueError):
+            p_after = None
+
+        # Optional metrics (if provided by generator)
+        avg_roi = s.get("avg_roi")
+        win_rate = s.get("win_rate")
+        sharpe = s.get("sharpe") or s.get("sharpe_ratio")
+        try:
+            avg_roi = float(avg_roi) if avg_roi is not None else None
+        except (TypeError, ValueError):
+            avg_roi = None
+        try:
+            win_rate = float(win_rate) if win_rate is not None else None
+        except (TypeError, ValueError):
+            win_rate = None
+        try:
+            sharpe = float(sharpe) if sharpe is not None else None
+        except (TypeError, ValueError):
+            sharpe = None
+
+        # Apply gating
+        passed = True
+        reason_parts = []
+        if conf < threshold:
+            passed = False
+            reason_parts.append(f"confidence {conf:.3f} < threshold {threshold:.3f}")
+        if win_rate is not None and win_rate < 0.55:
+            passed = False
+            reason_parts.append(f"win_rate {win_rate:.3f} < 0.55")
+        if avg_roi is not None and avg_roi < 0.003:
+            passed = False
+            reason_parts.append(f"avg_roi {avg_roi:.4f} < 0.003")
+        reason = ", ".join(reason_parts) if reason_parts else "meets criteria"
+
+        result = {
+            "shadow_test_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(UTC).isoformat(),
+            "strategy": strategy,
+            "confidence": conf,
+            "avg_roi": avg_roi,
+            "win_rate": win_rate,
+            "sharpe": sharpe,
+            "threshold": threshold,
+            "status": "pass" if passed else "fail",
+            "reason": reason,
+            "success_rate": 1.0 if passed else 0.0,
+        }
+        results.append(result)
+
+        stats = per_strategy.get(strategy) or {"passes": 0.0, "fails": 0.0, "conf_sum": 0.0}
+        if passed:
+            stats["passes"] += 1.0
+        else:
+            stats["fails"] += 1.0
+        stats["conf_sum"] += float(conf)
+        per_strategy[strategy] = stats
+
+    # Append strategy summary
+    if per_strategy:
         summary_rows = []
-        for strategy_name, stats in strategy_stats.items():
-            total = stats["passes"] + stats["fails"]
+        for strat, st in per_strategy.items():
+            total = st["passes"] + st["fails"]
             if total <= 0:
                 continue
-            pass_rate = stats["passes"] / total
-            avg_conf = stats["confidence_sum"] / total
             summary_rows.append(
                 {
-                    "strategy_name": strategy_name,
+                    "strategy": strat,
                     "tests": int(total),
-                    "passes": int(stats["passes"]),
-                    "fails": int(stats["fails"]),
-                    "pass_rate": round(pass_rate, 4),
-                    "avg_confidence": round(avg_conf, 4),
+                    "passes": int(st["passes"]),
+                    "fails": int(st["fails"]),
+                    "pass_rate": round(st["passes"] / total, 4),
+                    "avg_confidence": round(st["conf_sum"] / total, 4),
                 }
             )
-        summary_rows.sort(key=lambda row: (-row["pass_rate"], -row["avg_confidence"]))
-        if summary_rows:
-            summary_record = {
+        results.append(
+            {
                 "shadow_test_id": f"summary-{uuid.uuid4()}",
                 "timestamp": datetime.now(UTC).isoformat(),
                 "type": "strategy_confidence_summary",
                 "strategies": summary_rows,
             }
-            results.append(summary_record)
+        )
 
-        with open(output_file, "w", encoding="utf-8") as outfile:
-            for record in results:
-                outfile.write(json.dumps(record) + "\n")
-        logger.info("✅ Shadow test results saved to %s", output_file)
-    except OSError as e:
-        logger.error("Failed to write results to %s: %s", output_file, e)
+    # Write JSONL with fsync safety
+    os.makedirs(os.path.dirname(output_file) or "logs", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as out:
+        for rec in results:
+            out.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        out.flush()
+        try:
+            os.fsync(out.fileno())
+        except OSError:
+            pass
+    logger.info("✅ Shadow test results saved to %s", output_file)
 
 
 if __name__ == "__main__":

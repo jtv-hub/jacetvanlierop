@@ -3,7 +3,11 @@ Test script for validating the trade ledger logging functionality.
 Runs a few sample trades and prints their logged output.
 """
 
-from crypto_trading_bot.ledger.trade_ledger import log_trade
+from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+
+
+class _PM:
+    positions = {}
 
 
 def main():
@@ -13,44 +17,43 @@ def main():
     # Run a few forced trades with different ROI outcomes
     print("🚀 Running trade ledger test...")
 
-    # Trade 1 - BTC
-    trade1 = log_trade(
-        trading_pair="BTC-USD",
-        trade_size=100,
+    ledger = TradeLedger(_PM())
+
+    # Trade 1 - BTC (normalized to USDC pairs per ledger rules)
+    trade1_id = ledger.log_trade(
+        trading_pair="BTC/USDC",
+        trade_size=1.0,
         strategy_name="TestStrategy",
         confidence=0.95,
-        price=40000,
-        volume=1500,
-        indicators={"RSI": 55},
+        entry_price=40000.0,
         regime="uptrend",
+        source="unit_test",
     )
-    print(trade1)
+    print(trade1_id)
 
     # Trade 2 - ETH
-    trade2 = log_trade(
-        trading_pair="ETH-USD",
-        trade_size=200,
+    trade2_id = ledger.log_trade(
+        trading_pair="ETH/USDC",
+        trade_size=1.0,
         strategy_name="TestStrategy",
         confidence=0.88,
-        price=2500,
-        volume=1200,
-        indicators={"MACD": "bullish"},
+        entry_price=2500.0,
         regime="choppy",
+        source="unit_test",
     )
-    print(trade2)
+    print(trade2_id)
 
     # Trade 3 - SOL
-    trade3 = log_trade(
-        trading_pair="SOL-USD",
-        trade_size=150,
+    trade3_id = ledger.log_trade(
+        trading_pair="SOL/USDC",
+        trade_size=1.0,
         strategy_name="TestStrategy",
         confidence=0.90,
-        price=100,
-        volume=500,
-        indicators={"ATR": 2.5},
+        entry_price=100.0,
         regime="unknown",
+        source="unit_test",
     )
-    print(trade3)
+    print(trade3_id)
 
 
 if __name__ == "__main__":

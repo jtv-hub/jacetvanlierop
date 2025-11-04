@@ -1,13 +1,14 @@
 """
 rejected_simulator.py
 
-Simulates the performance of rejected strategy suggestions using historical
-price data to evaluate how they would have performed if accepted.
+DEPRECATED – replaced by canonical learning pipeline (learning_pipeline -> shadow_test_runner)
+This module remains for archival purposes and should not be used in production.
 """
 
 from datetime import datetime, timezone
 
-from crypto_trading_bot.learning.shadow_test_logger import log_shadow_test_result
+# DEPRECATED: shadow_test_logger writes to non-canonical path; do not import or use.
+# from crypto_trading_bot.learning.shadow_test_logger import log_shadow_test_result
 
 
 def simulate_rejected_strategy(
@@ -50,17 +51,7 @@ def simulate_rejected_strategy(
 
     test_duration = int((exit_time - entry_time).total_seconds() / 60)
 
-    log_shadow_test_result(
-        suggestion_id,
-        strategy_class.__name__,
-        parameters,
-        asset,
-        timeframe,
-        roi,
-        win_rate,
-        trade_count,
-        test_duration,
-    )
+    # DEPRECATED: No logging to legacy shadow_test_results.log
 
     return {
         "roi": roi,

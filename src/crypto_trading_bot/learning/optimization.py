@@ -5,7 +5,7 @@ Module for generating and exporting optimization suggestions based on trading pe
 import csv
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, stdev
 from typing import Dict, List
@@ -14,75 +14,157 @@ REPORTS_DIR = Path("reports")
 REPORTS_DIR.mkdir(exist_ok=True)
 
 
+def _clamp(v: float, lo: float = 0.1, hi: float = 1.0) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        x = lo
+    return max(lo, min(hi, x))
+
+
+def _bounded_param_change(current: float | None, *, pct: float = 0.2, direction: int = -1) -> tuple[float, float]:
+    """Return (before, after) with a bounded ±pct change.
+
+    If current is None, assume a sane default of 1.0 before and apply direction.
+    """
+    try:
+        before = float(current) if current is not None else 1.0
+    except (TypeError, ValueError):
+        before = 1.0
+    delta = before * pct * (1 if direction >= 0 else -1)
+    after = before + delta
+    return before, after
+
+
 def generate_suggestions(report: Dict) -> List[Dict]:
     """
-    Generate optimization suggestions based on learning report metrics.
-    Each suggestion contains: category, suggestion, confidence score, reason.
+    Generate parameter-level learning suggestions as structured records:
+    {"type":"learning_suggestion","strategy":"<name>",
+     "param_name":"<parameter>","param_value_before":<float>,"param_value_after":<float>,
+     "confidence_before":<float>,"confidence_after":<float>,
+     "reason":"<text>","timestamp":"<utc-iso>","status":"pending"}
     """
-    suggestions = []
+    ts = datetime.now(timezone.utc).isoformat()
+    win_rate = float(report.get("win_rate", 0) or 0)
+    sharpe = float(report.get("sharpe_ratio", 0) or 0)
+    sortino = float(report.get("sortino_ratio", 0) or 0)
+    drawdown = float(report.get("max_drawdown", 0) or 0)
+    roi_pct = float(report.get("roi_percent", 0) or 0)
 
-    win_rate = report.get("win_rate", 0)
-    sharpe = report.get("sharpe_ratio", 0)
-    sortino = report.get("sortino_ratio", 0)
-    drawdown = report.get("max_drawdown", 0)
-    roi = report.get("roi_percent", 0)
+    out: List[Dict] = []
 
-    # --- Heuristic 1: Win Rate Low ---
+    # Heuristic mappings to concrete strategies/params commonly used
+    # Adjust RSI upper/lower bands on poor win rate
     if win_rate < 0.4:
-        suggestions.append(
+        # Tighten RSI entry by lowering upper or raising lower band
+        before_u, after_u = _bounded_param_change(70.0, pct=0.2, direction=-1)
+        conf_b, conf_a = 0.7, _clamp(0.7)  # confidence unchanged but clamped
+        out.append(
             {
-                "category": "entry_filter",
-                "suggestion": "Tighten entry signal thresholds to reduce false positives.",
-                "confidence": 0.7,
-                "reason": f"Low win rate detected ({win_rate:.2f}).",
+                "type": "learning_suggestion",
+                "strategy": "SimpleRSIStrategy",
+                "param_name": "rsi_upper",
+                "param_value_before": round(before_u, 6),
+                "param_value_after": round(after_u, 6),
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
+                "reason": f"Low win rate detected ({win_rate:.2f}); tighten RSI upper threshold",
+                "timestamp": ts,
+                "status": "pending",
+            }
+        )
+        before_l, after_l = _bounded_param_change(30.0, pct=0.2, direction=+1)
+        out.append(
+            {
+                "type": "learning_suggestion",
+                "strategy": "SimpleRSIStrategy",
+                "param_name": "rsi_lower",
+                "param_value_before": round(before_l, 6),
+                "param_value_after": round(after_l, 6),
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
+                "reason": f"Low win rate detected ({win_rate:.2f}); raise RSI lower threshold",
+                "timestamp": ts,
+                "status": "pending",
             }
         )
 
-    # --- Heuristic 2: Sharpe Low but Sortino OK ---
+    # Sharpe low but Sortino acceptable -> improve exits (tighten stops)
     if sharpe < 1 and sortino > 1:
-        suggestions.append(
+        before_sl, after_sl = _bounded_param_change(0.015, pct=0.2, direction=-1)
+        conf_b, conf_a = 0.6, _clamp(0.6)
+        out.append(
             {
-                "category": "risk",
-                "suggestion": "Improve risk-adjusted returns by refining stop losses or exits.",
-                "confidence": 0.6,
-                "reason": f"Sharpe low ({sharpe:.2f}) while Sortino acceptable ({sortino:.2f}).",
+                "type": "learning_suggestion",
+                "strategy": "CompositeStrategy",
+                "param_name": "stop_loss_pct",
+                "param_value_before": round(before_sl, 6),
+                "param_value_after": round(after_sl, 6),
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
+                "reason": f"Sharpe low ({sharpe:.2f}) with Sortino acceptable ({sortino:.2f}); tighten SL",
+                "timestamp": ts,
+                "status": "pending",
             }
         )
 
-    # --- Heuristic 3: High Drawdown ---
-    if drawdown > 1000:
-        suggestions.append(
+    # High drawdown -> reduce position sizing buffer
+    if abs(drawdown) > 0.2:
+        before_buf, after_buf = _bounded_param_change(1.0, pct=0.2, direction=-1)
+        conf_b, conf_a = 0.8, _clamp(0.8)
+        out.append(
             {
-                "category": "risk",
-                "suggestion": "Tighten drawdown limits or cut position size in volatile regimes.",
-                "confidence": 0.8,
-                "reason": f"Max drawdown high ({drawdown:.1f}).",
+                "type": "learning_suggestion",
+                "strategy": "CompositeStrategy",
+                "param_name": "capital_buffer",
+                "param_value_before": round(before_buf, 6),
+                "param_value_after": round(after_buf, 6),
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
+                "reason": f"High max drawdown ({drawdown:.3f}); reduce buffer multiplier",
+                "timestamp": ts,
+                "status": "pending",
             }
         )
 
-    # --- Heuristic 4: Strong ROI + Good Win Rate ---
-    if roi > 50 and win_rate > 0.55:
-        suggestions.append(
+    # Strong ROI and Win rate -> consider loosening thresholds slightly
+    if roi_pct > 50 and win_rate > 0.55:
+        before_u, after_u = _bounded_param_change(70.0, pct=0.2, direction=+1)
+        conf_b, conf_a = 0.85, _clamp(0.9)
+        out.append(
             {
-                "category": "capital_allocation",
-                "suggestion": "Consider increasing capital for strategies in trending regimes.",
-                "confidence": 0.85,
-                "reason": f"Strong ROI ({roi:.2f}%) with solid win rate ({win_rate:.2f}).",
+                "type": "learning_suggestion",
+                "strategy": "SimpleRSIStrategy",
+                "param_name": "rsi_upper",
+                "param_value_before": round(before_u, 6),
+                "param_value_after": round(after_u, 6),
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
+                "reason": f"Strong ROI ({roi_pct:.2f}%) with solid win rate ({win_rate:.2f}); loosen upper",
+                "timestamp": ts,
+                "status": "pending",
             }
         )
 
-    # Default if no suggestions triggered
-    if not suggestions:
-        suggestions.append(
+    # If no specific suggestion triggered, emit a monitoring record with canonical keys
+    if not out:
+        conf_b = conf_a = _clamp(0.7)
+        out.append(
             {
-                "category": "general",
-                "suggestion": "No immediate changes required. Continue monitoring performance.",
-                "confidence": 0.7,
+                "type": "learning_suggestion",
+                "strategy": "general",
+                "param_name": None,
+                "param_value_before": None,
+                "param_value_after": None,
+                "confidence_before": conf_b,
+                "confidence_after": conf_a,
                 "reason": "All metrics within acceptable thresholds.",
+                "timestamp": ts,
+                "status": "pending",
             }
         )
 
-    return suggestions
+    return out
 
 
 def export_suggestions(suggestions: List[Dict]) -> None:

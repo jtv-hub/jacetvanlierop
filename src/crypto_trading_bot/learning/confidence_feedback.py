@@ -55,7 +55,7 @@ def analyze_feedback(trade_log_path):
     Returns:
         list: Analysis report per confidence bucket.
     """
-    trades = load_trades(trade_log_path)
+    trades = [t for t in load_trades(trade_log_path) if (t.get("status") or "").lower() == "closed"]
     grouped = group_trades_by_confidence_bucket(trades)
     analysis = []
 

@@ -7,10 +7,10 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
-from learning import learning_pipeline
+from crypto_trading_bot.learning import learning_pipeline
 
 # === Imports from scripts and learning ===
-from scripts import gatekeeper, ingest_paper_trades
+from crypto_trading_bot.scripts import gatekeeper, ingest_paper_trades
 
 # === Setup rotating logger ===
 os.makedirs("logs", exist_ok=True)

@@ -14,10 +14,22 @@ from pathlib import Path
 
 # Use absolute import for project safety
 try:
-    from crypto_trading_bot.ledger.trade_ledger import log_trade
+    from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 except ImportError as e:
     print(f"[ingest] ERROR: failed to import trade_ledger: {e}", file=sys.stderr)
     sys.exit(1)
+
+
+# === Minimal Position Manager Stub ===
+class _PM:
+    """Minimal placeholder for position manager (required by TradeLedger)."""
+
+    positions = {}
+
+
+# === Ledger instance ===
+ledger = TradeLedger(_PM())
+
 
 # Use project-root safe path
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -54,9 +66,9 @@ def ingest_paper_trades() -> int:
                 if not required.issubset(trade):
                     continue
 
-                # Call ledger log_trade with extended fields
+                # Call ledger.log_trade with extended feilds using the TradeLedger instance
                 try:
-                    log_trade(
+                    ledger.log_trade(
                         trading_pair=trade.get("symbol"),
                         trade_size=trade.get("entry"),
                         strategy_name="paper_trade",
