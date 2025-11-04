@@ -27,6 +27,7 @@ from crypto_trading_bot.learning.confidence_audit import (
 from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
 from crypto_trading_bot.learning.optimization import detect_outliers
 from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
+from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.safety.confirmation import require_live_confirmation
 
 # from crypto_trading_bot.scripts.check_exit_conditions import main as run_exit_checks
@@ -338,6 +339,12 @@ def run_scheduler():
                 logger.error("SyncValidator failed", extra={"error": str(e)})
 
             # Run anomaly audit every 6 hours
+            if bool(CONFIG.get("auto_pause", {}).get("force_exit_on_severe_drawdown", False)):
+                try:
+                    risk_guard.trigger_panic_exit_if_needed()
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    logger.error("trigger_panic_exit_if_needed failed", extra={"error": str(e)})
+
             if should_run_anomaly_audit(last_audit_run):
                 logger.info("Running anomaly audit")
                 ok = run_anomaly_audit()

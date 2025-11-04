@@ -849,6 +849,20 @@ CONFIG["prelaunch_guard"].setdefault(
     int(os.getenv("CRYPTO_TRADING_BOT_MAX_RECENT_HIGH_SEVERITY", "50")),
 )
 
+CONFIG.setdefault("auto_pause", {}).update(
+    {
+        "max_daily_drawdown_pct": CONFIG.get("auto_pause", {}).get("max_daily_drawdown_pct", 5.0),
+        "max_weekly_drawdown_pct": CONFIG.get("auto_pause", {}).get("max_weekly_drawdown_pct", 10.0),
+        "force_exit_on_severe_drawdown": CONFIG.get("auto_pause", {}).get("force_exit_on_severe_drawdown", False),
+    }
+)
+
+CONFIG.setdefault("correlation", {}).update(
+    {
+        "disable_correlation_block": CONFIG.get("correlation", {}).get("disable_correlation_block", True),
+    }
+)
+
 CONFIG["test_mode"] = _to_bool(os.getenv("CRYPTO_TRADING_BOT_TEST_MODE"), False)
 
 _DEPLOY_PHASE_VALUE, _PHASE_UPDATED_AT, _PHASE_STATUS, _PHASE_SOURCE = _load_deploy_phase()

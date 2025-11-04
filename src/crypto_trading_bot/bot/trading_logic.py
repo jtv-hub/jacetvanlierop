@@ -1270,6 +1270,14 @@ def evaluate_signals_and_trade(
     reinvestment_rate: float | None = None,
 ):
     """Evaluates trade signals and manages trade execution and exits."""
+    from crypto_trading_bot.safety import risk_guard as _risk_guard  # pylint: disable=redefined-outer-name
+
+    allow_entries, deny_reason = _risk_guard.should_allow_new_entry(context={})
+    if not allow_entries:
+        if deny_reason:
+            logger.warning("New entries halted: %s", deny_reason)
+        check_exits_only = True
+
     # REFACTOR-HOOKS: harmless calls while we peel logic out
     try:
         _signals = gather_signals(prices=None, volumes=None, ctx=None)  # type: ignore[name-defined]
@@ -1852,6 +1860,9 @@ def evaluate_signals_and_trade(
                         window=corr_window,
                         threshold=corr_threshold,
                     )
+                    disable_corr = bool(CONFIG.get("correlation", {}).get("disable_correlation_block", True))
+                    if disable_corr:
+                        skip_due_to_corr = False
                     if corr_rows:
                         os.makedirs("logs", exist_ok=True)
                         with open(
@@ -2009,6 +2020,39 @@ def evaluate_signals_and_trade(
                     entry_rsi=rsi_val,
                     timestamp=logged_ts,
                 )
+                try:
+                    Path("logs").mkdir(parents=True, exist_ok=True)
+                    state_snapshot = risk_guard.load_state()
+                    with open("logs/rl_features.jsonl", "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                                    "event": "entry",
+                                    "trade_id": trade_id,
+                                    "pair": pair,
+                                    "strategy": strategy_name,
+                                    "regime": context.get_regime(),
+                                    "buffer": buffer,
+                                    "drawdown_pct": float(state_snapshot.get("last_drawdown", 0.0) or 0.0),
+                                    "rsi": rsi_val,
+                                    "volume": current_volumes.get(pair),
+                                    "confidence": confidence,
+                                    "notional": position_notional,
+                                }
+                            )
+                            + "\n"
+                        )
+                        try:
+                            f.flush()
+                            os.fsync(f.fileno())
+                        except (OSError, IOError):
+                            pass
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.debug(
+                        "Failed to persist RL telemetry entry",
+                        extra={"trade_id": trade_id, "error": str(exc)},
+                    )
                 executed_trades += 1
                 logger.debug("Trade confidence score", extra={"trade_id": trade_id, "confidence": confidence})
                 # Print confirmation only when a valid trade record exists and size > 0
@@ -2137,6 +2181,59 @@ def evaluate_signals_and_trade(
             reason_display,
             DEPLOY_PHASE,
         )
+        try:
+            Path("logs").mkdir(parents=True, exist_ok=True)
+            state_snapshot = risk_guard.load_state()
+            rl_exit_payload = {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                "event": "exit",
+                "trade_id": trade_id,
+                "pair": (trade_position or trade_record or {}).get("pair"),
+                "strategy": (trade_position or trade_record or {}).get("strategy"),
+                "reason": canonical_reason,
+                "roi": roi_value,
+                "exit_price": exit_price,
+                "drawdown_pct": float(state_snapshot.get("last_drawdown", 0.0) or 0.0),
+                "confidence": (trade_record or {}).get("confidence"),
+                "regime": (trade_record or {}).get("regime"),
+            }
+            with open("logs/rl_features.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(rl_exit_payload) + "\n")
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except (OSError, IOError):
+                    pass
+        except (OSError, TypeError, ValueError) as exc:
+            logger.debug(
+                "Failed to persist RL telemetry exit event",
+                extra={"trade_id": trade_id, "error": str(exc)},
+            )
+        try:
+            audit_payload = {
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                "trade_id": trade_id,
+                "pair": (trade_position or {}).get("pair"),
+                "strategy": (trade_position or trade_record or {}).get("strategy"),
+                "reason": canonical_reason,
+                "reason_display": reason_display,
+                "exit_price": exit_price,
+                "roi": roi_value,
+                "slippage_amount": slippage_amount,
+            }
+            with open("logs/exit_check.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(audit_payload) + "\n")
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except (OSError, IOError):
+                    pass
+        except (OSError, TypeError, ValueError) as exc:
+            logger.debug("Failed to write exit audit log", extra={"trade_id": trade_id, "error": str(exc)})
+
+        if trade_id in position_manager.positions:
+            logger.warning("Closed trade still present in positions; removing: %s", trade_id)
+            del position_manager.positions[trade_id]
         with open(TRADES_LOG_PATH, "a", encoding="utf-8") as f:
             f.flush()
             os.fsync(f.fileno())  # Sync after update

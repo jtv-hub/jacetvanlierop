@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol, Tuple, cast
 
@@ -21,6 +21,9 @@ from crypto_trading_bot.config.constants import (
 from crypto_trading_bot.utils.system_logger import get_system_logger
 
 logger = get_system_logger().getChild("risk_guard")
+
+PAUSED_REASON_PATH = Path("logs/paused_reason.json").resolve()
+TRADES_LOG_PATH = Path("logs/trades.log").resolve()
 
 _STATE_CACHE: dict[str, Any] | None = None
 _STATE_CACHE_MTIME: int | None = None
@@ -66,6 +69,163 @@ def _default_state() -> dict[str, Any]:
     }
 
 
+def _utc_now_iso() -> str:
+    """Return the current UTC timestamp as an ISO-8601 string."""
+
+    return _now()
+
+
+def _start_of_next_utc_day(reference: datetime | None = None) -> str:
+    """Return the ISO timestamp for the next UTC midnight following ``reference``."""
+
+    reference = reference or datetime.now(timezone.utc)
+    midnight = reference.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_day = midnight + timedelta(days=1)
+    return next_day.isoformat()
+
+
+def _start_of_next_iso_week(reference: datetime | None = None) -> str:
+    """Return the ISO timestamp for the start of the next ISO week (Monday at 00:00 UTC)."""
+
+    reference = reference or datetime.now(timezone.utc)
+    midnight = reference.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = midnight - timedelta(days=midnight.weekday())
+    next_week_start = start_of_week + timedelta(days=7)
+    return next_week_start.isoformat()
+
+
+def _parse_trade_timestamp(trade: dict[str, Any]) -> datetime | None:
+    """Best-effort parsing of trade timestamps."""
+
+    candidates = [
+        trade.get("closed_at"),
+        trade.get("exit_timestamp"),
+        trade.get("exit_time"),
+        trade.get("exit_at"),
+        trade.get("timestamp"),
+    ]
+    for raw in candidates:
+        if not isinstance(raw, str) or not raw:
+            continue
+        cleaned = raw.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _aggregate_roi(values: list[float]) -> float:
+    """Return the sum of ROI values, ignoring non-numeric entries."""
+
+    total = 0.0
+    for value in values:
+        try:
+            total += float(value)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _daily_and_weekly_roi(trades: list[dict[str, Any]]) -> tuple[float, float]:
+    """Return aggregate ROI for the current UTC day and ISO week."""
+
+    if not trades:
+        return 0.0, 0.0
+
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = midnight - timedelta(days=midnight.weekday())
+
+    daily_values: list[float] = []
+    weekly_values: list[float] = []
+
+    for trade in trades:
+        timestamp = _parse_trade_timestamp(trade)
+        if timestamp is None:
+            continue
+        roi_raw = trade.get("roi")
+        try:
+            roi_value = float(roi_raw)
+        except (TypeError, ValueError):
+            continue
+        if timestamp >= midnight:
+            daily_values.append(roi_value)
+        if timestamp >= start_of_week:
+            weekly_values.append(roi_value)
+
+    daily_total = _aggregate_roi(daily_values)
+    weekly_total = _aggregate_roi(weekly_values)
+    return daily_total, weekly_total
+
+
+def _daily_and_weekly_drawdown_pct(trades: list[dict[str, Any]]) -> tuple[float, float]:
+    """Return drawdown magnitudes (percentage) for the current UTC day and ISO week."""
+
+    daily_total, weekly_total = _daily_and_weekly_roi(trades)
+    daily_drawdown_pct = abs(min(daily_total, 0.0)) * 100.0
+    weekly_drawdown_pct = abs(min(weekly_total, 0.0)) * 100.0
+    return daily_drawdown_pct, weekly_drawdown_pct
+
+
+def _load_closed_trades() -> list[dict[str, Any]]:
+    """Return closed trades recorded in the trades log."""
+
+    if not TRADES_LOG_PATH.exists():
+        return []
+    trades: list[dict[str, Any]] = []
+    try:
+        with TRADES_LOG_PATH.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    trade = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = str(trade.get("status", "")).lower()
+                if status != "closed":
+                    continue
+                trades.append(trade)
+    except OSError as exc:
+        logger.error("[risk_guard] Failed to read trades log %s: %s", TRADES_LOG_PATH, exc)
+        return []
+    return trades
+
+
+def _write_paused_reason(reason: str, *, resume_at: str | None = None) -> None:
+    """Persist the reason for auto-pausing new entries."""
+
+    payload = {
+        "reason": reason,
+        "updated_at": _utc_now_iso(),
+    }
+    if resume_at:
+        payload["resume_at"] = resume_at
+    try:
+        PAUSED_REASON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PAUSED_REASON_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        logger.warning("[risk_guard] Failed to persist pause reason: %s", exc)
+
+
+def _clear_paused_reason_file() -> None:
+    """Remove the paused reason file when trading resumes."""
+
+    try:
+        if PAUSED_REASON_PATH.exists():
+            PAUSED_REASON_PATH.unlink()
+    except OSError as exc:
+        logger.debug("[risk_guard] Failed to clear paused_reason file: %s", exc)
+
+
 def _write_state(state: dict[str, Any]) -> dict[str, Any]:
     global _STATE_CACHE, _STATE_CACHE_MTIME, _LAST_PAUSED_STATE  # pylint: disable=global-statement
     path = _state_path()
@@ -99,6 +259,60 @@ def _write_state(state: dict[str, Any]) -> dict[str, Any]:
             },
         )
     return snapshot
+
+
+def should_allow_new_entry(context: dict[str, Any] | None = None) -> tuple[bool, str | None]:
+    """Return ``(allow, reason)`` gating new entries based on calendar drawdowns."""
+
+    del context  # Context hook reserved for future enhancements.
+    trades = _load_closed_trades()
+    auto_cfg = CONFIG.get("auto_pause", {}) or {}
+    try:
+        max_daily = float(auto_cfg.get("max_daily_drawdown_pct", 5.0))
+    except (TypeError, ValueError):
+        max_daily = 5.0
+    try:
+        max_weekly = float(auto_cfg.get("max_weekly_drawdown_pct", 10.0))
+    except (TypeError, ValueError):
+        max_weekly = 10.0
+    max_daily = max(max_daily, 0.0)
+    max_weekly = max(max_weekly, 0.0)
+
+    if not trades or (max_daily <= 0 and max_weekly <= 0):
+        state = load_state()
+        try:
+            current_drawdown = float(state.get("last_drawdown", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            current_drawdown = 0.0
+        if current_drawdown != 0.0:
+            state["last_drawdown"] = 0.0
+            _write_state(state)
+        _clear_paused_reason_file()
+        return True, None
+
+    daily_roi, weekly_roi = _daily_and_weekly_roi(trades)
+    daily_drawdown_pct, weekly_drawdown_pct = _daily_and_weekly_drawdown_pct(trades)
+
+    state = load_state()
+    worst_drawdown = min(daily_roi, weekly_roi, 0.0)
+    state["last_drawdown"] = float(worst_drawdown)
+    _write_state(state)
+
+    reason: str | None = None
+    resume_at: str | None = None
+    if max_daily > 0 and daily_drawdown_pct >= max_daily:
+        reason = f"Daily drawdown {daily_drawdown_pct:.2f}% exceeds limit {max_daily:.2f}%"
+        resume_at = _start_of_next_utc_day()
+    elif max_weekly > 0 and weekly_drawdown_pct >= max_weekly:
+        reason = f"Weekly drawdown {weekly_drawdown_pct:.2f}% exceeds limit {max_weekly:.2f}%"
+        resume_at = _start_of_next_iso_week()
+
+    if reason:
+        _write_paused_reason(reason, resume_at=resume_at)
+        return False, reason
+
+    _clear_paused_reason_file()
+    return True, None
 
 
 def _current_state_mtime(path: Path) -> int | None:
@@ -196,6 +410,90 @@ def invalidate_cache() -> None:
     global _STATE_CACHE, _STATE_CACHE_MTIME  # pylint: disable=global-statement
     _STATE_CACHE = None
     _STATE_CACHE_MTIME = None
+
+
+def trigger_panic_exit_if_needed() -> bool:
+    """Force-close open positions when weekly ROI breaches the hard drawdown guard."""
+
+    trades = _load_closed_trades()
+    if not trades:
+        return False
+
+    _, weekly_roi = _daily_and_weekly_roi(trades)
+    weekly_threshold = -0.15
+    if weekly_roi > weekly_threshold:
+        return False
+
+    try:
+        # Imported lazily to avoid circular imports during module initialization.
+        from crypto_trading_bot.bot import trading_logic  # type: ignore import-not-found
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.error("[risk_guard] Panic exit unavailable — trading_logic import failed: %s", exc)
+        return False
+
+    position_manager = getattr(trading_logic, "position_manager", None)
+    ledger = getattr(trading_logic, "ledger", None)
+    if position_manager is None or ledger is None:
+        logger.error("[risk_guard] Panic exit unavailable — position manager or ledger missing.")
+        return False
+
+    exits = 0
+    for trade_id, position in list(position_manager.positions.items()):
+        exit_price_raw = (
+            position.get("current_price")
+            or position.get("last_price")
+            or position.get("exit_price")
+            or position.get("entry_price")
+        )
+        try:
+            exit_price = float(exit_price_raw)
+        except (TypeError, ValueError):
+            entry_price = position.get("entry_price")
+            try:
+                exit_price = float(entry_price)
+            except (TypeError, ValueError):
+                exit_price = 0.0
+        if exit_price <= 0:
+            logger.warning(
+                "[risk_guard] Panic exit using fallback price for trade %s",
+                trade_id,
+                extra={"fallback_price": exit_price},
+            )
+        try:
+            ledger.update_trade(
+                trade_id=trade_id,
+                exit_price=exit_price,
+                reason="PANIC_EXIT",
+            )
+            exits += 1
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.error("[risk_guard] Failed to update trade %s during panic exit: %s", trade_id, exc)
+            continue
+
+        if trade_id in position_manager.positions:
+            del position_manager.positions[trade_id]
+
+    if exits == 0:
+        return False
+
+    state = load_state()
+    state["paused"] = True
+    state["pause_trigger"] = "panic_exit"
+    state["pause_reason"] = "weekly drawdown exceeded 15%"
+    state["last_drawdown"] = float(min(weekly_roi, 0.0))
+    _write_state(state)
+
+    _write_paused_reason(
+        "Panic exit triggered — weekly drawdown exceeded 15%",
+        resume_at=_start_of_next_iso_week(),
+    )
+
+    logger.critical(
+        "[risk_guard] Panic exit executed for %d positions | weekly_roi=%.2f%%",
+        exits,
+        weekly_roi * 100.0,
+    )
+    return True
 
 
 def is_paused(state: dict[str, Any] | None = None, *, refresh: bool = False) -> bool:
@@ -415,7 +713,9 @@ __all__ = [
     "is_paused",
     "load_state",
     "resume_trading",
+    "should_allow_new_entry",
     "state_path",
+    "trigger_panic_exit_if_needed",
     "update_drawdown",
     "update_trade_outcome",
 ]

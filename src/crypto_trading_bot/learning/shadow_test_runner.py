@@ -56,11 +56,12 @@ def run_shadow_tests(input_file: str = DEFAULT_INPUT, output_file: str = DEFAULT
 
     Rules:
     - Only process entries where type=="learning_suggestion"
-    - Pass criteria: median(confidence) >= 0.5, win_rate >= 0.55 (if present), ROI >= 0.003 (if present)
+    - Pass criteria: median(confidence) >= 0.5, win_rate >= 0.55 (if present),
+      ROI >= 0.003 (if present)
     - Append per-strategy summary rows
     """
     suggestions = _load_jsonl(input_file)
-    suggestions = [s for s in suggestions if (s.get("type") == "learning_suggestion")]
+    suggestions = [s for s in suggestions if s.get("type") == "learning_suggestion"]
 
     if not suggestions:
         logger.info("No learning_suggestion rows found in %s", input_file)
