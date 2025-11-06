@@ -1,7 +1,10 @@
+"""Unit tests to verify synchronization between trade logs and the SQLite database."""
+
 from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,8 +15,6 @@ def _load_script_module(name: str):
     spec = importlib.util.spec_from_file_location(name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    import sys
-
     sys.modules[name] = module
     spec.loader.exec_module(module)  # type: ignore[arg-type]
     return module
@@ -34,8 +35,9 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write("\n")
 
 
-@pytest.fixture
-def seeded_logs(tmp_path: Path) -> tuple[Path, Path]:
+@pytest.fixture(name="seeded_logs")
+def _seeded_logs(tmp_path: Path) -> tuple[Path, Path]:
+    """Seed trades.log and positions.jsonl with matching and orphaned entries."""
     logs_dir = tmp_path / "logs"
     trades_path = logs_dir / "trades.log"
     positions_path = logs_dir / "positions.jsonl"
@@ -81,6 +83,7 @@ def seeded_logs(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_inspect_and_clean_orphaned_positions(seeded_logs: tuple[Path, Path]) -> None:
+    """Ensure orphaned positions are detected and removed by the maintenance scripts."""
     positions_path, trades_path = seeded_logs
 
     orphans = inspect_trade_sync.inspect_sync(positions_path, trades_path)

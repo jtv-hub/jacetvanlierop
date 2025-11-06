@@ -25,6 +25,7 @@ from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG, IS_LIVE
+from crypto_trading_bot.db.sqlite_adapter import SQLiteAdapter
 from crypto_trading_bot.utils.kraken_client import get_usdc_balance, kraken_get_balance
 from crypto_trading_bot.utils.system_logger import (
     SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
@@ -336,6 +337,8 @@ class TradeLedger:
         self.account_balance: Optional[float] = None
         self.txid_index: dict[str, str] = {}
         self._balance_source: str = "unknown"
+        # Shared SQLite adapter for dual-write
+        self.sqlite = SQLiteAdapter()
         self.reload_trades()
 
     def _fetch_runtime_balance(self) -> Optional[float]:
@@ -353,7 +356,9 @@ class TradeLedger:
             return None
 
         if math.isclose(value, 0.0, abs_tol=1e-9):
-            system_logger.warning("USDC balance fetch returned zero. Verify live balance configuration.")
+            system_logger.warning(
+                "USDC balance fetch returned zero. Verify live balance configuration.",
+            )
         system_logger.info("Fetched runtime USDC balance %.2f", value)
         return value
 
@@ -495,6 +500,53 @@ class TradeLedger:
             self._pause_reason = None
             return True, reason
         return False, None
+
+    def _map_trade_to_sqlite(self, trade: dict, *, status_override: str | None = None) -> dict:
+        """Map internal trade dict to SQLite schema-compliant row.
+        Assumes cost_basis is USD notional for size_usd mapping.
+        """
+        side_val = trade.get("side")
+        # Ensure 'buy'/'sell'
+        if isinstance(side_val, str):
+            s = side_val.strip().lower()
+            if s in {"long", "short"}:
+                side_sql = "buy" if s == "long" else "sell"
+            elif s in {"buy", "sell"}:
+                side_sql = s
+            else:
+                side_sql = "buy"
+        else:
+            side_sql = "buy"
+        entry_slip = trade.get("entry_slippage_rate")
+        exit_slip = trade.get("exit_slippage_rate")
+        slip_rate = exit_slip if exit_slip is not None else entry_slip
+        slippage_bps = round(float(slip_rate) * 10000, 6) if isinstance(slip_rate, (int, float)) else None
+        row = {
+            "trade_id": trade.get("trade_id"),
+            "timestamp": trade.get("timestamp"),
+            "pair": trade.get("pair"),
+            "side": side_sql,
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "size_usd": trade.get("cost_basis"),
+            "roi": trade.get("roi"),
+            "pnl_usd": trade.get("realized_gain"),
+            "confidence": trade.get("confidence"),
+            "strategy_id": trade.get("strategy"),
+            "status": (
+                status_override
+                if status_override
+                else (
+                    "closed"
+                    if trade.get("exit_price") is not None
+                    else ("open" if trade.get("status") == "executed" else trade.get("status"))
+                )
+            ),
+            "exit_reason": trade.get("exit_reason") or trade.get("reason"),
+            "rsi": trade.get("rsi"),
+            "slippage_bps": slippage_bps,
+        }
+        return row
 
     def log_trade(self, trading_pair, trade_size, strategy_name, **kwargs):
         """
@@ -756,6 +808,13 @@ class TradeLedger:
                 },
             )
             return existing_id
+
+        # Dual-write to SQLite as 'open' before file append
+        try:
+            sql_row = self._map_trade_to_sqlite(trade, status_override="open")
+            self.sqlite.insert_trade(sql_row)
+        except Exception:  # pragma: no cover - do not break logging on DB failure
+            system_logger.warning("SQLite insert (entry) failed for trade %s", trade_id, exc_info=True)
 
         balance_delta_value = None
         balance_delta_provided = "balance_delta" in kwargs and kwargs.get("balance_delta") is not None
@@ -1143,7 +1202,7 @@ class TradeLedger:
                         t_obj["balance_delta"] = pre_update_delta
                     if t_obj.get("account_balance") is None:
                         system_logger.warning(
-                            "Trade %s closed without account_balance; review live balance configuration.",
+                            ("Trade %s closed without account_balance; review live balance configuration."),
                             trade_id,
                         )
                     elif entry_balance_snapshot is not None and t_obj.get("balance_delta") is None:
@@ -1197,6 +1256,13 @@ class TradeLedger:
                             pass
 
                 if updated:
+                    # Upsert into SQLite as 'closed' prior to file rewrite
+                    try:
+                        sql_row = self._map_trade_to_sqlite(t_obj, status_override="closed")
+                        self.sqlite.insert_trade(sql_row)
+                    except Exception:
+                        system_logger.warning("SQLite insert (update) failed for trade %s", trade_id, exc_info=True)
+
                     # Safely rewrite trades.log with exclusive lock held on source
                     temp_path = TRADES_LOG_PATH + ".tmp"
                     with open(TRADES_LOG_PATH, "r+", encoding="utf-8") as src:
@@ -1340,7 +1406,9 @@ class TradeLedger:
         else:
             system_logger.info("No trades.log file found.")
         if legacy_mutations:
-            system_logger.info("Detected legacy trade entries missing metadata; rewriting trades.log.")
+            system_logger.info(
+                "Detected legacy trade entries missing metadata; rewriting trades.log.",
+            )
             self._rewrite_trades_file()
         latest_balance: Optional[float] = None
         for trade in self.trades:
@@ -1412,11 +1480,18 @@ class TradeLedger:
                 response = kraken_get_balance(asset)
             except Exception as exc:  # pylint: disable=broad-except
                 system_logger.error("[BALANCE] Kraken balance fetch failed: %s", exc)
-                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.") from exc
+                raise RuntimeError(
+                    "Failed to fetch live balance — aborting to prevent synthetic fallback.",
+                ) from exc
 
             if not isinstance(response, dict):
-                system_logger.error("[BALANCE] Kraken balance response malformed: %r", response)
-                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.")
+                system_logger.error(
+                    "[BALANCE] Kraken balance response malformed: %r",
+                    response,
+                )
+                raise RuntimeError(
+                    "Failed to fetch live balance — aborting to prevent synthetic fallback.",
+                )
 
             balance_value = response.get("balance")
             if balance_value is None:
@@ -1447,7 +1522,9 @@ class TradeLedger:
                     detail,
                     response,
                 )
-                raise RuntimeError("Failed to fetch live balance — aborting to prevent synthetic fallback.")
+                raise RuntimeError(
+                    "Failed to fetch live balance — aborting to prevent synthetic fallback.",
+                )
 
             system_logger.info("[BALANCE] Live Kraken balance fetched: $%.2f", balance_float)
             self.account_balance = balance_float
