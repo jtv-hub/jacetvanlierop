@@ -40,8 +40,10 @@ from crypto_trading_bot.config import (
 )
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
 from crypto_trading_bot.context.trading_context import TradingContext
+from crypto_trading_bot.indicators.atr import compute_atr
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.utils.file_locks import advisory_lock
 from crypto_trading_bot.utils.kraken_api import get_ohlc_data
 from crypto_trading_bot.utils.kraken_client import (
     KrakenAPIError,
@@ -59,13 +61,42 @@ from crypto_trading_bot.utils.price_history import (
 )
 from crypto_trading_bot.utils.system_logger import get_system_logger
 
+# RL agent integration
+try:
+    from crypto_trading_bot.rl.ppo_agent import PPOAgent
+except Exception:  # pragma: no cover - safe fallback if RL module missing
+    PPOAgent = None  # type: ignore[assignment]
+
+from crypto_trading_bot.rl import state_builder as state_builder_module
+
+try:
+    from crypto_trading_bot.rl.ppo_gate import decide as ppo_gate_decide
+except Exception:  # pragma: no cover - provides safe fallback gate
+
+    def ppo_gate_decide(strategy_output, ppo_output):
+        return {
+            "use_ppo": False,
+            "reason": "ppo_gate_unavailable",
+            "strategy_action": strategy_output,
+            "ppo_action": ppo_output,
+        }
+
+
+try:
+    from crypto_trading_bot.rl.ppo_shadow_logger import log_divergence as log_ppo_divergence
+except Exception:  # pragma: no cover - logging helper optional
+
+    def log_ppo_divergence(*_, **__):
+        return None
+
+
 # Optional RSI calculator (import may vary by environment)
 try:
     from crypto_trading_bot.indicators.rsi import calculate_rsi  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover
     calculate_rsi = None  # type: ignore[assignment]
 
-from .strategies.advanced_strategies import (
+from crypto_trading_bot.bot.strategies.advanced_strategies import (
     ADXStrategy,
     BollingerBandStrategy,
     CompositeStrategy,
@@ -74,11 +105,29 @@ from .strategies.advanced_strategies import (
     StochRSIStrategy,
     VWAPStrategy,
 )
-from .strategies.dual_threshold_strategies import DualThresholdStrategy
-from .strategies.simple_rsi_strategies import SimpleRSIStrategy
+from crypto_trading_bot.bot.strategies.dual_threshold_strategies import DualThresholdStrategy
+from crypto_trading_bot.bot.strategies.simple_rsi_strategies import SimpleRSIStrategy
 
 context = TradingContext()
-logger = get_system_logger().getChild("trading_logic")
+system_logger = get_system_logger()
+logger = system_logger.getChild("trading_logic")
+
+# Initialize PPO agent singleton with safe fallback
+if "ppo_agent" not in globals():
+    ppo_agent = None
+    try:
+        if PPOAgent is not None:
+            ppo_agent = PPOAgent()
+            try:
+                ppo_agent.load_model()
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Loading failure should not crash trading logic
+                logger.debug("PPO load_model failed; continuing with disabled agent", exc_info=True)
+        else:
+            logger.debug("PPOAgent class unavailable; RL disabled")
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Final guard to never break module import
+        logger.debug("PPO agent init error; RL disabled", exc_info=True)
 
 TRADES_LOG_PATH = "logs/trades.log"
 PORTFOLIO_STATE_PATH = "logs/portfolio_state.json"
@@ -1015,13 +1064,14 @@ class PositionManager:
         entry_adx: float | None = None,
         entry_rsi: float | None = None,
         timestamp: str | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ):
         """Opens a new position and writes it to the positions log.
         Expects entry_price to be the final effective entry (e.g., after slippage)
         so it is persisted exactly as used for the trade.
         """
         ts = timestamp or datetime.datetime.now(datetime.UTC).isoformat()
-        self.positions[trade_id] = {
+        position_payload = {
             "trade_id": trade_id,
             "pair": pair,
             "size": size,
@@ -1033,12 +1083,18 @@ class PositionManager:
             "entry_adx": entry_adx,
             "entry_rsi": entry_rsi,
         }
+        if extra_fields:
+            for key, value in extra_fields.items():
+                if value is not None:
+                    position_payload[key] = value
+        self.positions[trade_id] = position_payload
         try:
             os.makedirs("logs", exist_ok=True)
-            with open("logs/positions.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(self.positions[trade_id]) + "\n")
-                f.flush()  # Ensure write
-                os.fsync(f.fileno())  # Sync to disk
+            with open("logs/positions.jsonl", "a", encoding="utf-8") as locked_file:
+                with advisory_lock(locked_file):
+                    locked_file.write(json.dumps(position_payload) + "\n")
+                    locked_file.flush()
+                    os.fsync(locked_file.fileno())
             logger.debug("Position persisted", extra={"trade_id": trade_id, "pair": pair, "size": size})
         except (OSError, IOError) as e:
             logger.error("Failed writing positions.jsonl", extra={"error": str(e)})
@@ -1270,9 +1326,7 @@ def evaluate_signals_and_trade(
     reinvestment_rate: float | None = None,
 ):
     """Evaluates trade signals and manages trade execution and exits."""
-    from crypto_trading_bot.safety import risk_guard as _risk_guard  # pylint: disable=redefined-outer-name
-
-    allow_entries, deny_reason = _risk_guard.should_allow_new_entry(context={})
+    allow_entries, deny_reason = risk_guard.should_allow_new_entry(context={})
     if not allow_entries:
         if deny_reason:
             logger.warning("New entries halted: %s", deny_reason)
@@ -1584,6 +1638,18 @@ def evaluate_signals_and_trade(
                         extra={"pair": pair, "available": len(safe_prices), "required": min_needed},
                     )
                     continue
+
+                risk_cfg = CONFIG.get("risk", {})
+                atr_period = int(risk_cfg.get("atr_period", 14))
+                atr_value = compute_atr(safe_prices, period=atr_period)
+                atr_pct = (atr_value / current_price) if current_price else 0.0
+                max_atr_pct = float(risk_cfg.get("max_atr_pct", 0.06) or 0.0)
+                if max_atr_pct > 0 and atr_pct > max_atr_pct:
+                    logger.info(
+                        "Skipping asset due to ATR volatility guard",
+                        extra={"pair": pair, "atr_pct": atr_pct, "max_atr_pct": max_atr_pct},
+                    )
+                    continue
                 # Compute ADX gate using recent prices
                 adx_val = context.get_adx(pair, safe_prices)
                 if adx_val is not None:
@@ -1630,7 +1696,37 @@ def evaluate_signals_and_trade(
                     mode_label,
                     per_asset_params=per_asset_params,
                 )
-                regime = context.get_regime()
+                regime_snapshot = context.get_regime()
+                trend_strength = 0.0
+                regime_label = "unknown"
+                if isinstance(regime_snapshot, dict):
+                    try:
+                        trend_strength = float(regime_snapshot.get("trend_strength", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        trend_strength = 0.0
+                    regime_label = str(regime_snapshot.get("label") or regime_snapshot.get("regime") or "unknown")
+                else:
+                    regime_label = str(regime_snapshot or "unknown")
+                regime = regime_label
+                sl_mult_base = float(risk_cfg.get("sl_atr_mult", 1.5))
+                tp_mult_base = float(risk_cfg.get("tp_atr_mult", 2.0))
+                regime_alpha = float(risk_cfg.get("regime_alpha", 0.5))
+                sl_mult = sl_mult_base * (1 + regime_alpha * trend_strength)
+                tp_mult = tp_mult_base * (1 + regime_alpha * trend_strength)
+                sl_distance_abs = max(0.0, sl_mult * atr_value)
+                tp_distance_abs = max(0.0, tp_mult * atr_value)
+                risk_rr_metadata = {
+                    "atr_value": round(atr_value, 8),
+                    "atr": round(atr_value, 8),
+                    "atr_pct": round(atr_pct, 8),
+                    "sl_atr_mult": round(sl_mult, 6),
+                    "tp_atr_mult": round(tp_mult, 6),
+                    "sl_distance": round(sl_distance_abs, 8),
+                    "sl_distance_abs": round(sl_distance_abs, 8),
+                    "tp_distance": round(tp_distance_abs, 8),
+                    "tp_distance_abs": round(tp_distance_abs, 8),
+                    "trend_strength": round(trend_strength, 6),
+                }
                 strategy_candidates: list[dict[str, Any]] = []
                 signals_count = 0
                 buy_count = 0
@@ -1732,7 +1828,13 @@ def evaluate_signals_and_trade(
 
                 selected = max(actionable_candidates, key=lambda c: c["confidence"])
                 signal = selected["signal"]
-                confidence = selected["confidence"]
+                strategy_confidence = selected["confidence"]
+                try:
+                    strategy_confidence = float(strategy_confidence)
+                except (TypeError, ValueError):
+                    strategy_confidence = 0.0
+                strategy_confidence = max(0.0, min(1.0, strategy_confidence))
+                confidence = strategy_confidence
                 strategy_name = selected["strategy"]
                 selected_strategy = selected["strategy_obj"]
                 buffer = selected["buffer"]
@@ -1787,12 +1889,12 @@ def evaluate_signals_and_trade(
                 min_sz, max_sz = _resolve_trade_size_bounds(pair)
                 dynamic_buffer = context.get_buffer_for_strategy(strategy_name)
                 liquidity_factor = min(volume / 1000, 1.0)
-
+                confidence_before_ppo = float(confidence)
                 adjusted_size, position_notional, trade_risk = _compute_position_sizing(
                     total_capital=total_capital,
                     remaining_capital=remaining_capital,
                     current_price=current_price,
-                    confidence=confidence,
+                    confidence=confidence_before_ppo,
                     base_risk_pct=trade_risk_pct,
                     buffer=dynamic_buffer,
                     reinvestment_rate=reinvestment_rate,
@@ -1801,12 +1903,260 @@ def evaluate_signals_and_trade(
                     max_size=max_sz,
                 )
 
+                base_size = adjusted_size
+                sizing_cfg = CONFIG.get("sizing", {})
+                sizing_mode = str(sizing_cfg.get("confidence_mode", "linear")).lower()
+                if sizing_mode == "quadratic":
+                    confidence_scalar = confidence_before_ppo**2
+                elif sizing_mode == "sqrt":
+                    confidence_scalar = math.sqrt(max(confidence_before_ppo, 0.0))
+                else:
+                    confidence_scalar = confidence_before_ppo
+                confidence_scalar = max(0.0, min(confidence_scalar, 1.0))
+                adjusted_size = max(min_sz, min(base_size * confidence_scalar, max_sz))
+                if current_price:
+                    position_notional = adjusted_size * current_price
+
+                strategy_view = {
+                    "signal": signal,
+                    "confidence": confidence_before_ppo,
+                    "size": adjusted_size,
+                    "source": strategy_name,
+                }
+
+                # PPO integration — only influence entry sizing and permission
+                size_scalar_value = 1.0
+                agent_conf_value = confidence_before_ppo
+                allow_entry_flag = True
+                ppo_source = "ppo_disabled"
+                decision: dict[str, Any] = {"use_ppo": False}
+                ppo_config = CONFIG.get("ppo", {})
+                ppo_metadata: dict[str, Any] = {}
+                combined_metadata = dict(risk_rr_metadata)
+                try:
+                    # Build context for the RL agent
+                    now_ts = datetime.datetime.now(datetime.UTC).isoformat()
+                    portfolio_state = state_snapshot or {}
+                    indicators = {
+                        "rsi": rsi_val,
+                        "adx": adx_val,
+                        "volume": volume,
+                        "price": current_price,
+                        "atr": atr_value,
+                        "atr_pct": atr_pct,
+                    }
+                    regime = context.get_regime()
+
+                    class _S:  # lightweight shim holding a name attribute
+                        pass
+
+                    _strategy_holder = _S()
+                    _strategy_holder.name = strategy_name
+                    # Construct context dict as specified
+                    ppo_context = {
+                        "strategy_id": _strategy_holder.name,
+                        "confidence": strategy_confidence,
+                        "indicators": indicators,
+                        "regime": regime,
+                        "portfolio": portfolio_state,
+                        "timestamp": now_ts,
+                    }
+                    ppo_state = state_builder_module.build_state(ppo_context)
+                    if ppo_agent is not None:
+                        try:
+                            confidence = ppo_agent.predict(
+                                observation=ppo_state,
+                            )
+                        except Exception:  # pylint: disable=broad-exception-caught
+                            logger.debug(
+                                "PPO confidence inference failed; falling back to strategy confidence",
+                                exc_info=True,
+                            )
+                            confidence = strategy_confidence
+                    else:
+                        confidence = strategy_confidence
+
+                    confidence = float(max(0.0, min(confidence, 1.0)))
+
+                    adjusted_size, position_notional, trade_risk = _compute_position_sizing(
+                        total_capital=total_capital,
+                        remaining_capital=remaining_capital,
+                        current_price=current_price,
+                        confidence=confidence,
+                        base_risk_pct=trade_risk_pct,
+                        buffer=dynamic_buffer,
+                        reinvestment_rate=reinvestment_rate,
+                        liquidity_factor=liquidity_factor,
+                        min_size=min_sz,
+                        max_size=max_sz,
+                    )
+
+                    strategy_view["confidence"] = confidence
+                    strategy_view["size"] = adjusted_size
+
+                    if ppo_agent is not None:
+                        ppo_action = ppo_agent.get_action(state=ppo_state, context=ppo_context)
+                    else:
+                        ppo_action = {"source": "ppo_disabled"}
+
+                    ppo_output = dict(ppo_action) if isinstance(ppo_action, dict) else {"source": "ppo_invalid"}
+                    ppo_source = ppo_output.get("source", "unknown")
+                    try:
+                        size_scalar_value = float(ppo_action.get("size_scalar", 1.0) or 1.0)
+                    except (TypeError, ValueError):
+                        size_scalar_value = 1.0
+                    size_scalar_value = max(size_scalar_value, 0.0)
+                    try:
+                        agent_conf_value = float(ppo_action.get("agent_confidence", 0.5))
+                    except (TypeError, ValueError):
+                        agent_conf_value = 0.5
+                    agent_conf_value = max(0.0, min(agent_conf_value, 1.0))
+                    allow_entry_flag = bool(ppo_action.get("allow_entry", True))
+                    ppo_output["confidence"] = agent_conf_value
+                    ppo_output["size_scalar"] = size_scalar_value
+                    ppo_output["allow_entry"] = allow_entry_flag
+
+                    logger.info("PPO action source: %s", ppo_source)
+                    decision = ppo_gate_decide(strategy_view, ppo_output)
+                    log_ppo_divergence(strategy_view, ppo_output, decision, trade_id=None)
+
+                    approved_live = bool(getattr(ppo_agent, "is_approved", lambda: False)()) if ppo_agent else False
+                    enable_live_mode = bool(ppo_config.get("enable_live_mode", False))
+                    min_live_conf = float(ppo_config.get("min_live_confidence", 0.6))
+                    hybrid_mode = bool(ppo_config.get("hybrid_mode", False))
+                    hybrid_weight = float(ppo_config.get("hybrid_weight", 0.7))
+                    if hybrid_mode:
+                        confidence_blend = (
+                            hybrid_weight * agent_conf_value + (1 - hybrid_weight) * confidence_before_ppo
+                        )
+                        confidence_blend = max(0.0, min(confidence_blend, 1.0))
+                    else:
+                        confidence_blend = None
+
+                    final_confidence = confidence_before_ppo
+                    final_size_scalar = 1.0
+                    ppo_used = False
+
+                    if enable_live_mode and is_live and approved_live and decision.get("use_ppo", False):
+                        if agent_conf_value >= min_live_conf and allow_entry_flag:
+                            final_confidence = confidence_blend if hybrid_mode else agent_conf_value
+                            final_size_scalar = size_scalar_value
+                            ppo_used = True
+                        else:
+                            logger.info(
+                                "PPO live gate blocked this entry",
+                                extra={
+                                    "agent_conf_value": agent_conf_value,
+                                    "min_live_conf": min_live_conf,
+                                    "allow_entry_flag": allow_entry_flag,
+                                },
+                            )
+                    elif decision.get("use_ppo", False) and allow_entry_flag:
+                        blended = (
+                            confidence_blend
+                            if hybrid_mode
+                            else min(
+                                confidence_before_ppo,
+                                agent_conf_value,
+                            )
+                        )
+                        final_confidence = max(0.0, min(blended, 1.0))
+                        final_size_scalar = size_scalar_value
+
+                    if not decision.get("use_ppo", False):
+                        size_scalar_value = 1.0
+                        agent_conf_value = confidence_before_ppo
+                        allow_entry_flag = True
+                        logger.debug(
+                            "PPO gate declined override",
+                            extra={
+                                "pair": pair,
+                                "strategy": strategy_name,
+                                "reason": decision.get("reason"),
+                            },
+                        )
+
+                    if not allow_entry_flag:
+                        logger.info(
+                            "Confidence drift (PPO gated entry)",
+                            extra={
+                                "pair": pair,
+                                "strategy": strategy_name,
+                                "rule_confidence": round(float(confidence_before_ppo), 6),
+                                "agent_confidence": round(float(agent_conf_value), 6),
+                                "final_confidence": round(float(final_confidence), 6),
+                                "ppo_source": ppo_source,
+                                "size_scalar": float(size_scalar_value),
+                            },
+                        )
+                        continue
+
+                    adjusted_size = max(adjusted_size * final_size_scalar, 0.0)
+                    atr_sizing_cfg = CONFIG.get("risk", {}).get("atr_sizing", {}) or {}
+                    if atr_sizing_cfg.get("enabled", False):
+                        target_atr_pct = float(atr_sizing_cfg.get("target_atr_pct", 0.02) or 0.02)
+                        min_scalar = float(atr_sizing_cfg.get("min_scalar", 0.5) or 0.5)
+                        max_scalar = float(atr_sizing_cfg.get("max_scalar", 1.5) or 1.5)
+                        mode = str(atr_sizing_cfg.get("mode", "inverse")).lower()
+                        eps = 1e-8
+                        if mode == "inverse":
+                            scalar = target_atr_pct / max(atr_pct, eps)
+                        else:
+                            scalar = atr_pct / max(target_atr_pct, eps)
+                        scalar = max(min_scalar, min(max_scalar, scalar))
+                        adjusted_size = max(min_sz, min(max_sz, adjusted_size * scalar))
+                        if current_price:
+                            position_notional = adjusted_size * current_price
+                            if total_capital > 0:
+                                trade_risk = min((position_notional / total_capital), trade_risk_pct)
+                        combined_metadata["atr_sizing_scalar"] = round(float(scalar), 6)
+                    confidence = final_confidence
+                    strategy_view["confidence"] = confidence
+                    strategy_view["size"] = adjusted_size
+
+                except Exception:  # pylint: disable=broad-exception-caught
+                    # Fail-safe: do not block trade flow
+                    logger.debug("PPO integration error; proceeding without RL influence", exc_info=True)
+                    logger.info("PPO action source: %s", "ppo_error")
+                    size_scalar_value = 1.0
+                    agent_conf_value = confidence_before_ppo
+                    confidence = confidence_before_ppo
+                    ppo_source = "ppo_error"
+                    decision = {"use_ppo": False}
+                    min_live_conf = float(CONFIG.get("ppo", {}).get("min_live_confidence", 0.6))
+                    combined_metadata = dict(risk_rr_metadata)
+
+                ppo_metadata = {
+                    "ppo_used": ppo_used,
+                    "ppo_agent_confidence": agent_conf_value,
+                    "ppo_size_scalar": size_scalar_value,
+                    "rl_source": ppo_source,
+                    "ppo_source": ppo_source,
+                    "hybrid": hybrid_mode,
+                    "hybrid_weight": hybrid_weight if hybrid_mode else None,
+                    "confidence_blend": confidence_blend,
+                }
+                combined_metadata = {k: v for k, v in {**risk_rr_metadata, **ppo_metadata}.items() if v is not None}
+
                 if adjusted_size <= 0:
                     logger.warning(
                         "Skipping due to insufficient capital for minimum position size",
                         extra={"pair": pair},
                     )
                     continue
+
+                logger.info(
+                    "Confidence drift (trade attempt)",
+                    extra={
+                        "pair": pair,
+                        "strategy": strategy_name,
+                        "rule_confidence": round(float(confidence_before_ppo), 6),
+                        "agent_confidence": round(float(agent_conf_value), 6),
+                        "final_confidence": round(float(confidence), 6),
+                        "ppo_source": ppo_source,
+                        "size_scalar": float(size_scalar_value),
+                    },
+                )
 
                 limited_size, limit_context = _apply_deploy_phase_limits(
                     pair,
@@ -1995,6 +2345,7 @@ def evaluate_signals_and_trade(
                     rsi=rsi_val,
                     adx=adx_val,
                     **{k: v for k, v in ledger_kwargs.items() if v is not None},
+                    **combined_metadata,
                 )
                 # Use the exact entry_price and timestamp
                 # as written by the ledger (after slippage & rounding)
@@ -2009,6 +2360,22 @@ def evaluate_signals_and_trade(
                 if logged_price is None:
                     # Fallback (should not happen): approximate using same computation
                     logged_price = round(entry_raw * (1 + 0.002), 4)
+                position_extra_fields = dict(combined_metadata)
+                position_extra_fields.update(
+                    {
+                        "atr": float(atr_value),
+                        "atr_pct": float(atr_pct),
+                        "sl_atr_mult": float(sl_mult),
+                        "tp_atr_mult": float(tp_mult),
+                        "sl_distance": float(sl_distance_abs),
+                        "tp_distance": float(tp_distance_abs),
+                        "trend_strength": float(trend_strength),
+                        "ppo_used": bool(ppo_used),
+                        "ppo_source": ppo_source,
+                        "sl_distance_abs": float(sl_distance_abs),
+                        "tp_distance_abs": float(tp_distance_abs),
+                    }
+                )
                 position_manager.open_position(
                     trade_id=trade_id,
                     pair=pair,
@@ -2019,6 +2386,7 @@ def evaluate_signals_and_trade(
                     entry_adx=adx_val,
                     entry_rsi=rsi_val,
                     timestamp=logged_ts,
+                    extra_fields=position_extra_fields,
                 )
                 try:
                     Path("logs").mkdir(parents=True, exist_ok=True)
@@ -2245,19 +2613,23 @@ def evaluate_signals_and_trade(
         logger.info("No exit conditions triggered.")
 
     # Shadow test result logging
-    shadow_path = "logs/shadow_test_results.jsonl"
+    # Moved minimal shadow metrics to a separate observations log to avoid mixing schemas
+    obs_path = "logs/shadow_cycle_observations.jsonl"
     win_count = sum(1 for e in exits if e[2] == "TAKE_PROFIT")
-    with open(shadow_path, "a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                {
-                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                    "win_rate": win_count / len(exits) if exits else 0.0,
-                    "num_exits": len(exits),
-                }
+    try:
+        with open(obs_path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                        "win_rate": win_count / len(exits) if exits else 0.0,
+                        "num_exits": len(exits),
+                    }
+                )
+                + "\n"
             )
-            + "\n"
-        )
+    except (OSError, ValueError, TypeError):
+        logger.debug("Failed writing shadow cycle observation", exc_info=True)
 
     _maybe_write_state_checkpoint(
         {
@@ -2431,4 +2803,16 @@ def check_and_close_exits(ctx=None, **kwargs) -> int:
 
 
 if __name__ == "__main__":
-    evaluate_signals_and_trade()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Trading logic runner")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Execute a single evaluation cycle without live order submission.",
+    )
+    args, _unknown = parser.parse_known_args()
+    if args.dry_run:
+        evaluate_signals_and_trade(check_exits_only=False)
+    else:
+        evaluate_signals_and_trade()

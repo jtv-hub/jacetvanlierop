@@ -7,7 +7,6 @@ and trade syncing using a class-based approach.
 
 # pylint: disable=too-many-lines
 
-import fcntl
 import json
 import logging
 import math
@@ -17,8 +16,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from crypto_trading_bot import config as bot_config
 from crypto_trading_bot.bot.utils.alerts import send_alert
@@ -26,6 +25,8 @@ from crypto_trading_bot.bot.utils.log_rotation import get_anomalies_logger
 from crypto_trading_bot.bot.utils.schema_validator import validate_trade_schema
 from crypto_trading_bot.config import CONFIG, IS_LIVE
 from crypto_trading_bot.db.sqlite_adapter import SQLiteAdapter
+from crypto_trading_bot.safety import risk_guard
+from crypto_trading_bot.utils.file_locks import advisory_lock
 from crypto_trading_bot.utils.kraken_client import get_usdc_balance, kraken_get_balance
 from crypto_trading_bot.utils.system_logger import (
     SYSTEM_LOG_PATH as SHARED_SYSTEM_LOG_PATH,
@@ -40,28 +41,33 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "0") == "1"
 TRADES_LOG_PATH = "logs/trades.log"
 SYSTEM_LOG_PATH = str(SHARED_SYSTEM_LOG_PATH)
 POSITIONS_PATH = "logs/positions.jsonl"
+LEDGER_STATE_PATH = Path("logs/ledger_state.json")
 SLIPPAGE = 0.002  # default fallback; per-asset slippage from CONFIG overrides this
 
 # System logger (warnings/errors/debug) to logs/system.log
 system_logger = get_system_logger()
 
-# Trade logger (message-only JSON lines) to logs/trades.log
+# Trade logger for observers/tests; no default file writes (handled manually)
 trade_logger = logging.getLogger("trade_ledger.trades")
 if not trade_logger.hasHandlers():
-    os.makedirs("logs", exist_ok=True)
-    trade_handler = RotatingFileHandler(
-        TRADES_LOG_PATH,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    trade_handler.setFormatter(logging.Formatter("%(message)s"))
-    trade_logger.addHandler(trade_handler)
-    trade_logger.setLevel(logging.INFO)
-    trade_logger.propagate = False
+    trade_logger.addHandler(logging.NullHandler())
 
 # Shared anomalies logger (compact JSONL)
 anomalies_logger = get_anomalies_logger()
+
+
+class _RiskGuardProxy:
+    """Thin adapter so ledger code can request pauses without tight coupling."""
+
+    @staticmethod
+    def pause(*, reason: str) -> None:
+        try:
+            risk_guard.activate_pause(reason=reason, trigger="ledger_limit")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            system_logger.error("[ledger] Failed to activate risk guard pause: %s", exc)
+
+
+_rg = _RiskGuardProxy()
 
 _MISSING_TRADE_ALERT_LIMIT = int(os.getenv("MISSING_TRADE_ALERT_LIMIT", "2"))
 _MISSING_TRADE_WINDOW_SECONDS = float(os.getenv("MISSING_TRADE_ALERT_WINDOW", "300"))
@@ -138,6 +144,80 @@ def _calculate_balance_delta(entry_balance: Any, exit_balance: Any) -> float | N
     except InvalidOperation:
         return None
     return float(quantized)
+
+
+def _ledger_series(trades: List[dict]) -> list[tuple[datetime, float]]:
+    """Return closed-trade ROI series sorted chronologically."""
+
+    series: list[tuple[datetime, float]] = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        status = str(trade.get("status") or "").lower()
+        if status != "closed":
+            continue
+        roi_val = _safe_float(trade.get("roi"))
+        if roi_val is None:
+            continue
+        ts = _parse_iso_datetime(trade.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)
+        series.append((ts, roi_val))
+    series.sort(key=lambda item: item[0])
+    return series
+
+
+def _ledger_metrics(trades: List[dict]) -> dict[str, Any]:
+    """Compute drawdown/loss streak metrics for ledger_state snapshots."""
+
+    series = _ledger_series(trades)
+    total = len(series)
+    if not series:
+        return {
+            "total_closed_trades": 0,
+            "drawdown_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "last_drawdown": 0.0,
+            "loss_streak": 0,
+            "max_consecutive_losses": 0,
+            "last_roi": 0.0,
+        }
+
+    equity = 1.0
+    peak = 1.0
+    current_dd = 0.0
+    max_dd = 0.0
+    loss_streak = 0
+    max_loss_streak = 0
+    last_roi = 0.0
+
+    for _, roi in series:
+        last_roi = roi
+        equity *= 1.0 + roi
+        if equity > peak:
+            peak = equity
+            current_dd = 0.0
+        elif peak > 0:
+            current_dd = (peak - equity) / peak
+            if current_dd > max_dd:
+                max_dd = current_dd
+        else:
+            current_dd = 0.0
+
+        if roi < 0:
+            loss_streak += 1
+            if loss_streak > max_loss_streak:
+                max_loss_streak = loss_streak
+        else:
+            loss_streak = 0
+
+    return {
+        "total_closed_trades": total,
+        "drawdown_pct": round(current_dd, 6),
+        "last_drawdown": round(current_dd, 6),
+        "max_drawdown_pct": round(max_dd, 6),
+        "loss_streak": loss_streak,
+        "max_consecutive_losses": max_loss_streak,
+        "last_roi": float(last_roi),
+    }
 
 
 def _canonical_exit_reason(*candidates: Any) -> tuple[str, str]:
@@ -440,6 +520,57 @@ class TradeLedger:
         else:
             trade["balance_delta"] = existing_delta
 
+    def _persist_ledger_state(self, snapshot: dict[str, Any]) -> None:
+        """Write ledger_state.json while holding an advisory lock."""
+
+        try:
+            LEDGER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(LEDGER_STATE_PATH, "a+", encoding="utf-8") as handle:
+                with advisory_lock(handle):
+                    handle.seek(0)
+                    handle.truncate(0)
+                    json.dump(snapshot, handle, indent=2, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        except (OSError, IOError, TypeError, ValueError) as exc:
+            system_logger.error("Failed to persist ledger_state.json: %s", exc)
+
+    def _enforce_risk_limits(self, snapshot: dict[str, Any]) -> None:
+        """Trigger auto-pause when drawdown or loss streak limits are exceeded."""
+
+        risk_cfg = CONFIG.get("risk", {}) or {}
+        drawdown_limit = float(risk_cfg.get("max_drawdown_pct", 0.0) or 0.0)
+        loss_limit = int(risk_cfg.get("max_consecutive_losses", 0) or 0)
+        drawdown_pct = float(snapshot.get("drawdown_pct", 0.0) or 0.0)
+        loss_streak = int(snapshot.get("loss_streak", 0) or 0)
+
+        if drawdown_limit > 0 and drawdown_pct >= drawdown_limit:
+            _rg.pause(reason=f"drawdown_limit:{drawdown_pct:.3f}")
+            system_logger.critical(
+                "Auto-pause: drawdown=%.3f >= limit=%.3f",
+                drawdown_pct,
+                drawdown_limit,
+            )
+
+        if loss_limit > 0 and loss_streak >= loss_limit:
+            _rg.pause(reason=f"loss_streak:{loss_streak}")
+            system_logger.critical(
+                "Auto-pause: loss_streak=%s >= limit=%s",
+                loss_streak,
+                loss_limit,
+            )
+
+    def _update_ledger_state(self) -> None:
+        """Recompute ledger metrics, persist snapshot, and enforce limits."""
+
+        try:
+            snapshot = _ledger_metrics(self.trades)
+            snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._persist_ledger_state(snapshot)
+            self._enforce_risk_limits(snapshot)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            system_logger.error("Failed to refresh ledger state metrics: %s", exc)
+
     def _find_recent_duplicate(self, trade: dict) -> dict | None:
         """Return an existing trade that matches the provided signature."""
 
@@ -683,6 +814,8 @@ class TradeLedger:
         except (TypeError, ValueError):
             fill_price_value = None
 
+        holding_period_default = kwargs.get("holding_period_days", 0)
+
         trade = {
             "trade_id": trade_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -698,8 +831,8 @@ class TradeLedger:
             # Persist side so downstream logic can apply correct exit behavior
             "side": side_norm,
             "exit_price": None,
-            "realized_gain": None,
-            "holding_period_days": None,
+            "realized_gain": kwargs.get("realized_gain"),
+            "holding_period_days": holding_period_default,
             "roi": None,
             "reason": None,
             "regime": regime,
@@ -723,6 +856,49 @@ class TradeLedger:
             "source": source_flag,
             "pending_reconciliation_at": pending_at,
         }
+        cost_basis_value = trade.get("cost_basis", 0.0)
+        try:
+            cost_basis_value = round(float(cost_basis_value), 4)
+        except (TypeError, ValueError):
+            cost_basis_value = 0.0
+        trade["cost_basis"] = cost_basis_value
+        realized_gain_value = trade.get("realized_gain", 0.0)
+        try:
+            realized_gain_value = float(realized_gain_value)
+        except (TypeError, ValueError):
+            realized_gain_value = 0.0
+        trade["realized_gain"] = realized_gain_value
+
+        meta_fields = (
+            "ppo_used",
+            "ppo_agent_confidence",
+            "ppo_size_scalar",
+            "rl_source",
+            "ppo_source",
+            "hybrid",
+            "hybrid_weight",
+            "confidence_blend",
+            "atr_sizing_scalar",
+        )
+        for meta_field in meta_fields:
+            if meta_field in kwargs and kwargs[meta_field] is not None:
+                trade[meta_field] = kwargs[meta_field]
+
+        risk_fields = (
+            "atr",
+            "atr_value",
+            "atr_pct",
+            "sl_atr_mult",
+            "tp_atr_mult",
+            "sl_distance",
+            "tp_distance",
+            "sl_distance_abs",
+            "tp_distance_abs",
+            "trend_strength",
+        )
+        for risk_field in risk_fields:
+            if risk_field in kwargs and kwargs[risk_field] is not None:
+                trade[risk_field] = kwargs[risk_field]
 
         # Debug: emit the trade being logged for diagnostics (opt-in)
         if DEBUG_MODE:
@@ -850,8 +1026,17 @@ class TradeLedger:
                     trade_id,
                 )
 
-        # Write compact, one-line JSON to trades.log via trade_logger
-        trade_logger.info(json.dumps(trade, separators=(",", ":")))
+        # Write compact, one-line JSON to trades.log with advisory lock
+        directory = os.path.dirname(TRADES_LOG_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        line = json.dumps(trade, separators=(",", ":"))
+        with open(TRADES_LOG_PATH, "a", encoding="utf-8") as locked_file:
+            with advisory_lock(locked_file):
+                locked_file.write(line + "\n")
+                locked_file.flush()
+                os.fsync(locked_file.fileno())
+        trade_logger.info(line)
         self.trades.append(trade)
         self.trade_index[trade_id] = trade
         if normalized_txid:
@@ -926,13 +1111,12 @@ class TradeLedger:
             roi=trade.get("roi"),
         )
 
-        with open(POSITIONS_PATH, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            json.dump(trade, f)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-            fcntl.flock(f, fcntl.LOCK_UN)
+        with open(POSITIONS_PATH, "a", encoding="utf-8") as locked_file:
+            with advisory_lock(locked_file):
+                json.dump(trade, locked_file)
+                locked_file.write("\n")
+                locked_file.flush()
+                os.fsync(locked_file.fileno())
         system_logger.debug("Position %s written to positions.jsonl", trade_id)
 
     def update_trade(self, trade_id, exit_price, reason, exit_reason=None):
@@ -1027,7 +1211,47 @@ class TradeLedger:
                             "roi": None,
                             "reason": None,
                             "regime": "unknown",
+                            "ppo_used": pos.get("ppo_used"),
+                            "ppo_agent_confidence": pos.get("ppo_agent_confidence"),
+                            "ppo_size_scalar": pos.get("ppo_size_scalar"),
+                            "rl_source": pos.get("rl_source"),
+                            "hybrid": pos.get("hybrid"),
+                            "hybrid_weight": pos.get("hybrid_weight"),
+                            "confidence_blend": pos.get("confidence_blend"),
+                            "ppo_source": pos.get("ppo_source") or pos.get("rl_source"),
+                            "atr": pos.get("atr_value"),
+                            "atr_value": pos.get("atr_value"),
+                            "atr_pct": pos.get("atr_pct"),
+                            "sl_atr_mult": pos.get("sl_atr_mult"),
+                            "tp_atr_mult": pos.get("tp_atr_mult"),
+                            "sl_distance": pos.get("sl_distance") or pos.get("sl_distance_abs"),
+                            "sl_distance_abs": pos.get("sl_distance_abs"),
+                            "tp_distance": pos.get("tp_distance") or pos.get("tp_distance_abs"),
+                            "tp_distance_abs": pos.get("tp_distance_abs"),
+                            "trend_strength": pos.get("trend_strength"),
+                            "atr_sizing_scalar": pos.get("atr_sizing_scalar"),
                         }
+                        extra_fields = (
+                            "ppo_used",
+                            "ppo_agent_confidence",
+                            "ppo_size_scalar",
+                            "rl_source",
+                            "ppo_source",
+                            "hybrid",
+                            "hybrid_weight",
+                            "confidence_blend",
+                            "atr_sizing_scalar",
+                            "atr",
+                            "atr_pct",
+                            "sl_atr_mult",
+                            "tp_atr_mult",
+                            "sl_distance",
+                            "tp_distance",
+                            "trend_strength",
+                        )
+                        for field in extra_fields:
+                            if field in pos:
+                                trade[field] = pos[field]
                         trades.append(trade)
                         self.trade_index[trade_id] = trade
                         system_logger.warning("Synced missing trade %s from position", trade_id)
@@ -1263,20 +1487,16 @@ class TradeLedger:
                     except Exception:
                         system_logger.warning("SQLite insert (update) failed for trade %s", trade_id, exc_info=True)
 
-                    # Safely rewrite trades.log with exclusive lock held on source
-                    temp_path = TRADES_LOG_PATH + ".tmp"
-                    with open(TRADES_LOG_PATH, "r+", encoding="utf-8") as src:
-                        fcntl.flock(src, fcntl.LOCK_EX)
-                        try:
-                            with open(temp_path, "w", encoding="utf-8") as f:
-                                for t in trades:
-                                    if t is not None:
-                                        f.write(json.dumps(t) + "\n")
-                                f.flush()
-                                os.fsync(f.fileno())
-                            os.replace(temp_path, TRADES_LOG_PATH)
-                        finally:
-                            fcntl.flock(src, fcntl.LOCK_UN)
+                    # Safely rewrite trades.log while holding an exclusive lock
+                    with open(TRADES_LOG_PATH, "r+", encoding="utf-8") as locked_trades:
+                        with advisory_lock(locked_trades):
+                            locked_trades.seek(0)
+                            locked_trades.truncate(0)
+                            for t in trades:
+                                if t is not None:
+                                    locked_trades.write(json.dumps(t) + "\n")
+                            locked_trades.flush()
+                            os.fsync(locked_trades.fileno())
                     self.trades = trades
                     self.trade_index = {}
                     for trade in trades:
@@ -1290,26 +1510,26 @@ class TradeLedger:
                     # Safely resync positions.jsonl by removing the closed position
                     try:
                         if os.path.exists(POSITIONS_PATH):
-                            tmp_pos = POSITIONS_PATH + ".tmp"
-                            with open(POSITIONS_PATH, "r", encoding="utf-8") as src:
-                                with open(tmp_pos, "w", encoding="utf-8") as dst:
-                                    fcntl.flock(dst, fcntl.LOCK_EX)
-                                    try:
-                                        for line in src:
-                                            try:
-                                                obj = json.loads(line)
-                                                if obj.get("trade_id") == trade_id:
-                                                    # skip removed position
-                                                    continue
-                                            except json.JSONDecodeError:
-                                                # preserve unparseable lines as-is
-                                                pass
-                                            dst.write(line)
-                                        dst.flush()
-                                        os.fsync(dst.fileno())
-                                    finally:
-                                        fcntl.flock(dst, fcntl.LOCK_UN)
-                            os.replace(tmp_pos, POSITIONS_PATH)
+                            with open(POSITIONS_PATH, "r+", encoding="utf-8") as locked_positions:
+                                with advisory_lock(locked_positions):
+                                    locked_positions.seek(0)
+                                    preserved_lines: list[str] = []
+                                    for line in locked_positions:
+                                        write_line = True
+                                        try:
+                                            obj = json.loads(line)
+                                            if obj.get("trade_id") == trade_id:
+                                                write_line = False
+                                        except json.JSONDecodeError:
+                                            write_line = True
+                                        if write_line:
+                                            preserved_lines.append(line if line.endswith("\n") else line + "\n")
+                                    locked_positions.seek(0)
+                                    locked_positions.truncate(0)
+                                    for line in preserved_lines:
+                                        locked_positions.write(line)
+                                    locked_positions.flush()
+                                    os.fsync(locked_positions.fileno())
                             system_logger.debug(
                                 "Synchronized positions.jsonl — removed closed position %s",
                                 trade_id,
@@ -1320,6 +1540,7 @@ class TradeLedger:
                             trade_id,
                             e,
                         )
+                    self._update_ledger_state()
                 else:
                     # If trade is already closed, treat this as idempotent
                     existing = next(
@@ -1355,6 +1576,7 @@ class TradeLedger:
         self.trades = []
         self.txid_index = {}
         legacy_mutations = False
+        legacy_fix_count = 0
         if os.path.exists(TRADES_LOG_PATH):
             with open(TRADES_LOG_PATH, "r", encoding="utf-8") as f:
                 for line in f:
@@ -1362,6 +1584,24 @@ class TradeLedger:
                         continue
                     try:
                         trade = json.loads(line)
+                        if not isinstance(trade, dict):
+                            continue
+                        if "tax_method" not in trade:
+                            trade["tax_method"] = "FIFO"
+                            legacy_mutations = True
+                            legacy_fix_count += 1
+                        if "cost_basis" not in trade:
+                            trade["cost_basis"] = 0.0
+                            legacy_mutations = True
+                            legacy_fix_count += 1
+                        if "realized_gain" not in trade:
+                            trade["realized_gain"] = 0.0
+                            legacy_mutations = True
+                            legacy_fix_count += 1
+                        if "holding_period_days" not in trade:
+                            trade["holding_period_days"] = 0
+                            legacy_mutations = True
+                            legacy_fix_count += 1
                         if trade.get("trade_id"):
                             # Populate defaults for backward compatibility
                             trade.setdefault("txid", None)
@@ -1381,6 +1621,7 @@ class TradeLedger:
                                 trade["txid"] = []
                             if _ensure_closed_trade_metadata(trade):
                                 legacy_mutations = True
+                                legacy_fix_count += 1
                             self.trades.append(trade)
                     except json.JSONDecodeError as e:
                         raw = line.strip()
@@ -1407,7 +1648,8 @@ class TradeLedger:
             system_logger.info("No trades.log file found.")
         if legacy_mutations:
             system_logger.info(
-                "Detected legacy trade entries missing metadata; rewriting trades.log.",
+                "Detected %d legacy trade entries missing metadata; rewriting trades.log.",
+                legacy_fix_count,
             )
             self._rewrite_trades_file()
         latest_balance: Optional[float] = None
@@ -1416,6 +1658,7 @@ class TradeLedger:
             if acct_value is not None:
                 latest_balance = acct_value
         self.account_balance = latest_balance
+        self._update_ledger_state()
         return self.trades
 
     def _rewrite_trades_file(self) -> None:
@@ -1425,8 +1668,13 @@ class TradeLedger:
         if directory:
             os.makedirs(directory, exist_ok=True)
         with open(TRADES_LOG_PATH, "w", encoding="utf-8") as handle:
-            for trade in self.trades:
-                handle.write(json.dumps(trade, separators=(",", ":")) + "\n")
+            with advisory_lock(handle):
+                for trade in self.trades:
+                    handle.write(json.dumps(trade, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def mark_pending_reconciliation(
         self,

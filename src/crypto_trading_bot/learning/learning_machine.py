@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 from typing import Dict, List
 
 try:
@@ -25,6 +26,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from crypto_trading_bot.bot.utils.log_rotation import get_rotating_handler
 from crypto_trading_bot.risk.risk_manager import get_dynamic_buffer
+from crypto_trading_bot.rl import deploy_gate
 
 logger = logging.getLogger("learning_machine")
 logger.setLevel(logging.INFO)
@@ -34,6 +36,36 @@ if not logger.hasHandlers():
     # Dedicated debug/ops log for this module as requested
     logger.addHandler(get_rotating_handler("learning_machine.log"))
     logger.propagate = False
+
+SHADOW_RESULTS_PATH = "logs/shadow_test_results.jsonl"
+# PPO model artifact defaults (avoid circular imports by defining paths here)
+PPO_MODEL_CANDIDATE = "models/ppo_agent_v1.zip"
+PPO_MODEL_METADATA = "models/ppo_agent_v1_meta.json"
+
+
+def _safe_float(value, default=0.0):
+    """Return a finite float or default."""
+    try:
+        result = float(value)
+        if math.isnan(result) or math.isinf(result):
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
+
+
+def _model_age_days(timestamp: str | None) -> float:
+    """Convert ISO timestamp into age in days."""
+    if not timestamp:
+        return 0.0
+    try:
+        dt_val = datetime.datetime.fromisoformat(timestamp)
+    except ValueError:
+        return 0.0
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=datetime.UTC)
+    delta = datetime.datetime.now(datetime.UTC) - dt_val
+    return _safe_float(delta.total_seconds() / 86400.0)
 
 
 def _is_valid_learning_trade(trade: dict) -> bool:
@@ -319,6 +351,159 @@ def _evaluate_shadow_promotions(
             handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
 
+def _max_drawdown_from_rois(rois: List[float]) -> float:
+    equity = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    for roi in rois:
+        equity *= 1 + roi
+        peak = max(peak, equity)
+        if peak <= 0:
+            continue
+        drawdown = (peak - equity) / peak
+        max_drawdown = max(max_drawdown, drawdown)
+    return max_drawdown
+
+
+def _shadow_summary_metrics(rois: List[float]) -> Dict[str, float]:
+    total = len(rois)
+    if total == 0:
+        return {
+            "total_trades": 0.0,
+            "win_rate": 0.0,
+            "avg_roi": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown_pct": 0.0,
+        }
+    wins = sum(1 for roi in rois if roi > 0)
+    win_rate = wins / total
+    avg_roi = sum(rois) / total
+    if total > 1:
+        variance = sum((roi - avg_roi) ** 2 for roi in rois) / total
+        std_dev = math.sqrt(variance)
+    else:
+        std_dev = 0.0
+    sharpe = avg_roi / std_dev if std_dev > 0 else 0.0
+    max_drawdown = _max_drawdown_from_rois(rois)
+    return {
+        "total_trades": float(total),
+        "win_rate": win_rate,
+        "avg_roi": avg_roi,
+        "sharpe": sharpe,
+        "max_drawdown_pct": max_drawdown,
+    }
+
+
+def _load_model_metadata(path: str = PPO_MODEL_METADATA) -> Dict[str, str]:
+    """Load PPO model metadata JSON if available.
+
+    Returns an empty dict on any error and logs a warning for missing files.
+    """
+    try:
+        meta_path = Path(path)
+        if not meta_path.exists():
+            logger.warning("PPO model metadata not found: %s", str(meta_path))
+            return {}
+        with meta_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+            logger.warning("PPO metadata not a dict: %s", str(meta_path))
+            return {}
+    except FileNotFoundError:
+        logger.warning("PPO model metadata file missing: %s", path)
+        return {}
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid PPO metadata JSON at %s: %s", path, exc)
+        return {}
+    except OSError as exc:
+        logger.warning("Error reading PPO metadata at %s: %s", path, exc)
+        return {}
+
+
+def append_shadow_summary(
+    *,
+    strategy_name: str,
+    exit_reason_distribution: Dict[str, int],
+    win_rate: float,
+    sharpe_ratio: float,
+    average_roi: float,
+    risk_adjusted_roi: float,
+    max_drawdown: float,
+    num_trades: int,
+    model_path: str | None,
+    model_age_days: float | None = None,
+    model_timestamp: str | None = None,
+    shadow_passed: bool,
+) -> None:
+    """Persist a single shadow summary row and trigger deployment gate."""
+
+    safe_exit_distribution = {str(k): int(v) for k, v in (exit_reason_distribution or {}).items()}
+    computed_age_days = _safe_float(model_age_days) if model_age_days is not None else _model_age_days(model_timestamp)
+
+    avg_roi_value = _safe_float(average_roi)
+    sharpe_value = _safe_float(sharpe_ratio)
+    max_dd_value = _safe_float(max_drawdown)
+    row = {
+        "summary": True,
+        "type": "ppo_shadow_summary",
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        "strategy_name": strategy_name or "aggregate",
+        "exit_reason_distribution": safe_exit_distribution,
+        "win_rate": _safe_float(win_rate),
+        "sharpe_ratio": sharpe_value,
+        "average_roi": avg_roi_value,
+        "risk_adjusted_roi": _safe_float(risk_adjusted_roi),
+        "max_drawdown": max_dd_value,
+        "num_trades": int(num_trades),
+        "shadow_passed": bool(shadow_passed),
+        "model_path": model_path or "",
+        "model_age_days": computed_age_days,
+        "model_timestamp": model_timestamp or "",
+        # Compatibility aliases for downstream tooling
+        "avg_roi": avg_roi_value,
+        "sharpe": sharpe_value,
+        "max_drawdown_pct": max_dd_value,
+        "total_trades": int(num_trades),
+    }
+
+    try:
+        os.makedirs(os.path.dirname(SHADOW_RESULTS_PATH), exist_ok=True)
+        with open(SHADOW_RESULTS_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        logger.info(
+            "[shadow] summary written",
+            extra={
+                "strategy": row["strategy_name"],
+                "win_rate": row["win_rate"],
+                "sharpe_ratio": row["sharpe_ratio"],
+                "max_drawdown": row["max_drawdown"],
+                "num_trades": row["num_trades"],
+                "risk_adjusted_roi": row["risk_adjusted_roi"],
+                "shadow_passed": row["shadow_passed"],
+                "model_path": row["model_path"],
+            },
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("Failed to write shadow summary: %s", exc)
+        return
+
+    try:
+        decision = deploy_gate.check_and_approve(model_path=row["model_path"] or deploy_gate.DEFAULT_MODEL_CANDIDATE)
+        logger.info(
+            "[shadow] deploy gate evaluated",
+            extra={
+                "approved": decision.get("approved"),
+                "reason": decision.get("reason"),
+            },
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "Deploy gate check failed after shadow summary",
+            extra={"error": str(exc)},
+        )
+
+
 def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> int:
     """Generate simple learning suggestions and append to JSONL file.
 
@@ -463,49 +648,105 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             )
     # Shadow test recent performance per suggested strategy
     try:
-        _shadow_log_path = "logs/shadow_test_results.jsonl"
-        os.makedirs(os.path.dirname(_shadow_log_path), exist_ok=True)
-        recent_trades = load_trades()
-        recent_trades = recent_trades[-100:]
+        recent_trades = load_trades()[-100:]
+        exit_reason_counts: Dict[str, int] = {}
+        rois_all: List[float] = []
+        for trade in recent_trades:
+            reason_val = trade.get("exit_reason") or trade.get("reason") or trade.get("status") or "unknown"
+            reason_key = str(reason_val).lower()
+            exit_reason_counts[reason_key] = exit_reason_counts.get(reason_key, 0) + 1
+            try:
+                rois_all.append(float(trade.get("roi")))
+            except (TypeError, ValueError):
+                continue
+
         if recent_trades and suggestions:
-            # Aggregate by strategy from recent closed trades
+            # Aggregate by strategy from recent closed trades for diagnostics
             by_strategy: Dict[str, List[dict]] = {}
             for t in recent_trades:
                 strat = t.get("strategy") or "Unknown"
                 by_strategy.setdefault(strat, []).append(t)
-            with open(_shadow_log_path, "a", encoding="utf-8") as sf:
-                for s in suggestions:
-                    strat = s.get("strategy") or s.get("strategy_name") or "Unknown"
-                    rows = by_strategy.get(strat, [])
-                    if not rows:
+
+            for suggestion in suggestions:
+                strat = suggestion.get("strategy") or suggestion.get("strategy_name") or "Unknown"
+                rows = by_strategy.get(strat, [])
+                if not rows:
+                    continue
+                rois = []
+                for row in rows:
+                    try:
+                        rois.append(float(row.get("roi")))
+                    except (TypeError, ValueError):
                         continue
-                    rois = []
-                    for r in rows:
-                        try:
-                            rois.append(float(r.get("roi")))
-                        except (TypeError, ValueError):
-                            continue
-                    if not rois:
-                        continue
-                    wins = sum(1 for x in rois if x > 0)
-                    total = len(rois)
-                    success_rate = wins / total if total else 0.0
-                    avg_roi = float(sum(rois) / total) if total else 0.0
-                    conf_val = s.get("confidence_after") or s.get("suggested_confidence") or s.get("confidence")
-                    rec = {
-                        "timestamp": ts,
-                        "strategy": strat,
-                        "success_rate": round(success_rate, 4),
-                        "avg_roi": round(avg_roi, 6),
-                        "confidence": conf_val,
-                    }
-                    sf.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                    logger.info(
-                        "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f",
-                        strat,
-                        success_rate * 100,
-                        avg_roi,
-                    )
+                if not rois:
+                    continue
+                wins = sum(1 for value in rois if value > 0)
+                total = len(rois)
+                success_rate = wins / total if total else 0.0
+                avg_roi = float(sum(rois) / total) if total else 0.0
+                conf_val_raw = (
+                    suggestion.get("confidence_after")
+                    or suggestion.get("suggested_confidence")
+                    or suggestion.get("confidence")
+                )
+                rule_conf_raw = (
+                    suggestion.get("confidence_before")
+                    or suggestion.get("current_confidence")
+                    or suggestion.get("confidence")
+                )
+                try:
+                    conf_val = float(conf_val_raw)
+                except (TypeError, ValueError):
+                    conf_val = None
+                try:
+                    rule_conf_val = float(rule_conf_raw)
+                except (TypeError, ValueError):
+                    rule_conf_val = None
+                drift_val = None
+                if conf_val is not None and rule_conf_val is not None:
+                    drift_val = conf_val - rule_conf_val
+
+                logger.info(
+                    "[SHADOW TEST] %s -> %.2f%%, ROI=%.2f drift=%s",
+                    strat,
+                    success_rate * 100,
+                    avg_roi,
+                    round(drift_val, 6) if drift_val is not None else "n/a",
+                )
+
+        if rois_all:
+            summary_metrics = _shadow_summary_metrics(rois_all)
+            metadata = _load_model_metadata(PPO_MODEL_METADATA)
+            avg_roi_metric = _safe_float(summary_metrics["avg_roi"])
+            win_rate_metric = _safe_float(summary_metrics["win_rate"])
+            max_dd_metric = _safe_float(summary_metrics["max_drawdown_pct"], 1e-6)
+            risk_adjusted = (
+                _safe_float(avg_roi_metric * win_rate_metric / max(max_dd_metric, 1e-6)) if max_dd_metric > 0 else 0.0
+            )
+            model_path_value = str(metadata.get("model_path") or PPO_MODEL_CANDIDATE)
+            model_timestamp = metadata.get("timestamp")
+            shadow_passed = (
+                summary_metrics["total_trades"] >= 100
+                and win_rate_metric >= 0.6
+                and risk_adjusted >= 0.18
+                and summary_metrics["max_drawdown_pct"] <= 0.10
+            )
+            append_shadow_summary(
+                strategy_name="aggregate",
+                exit_reason_distribution=exit_reason_counts,
+                win_rate=win_rate_metric,
+                sharpe_ratio=_safe_float(summary_metrics["sharpe"]),
+                average_roi=avg_roi_metric,
+                risk_adjusted_roi=risk_adjusted,
+                max_drawdown=_safe_float(summary_metrics["max_drawdown_pct"]),
+                num_trades=int(summary_metrics["total_trades"]),
+                model_path=model_path_value,
+                model_age_days=_model_age_days(model_timestamp),
+                model_timestamp=model_timestamp,
+                shadow_passed=shadow_passed,
+            )
+        else:
+            logger.info("Skipping shadow summary generation; insufficient ROI samples")
     except (OSError, ValueError, TypeError) as _e:  # pragma: no cover - diagnostics only
         logger.info("Shadow test logging skipped: %s", _e)
 

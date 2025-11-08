@@ -8,7 +8,7 @@ Used to standardize decision-making based on market conditions.
 """
 
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict
 
 from crypto_trading_bot.bot.state.portfolio_state import load_portfolio_state
 from crypto_trading_bot.config import CONFIG
@@ -28,6 +28,11 @@ class TradingContext:
         self.buffer_profile: Dict[str, float] = {}
         self.strategy_buffers: Dict[str, Dict[str, float]] = {}
         self._adx_cache: dict[str, float] = {}
+        self.regime_snapshot: Dict[str, Any] = {"label": "unknown", "trend_strength": 0.0}
+        self.drawdown_pct = 0.0
+        self.total_roi = 0.0
+        self.available_capital = 0.0
+        self.capital_buffer = self.buffer
 
         self.update_context()
 
@@ -37,8 +42,20 @@ class TradingContext:
         """
         snapshot = load_portfolio_state(refresh=True)
 
-        regime = snapshot.get("market_regime", "unknown")
-        self.regime = str(regime) if isinstance(regime, str) else "unknown"
+        regime_label = str(snapshot.get("market_regime", "unknown") or "unknown")
+        trend_strength = snapshot.get("trend_strength", 0.0)
+        try:
+            trend_strength = float(trend_strength)
+        except (TypeError, ValueError):
+            trend_strength = 0.0
+        regime_meta = snapshot.get("regime_meta")
+        if not isinstance(regime_meta, dict):
+            regime_meta = {}
+        regime_meta = dict(regime_meta)
+        regime_meta.setdefault("label", regime_label)
+        regime_meta.setdefault("trend_strength", trend_strength)
+        self.regime_snapshot = regime_meta
+        self.regime = regime_label
 
         raw_profile = snapshot.get("regime_capital_buffers") or {}
         self.buffer_profile = {}
@@ -55,6 +72,7 @@ class TradingContext:
             self.buffer = float(self.buffer_profile.get(self.regime, fallback_buffer))
         else:
             self.buffer = fallback_buffer
+        self.capital_buffer = self.buffer
 
         raw_strategy_buffers = snapshot.get("strategy_buffers") or {}
         parsed: Dict[str, Dict[str, float]] = {}
@@ -67,10 +85,24 @@ class TradingContext:
                     parsed[strategy][regime_key] = float(value)
         self.strategy_buffers = parsed
 
+        self.drawdown_pct = float(snapshot.get("drawdown_pct", 0.0) or 0.0)
+        self.total_roi = float(snapshot.get("total_roi", 0.0) or 0.0)
+        available_capital = snapshot.get("available_capital")
+        try:
+            self.available_capital = float(available_capital or 0.0)
+        except (TypeError, ValueError):
+            self.available_capital = 0.0
+
         self.last_updated = datetime.now(timezone.utc)
 
     def get_regime(self):
-        """Returns the current market regime."""
+        """Return the current regime snapshot."""
+        return self.regime_snapshot
+
+    def get_regime_label(self) -> str:
+        """Return the string label for the current regime."""
+        if isinstance(self.regime_snapshot, dict):
+            return str(self.regime_snapshot.get("label") or self.regime)
         return self.regime
 
     def get_buffer(self):
@@ -92,10 +124,19 @@ class TradingContext:
         """Returns a snapshot dictionary of the current context (timestamp, regime, buffer)."""
         return {
             "timestamp": self.last_updated.isoformat(),
-            "regime": self.regime,
+            "regime": self.get_regime_label(),
+            "regime_data": self.regime_snapshot,
             "buffer": self.buffer,
             "buffer_profile": self.buffer_profile,
             "strategy_buffers": self.strategy_buffers,
+            "drawdown_pct": self.drawdown_pct,
+            "total_roi": self.total_roi,
+            "capital_buffer": self.capital_buffer,
+            "trend_strength": (
+                float(self.regime_snapshot.get("trend_strength", 0.0))
+                if isinstance(self.regime_snapshot, dict)
+                else 0.0
+            ),
         }
 
     def get_adx(

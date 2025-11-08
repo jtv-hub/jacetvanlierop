@@ -12,14 +12,19 @@ import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-from crypto_trading_bot.bot.state.portfolio_state import (
-    get_reinvestment_rate,
-)
+from crypto_trading_bot.bot.state.portfolio_state import get_reinvestment_rate
 from crypto_trading_bot.bot.trading_logic import position_manager
+from crypto_trading_bot.config import CONFIG
 from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+
+try:
+    from crypto_trading_bot.bot.trading_logic import ppo_agent as _PPO_AGENT
+except Exception:  # pragma: no cover - allow CLI execution without PPO deps
+    _PPO_AGENT = None
 
 HEARTBEAT_LOG = "logs/daily_heartbeat.log"
 ANOMALIES_LOG = "logs/anomalies.log"
+PORTFOLIO_STATE_LOG = "logs/portfolio_state.json"
 
 
 def _log_setup():
@@ -80,6 +85,7 @@ def run_daily_tasks():
     """Run all daily scheduled maintenance tasks for the trading bot."""
     logger = _log_setup()
     logger.info("Running daily heartbeat tasks…")
+    _log_portfolio_snapshot(logger)
 
     try:
         # Refresh reinvestment rate (automatically refreshes if outdated)
@@ -138,5 +144,59 @@ def run_daily_tasks():
         _append_anomaly("Unhandled exception in daily heartbeat", {})
 
 
-if __name__ == "__main__":
+def _load_portfolio_snapshot() -> dict:
+    if not os.path.exists(PORTFOLIO_STATE_LOG):
+        return {}
+    try:
+        with open(PORTFOLIO_STATE_LOG, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _ppo_status() -> str:
+    agent = _PPO_AGENT
+    if agent is None:
+        return "N/A"
+    approver = getattr(agent, "is_approved", None)
+    try:
+        if callable(approver):
+            return str(bool(approver()))
+        if approver is not None:
+            return str(bool(approver))
+    except Exception:  # pragma: no cover - guard logging path
+        return "error"
+    return "N/A"
+
+
+def _log_portfolio_snapshot(logger):
+    snapshot = _load_portfolio_snapshot()
+    drawdown_pct = _to_float(snapshot.get("drawdown_pct"), 0.0)
+    capital = _to_float(snapshot.get("available_capital"), 0.0)
+    trend_strength = _to_float(snapshot.get("trend_strength"), 0.0)
+    ppo_mode = CONFIG.get("ppo", {}).get("mode", "disabled")
+    logger.info(
+        "Drawdown: %.2f%% | Live Capital: $%s | Trend Strength: %.2f | PPO Mode: %s | Approved: %s",
+        drawdown_pct * 100,
+        f"{capital:,.2f}",
+        trend_strength,
+        ppo_mode,
+        _ppo_status(),
+    )
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def main():
+    """CLI entrypoint."""
     run_daily_tasks()
+
+
+if __name__ == "__main__":
+    main()

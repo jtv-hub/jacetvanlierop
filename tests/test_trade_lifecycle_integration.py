@@ -50,7 +50,7 @@ def test_trade_lifecycle_integration(tmp_path, monkeypatch, request):
             trade_ledger_module.trade_logger.removeHandler(handler)
             try:
                 handler.close()
-            except Exception:  # pragma: no cover - defensive cleanup
+            except (OSError, ValueError):  # pragma: no cover - defensive cleanup
                 pass
         for handler in original_handlers:
             trade_ledger_module.trade_logger.addHandler(handler)

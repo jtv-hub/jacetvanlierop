@@ -22,7 +22,6 @@ from crypto_trading_bot.bot.simulation import collect_signal_snapshot
 from crypto_trading_bot.bot.utils.alerts import send_alert
 from crypto_trading_bot.config import CONFIG, IS_LIVE, ConfigurationError, is_live, set_live_mode
 from crypto_trading_bot.config.constants import KILL_SWITCH_FILE
-from crypto_trading_bot.ledger.ledger_access import get_ledger
 from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.safety.confirmation import require_live_confirmation
 from crypto_trading_bot.utils.price_history import get_fallback_metrics
@@ -255,8 +254,12 @@ def _ensure_no_mock_fallbacks() -> None:
         )
 
 
-def _ensure_missing_trade_health() -> None:
-    metrics = get_ledger().get_missing_trade_metrics(reset=False)
+def _ensure_missing_trade_health(ledger=None) -> None:
+    if ledger is None:
+        from crypto_trading_bot.ledger.ledger_access import get_ledger
+
+        ledger = get_ledger()
+    metrics = ledger.get_missing_trade_metrics(reset=False)
     for bucket, state in metrics.items():
         count = int(state.get("count", 0))
         suppressed = int(state.get("suppressed", 0))
@@ -459,6 +462,8 @@ def run_prelaunch_guard(
     alert_window_hours: int = _DEFAULT_WINDOW_HOURS,
     max_recent_high: int = _DEFAULT_MAX_HIGH,
 ) -> None:
+    from crypto_trading_bot.ledger.ledger_access import get_ledger
+
     ensure_system_capacity(min_disk_mb=500.0, min_mem_mb=256.0)
     _clear_kill_switch()
     _prune_log_noise(_ALERT_LOG_PATH)
@@ -504,7 +509,8 @@ def run_prelaunch_guard(
         logger.info("Prelaunch guard running while is_live is already True; continuing checks.")
 
     _ensure_no_mock_fallbacks()
-    _ensure_missing_trade_health()
+    ledger = get_ledger()
+    _ensure_missing_trade_health(ledger)
 
     pairs_list = list(pairs) if pairs is not None else list(CONFIG.get("tradable_pairs", []))
     _run_mode_compare(pairs_list)

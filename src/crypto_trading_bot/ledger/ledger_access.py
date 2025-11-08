@@ -2,27 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from crypto_trading_bot.ledger.trade_ledger import TradeLedger
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from crypto_trading_bot.ledger.trade_ledger import TradeLedger
 
-_LEDGER: TradeLedger | None = None
+_LEDGER_SINGLETON = None
 
 
-def get_ledger(position_manager: Any | None = None) -> TradeLedger:
+def get_ledger(position_manager: Any | None = None) -> "TradeLedger":
     """Return the shared ``TradeLedger`` instance, initialising it lazily."""
 
-    global _LEDGER
+    from crypto_trading_bot.ledger.trade_ledger import TradeLedger  # local import
 
-    if _LEDGER is None:
+    global _LEDGER_SINGLETON  # pylint: disable=global-statement
+
+    if _LEDGER_SINGLETON is None:
         if position_manager is None:
             from crypto_trading_bot.bot import trading_logic
 
             position_manager = trading_logic.position_manager
 
-        _LEDGER = TradeLedger(position_manager)
+        _LEDGER_SINGLETON = TradeLedger(position_manager)
 
-    return _LEDGER
+    return _LEDGER_SINGLETON
 
 
 __all__ = ["get_ledger"]

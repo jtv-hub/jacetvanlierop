@@ -10,6 +10,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
 from crypto_trading_bot.bot.state.portfolio_state import (
     load_portfolio_state,
@@ -40,15 +41,75 @@ from crypto_trading_bot.scripts.suggest_top_configs import (
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
 from crypto_trading_bot.utils.system_logger import get_system_logger
 
+try:
+    from crypto_trading_bot.rl.ppo_agent import PPOAgent
+except ImportError:  # pragma: no cover - optional dependency
+    PPOAgent = None
+
 # Constants for task intervals in seconds
 TRADE_INTERVAL = 5 * 60  # Every 5 minutes
 DAILY_TASK_HOUR = 0  # Midnight UTC
 DAILY_TASK_MINUTE = 5  # Buffer to ensure market data is updated
 ANOMALY_AUDIT_INTERVAL = 6 * 60 * 60  # 6 hours in seconds
+PPO_SHADOW_INTERVAL = 5 * 60  # Every 5 minutes
 ALERTS_LOG_PATH = "logs/alerts.log"
+SHADOW_RESULTS_PATH = "logs/shadow_test_results.jsonl"
+SHADOW_OBS_PATH = "logs/shadow_cycle_observations.jsonl"
+LEDGER_STATE_PATH = Path("logs/ledger_state.json")
 
 anomalies_logger = get_anomalies_logger()
 logger = get_system_logger().getChild("scheduler")
+
+PPO_AGENT = None
+if PPOAgent:
+    try:
+        _singleton_agent = PPOAgent()
+        _singleton_agent.load_model()
+        PPO_AGENT = _singleton_agent
+    except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive init
+        print(f"[PPO] Failed to load PPO model: {exc}")
+        PPO_AGENT = None
+
+
+def _json_safe(value):
+    """Convert nested values into JSON-serializable scalars."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (TypeError, ValueError):  # pragma: no cover - best effort
+            return str(value)
+    return str(value)
+
+
+def _ppo_is_approved() -> bool:
+    """Best-effort PPO approval check without coupling tests to agent internals."""
+
+    if not PPO_AGENT:
+        return False
+    try:
+        return bool(getattr(PPO_AGENT, "is_approved", lambda: False)())
+    except (AttributeError, TypeError):  # pragma: no cover - defensive
+        return False
+
+
+def _load_ledger_state_snapshot() -> dict:
+    """Read the latest ledger_state.json snapshot, returning an empty dict on error."""
+
+    if not LEDGER_STATE_PATH.exists():
+        return {}
+    try:
+        with LEDGER_STATE_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
@@ -71,8 +132,8 @@ def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
 
 def run_anomaly_audit() -> bool:
     """Run audit with cleanup of closed positions; return True if final state passes."""
-    if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
-        logger.info("Skipping anomaly audit — live mode disabled.")
+    if not CONFIG.get("is_live"):
+        logger.info("Skipping anomaly audit — not in live mode.")
         return True
     try:
         result = audit_run_and_cleanup("logs/trades.log", "logs/positions.jsonl")
@@ -99,10 +160,9 @@ def run_anomaly_audit() -> bool:
                 level="CRITICAL",
             )
             return False
-        else:
-            msg = "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, final_errors=0"
-            logger.info("Audit cleanup complete", extra={"message": msg})
-            return True
+        msg = "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, final_errors=0"
+        logger.info("Audit cleanup complete", extra={"message": msg})
+        return True
     except (OSError, IOError, ValueError, KeyError, RuntimeError) as e:
         logger.error("run_anomaly_audit failed", extra={"error": str(e)})
         send_alert("run_anomaly_audit failed", context={"error": str(e)})
@@ -141,12 +201,77 @@ def update_shadow_test_results():
             "num_exits": num_exits,
         }
         os.makedirs("logs", exist_ok=True)
-        with open("logs/shadow_test_results.jsonl", "a", encoding="utf-8") as f:
+        with open(SHADOW_OBS_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(out) + "\n")
+        logger.info(
+            "Shadow observation appended",
+            extra={"path": SHADOW_OBS_PATH, "win_rate": win_rate, "num_exits": num_exits},
+        )
     except (OSError, IOError, ValueError) as e:
         send_alert("update_shadow_test_results failed", context={"error": str(e)})
         # Non-fatal
         return
+
+
+def run_ppo_shadow_inference() -> None:
+    """Log PPO agent actions in shadow mode for observability."""
+    if not PPO_AGENT:
+        print("[PPO] Shadow inference skipped – agent not approved.")
+        return
+
+    try:
+        approved = bool(getattr(PPO_AGENT, "is_approved", lambda: False)())
+    except (AttributeError, TypeError):  # pragma: no cover - defensive
+        approved = False
+
+    if not approved:
+        print("[PPO] Shadow inference skipped – agent not approved.")
+        return
+
+    tradable_pairs = CONFIG.get("tradable_pairs", [])
+    if not tradable_pairs:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    os.makedirs("logs", exist_ok=True)
+
+    for pair in tradable_pairs:
+        try:
+            context = {
+                "strategy_id": "scheduler_shadow",
+                "pair": pair,
+                "confidence": 1.0,
+                "timestamp": now,
+                "indicators": {},
+                "portfolio": {},
+            }
+            action = PPO_AGENT.get_action(state=None, context=context) or {}
+            try:
+                confidence = float(action.get("agent_confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            model_path = getattr(PPO_AGENT, "model_path", "")
+            row = {
+                "timestamp": now,
+                "pair": pair,
+                "ppo_action": _json_safe(action),
+                "ppo_confidence": confidence,
+                "model_path": model_path,
+                "mode": "shadow",
+                "type": "ppo_shadow_tick",
+            }
+            with open(SHADOW_RESULTS_PATH, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            logger.info(
+                "[PPO] Shadow inference recorded",
+                extra={"pair": pair, "confidence": confidence},
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[PPO] Error during shadow inference for {pair}: {exc}")
+            logger.warning(
+                "PPO shadow inference failed",
+                extra={"pair": pair, "error": str(exc)},
+            )
 
 
 def run_daily_pipeline() -> None:
@@ -237,6 +362,13 @@ def should_run_anomaly_audit(last_audit_time):
     return (datetime.now(timezone.utc) - last_audit_time).total_seconds() >= ANOMALY_AUDIT_INTERVAL
 
 
+def should_run_shadow_inference(last_run_time):
+    """Determine whether to run PPO shadow inference based on interval."""
+    if last_run_time is None:
+        return True
+    return (datetime.now(timezone.utc) - last_run_time).total_seconds() >= PPO_SHADOW_INTERVAL
+
+
 def run_scheduler():
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
     logger.info("Scheduler started; running bot tasks")
@@ -275,6 +407,7 @@ def run_scheduler():
 
     last_daily_run = None
     last_audit_run = None
+    last_shadow_inference = None
 
     portfolio_state = load_portfolio_state(refresh=True)
 
@@ -294,6 +427,18 @@ def run_scheduler():
         anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
         logger.error("Initial run_learning_machine failed", extra={"error": str(exc)})
 
+    if CONFIG.get("is_live") and CONFIG.get("live", {}).get("CONFIRM_LIVE_TRADING", False):
+        try:
+            from crypto_trading_bot.utils.kraken_client import kraken_place_order
+
+            tradable_pairs = CONFIG.get("tradable_pairs") or ["BTC/USDC"]
+            pair = tradable_pairs[0]
+            kraken_place_order(pair, "buy", 0.0001, 1.0, validate=True)
+            logger.info("Live trading validation trade submitted", extra={"pair": pair})
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.critical("Live trading validation failed: %s", exc)
+            return
+
     while True:
         try:
             if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
@@ -306,6 +451,17 @@ def run_scheduler():
 
             # Refresh portfolio state and run trade evaluation
             portfolio_state = load_portfolio_state(refresh=True)
+            ledger_state = _load_ledger_state_snapshot()
+            logger.info(
+                "[heartbeat]",
+                extra={
+                    "mode": get_mode_label(),
+                    "is_live": is_live,
+                    "ppo_approved": _ppo_is_approved(),
+                    "drawdown": ledger_state.get("drawdown_pct", ledger_state.get("last_drawdown")),
+                    "regime": portfolio_state.get("regime"),
+                },
+            )
             available_capital = float(portfolio_state.get("available_capital", 0.0))
             reinvestment_rate = float(portfolio_state.get("reinvestment_rate", 0.0))
 
@@ -361,6 +517,10 @@ def run_scheduler():
                 run_daily_pipeline()
                 last_daily_run = datetime.now(timezone.utc)
 
+            if should_run_shadow_inference(last_shadow_inference):
+                run_ppo_shadow_inference()
+                last_shadow_inference = datetime.now(timezone.utc)
+
             time.sleep(TRADE_INTERVAL)
 
         except KeyboardInterrupt:
@@ -394,5 +554,30 @@ def run_scheduler():
             traceback.print_exc()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for running the scheduler in paper or live mode."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Crypto trading bot scheduler")
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live"],
+        default="paper",
+        help="Run the scheduler in paper or live configuration (default: paper).",
+    )
+    args = parser.parse_args(argv)
+    requested_mode = args.mode
+
+    if requested_mode == "paper":
+        CONFIG["is_live"] = False
+        CONFIG["test_mode"] = True
+    else:
+        CONFIG["is_live"] = True
+        CONFIG["test_mode"] = False
+
     run_scheduler()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -363,6 +363,24 @@ def _build_composite_buffer_profile(
     return composite_profile
 
 
+def _regime_trend_strength(regime_label: str) -> float:
+    """Map regime labels to a normalized trend-strength score."""
+
+    lookup = {
+        "trending": 0.7,
+        "uptrend": 1.0,
+        "bull": 0.8,
+        "downtrend": -0.8,
+        "bear": -1.0,
+        "volatile": 0.1,
+        "chop": 0.0,
+        "flat": 0.0,
+        "range": 0.0,
+    }
+    key = str(regime_label or "unknown").lower()
+    return float(lookup.get(key, 0.0))
+
+
 def load_state() -> Dict[str, Any]:
     """Read the persisted portfolio state from disk."""
     if os.path.exists(STATE_FILE):
@@ -534,6 +552,12 @@ def refresh_portfolio_state(
         reinvestment_rate = DEFAULT_REINVESTMENT_RATE
     regime_buffers = _build_regime_buffer_profile(dynamic_buffer, reinvestment_rate)
     composite_buffers = _build_composite_buffer_profile(regime_buffers, reinvestment_rate)
+    trend_strength = _regime_trend_strength(regime)
+    regime_meta = {
+        "label": regime,
+        "trend_strength": trend_strength,
+        "source": "portfolio_state",
+    }
 
     snapshot: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -561,6 +585,8 @@ def refresh_portfolio_state(
         "drawdown_pct": round(drawdown_pct, 6),
         "drawdown_limit": drawdown_limit,
         "total_roi": round(total_roi, 6),
+        "trend_strength": trend_strength,
+        "regime_meta": regime_meta,
     }
     save_state(snapshot)
     return snapshot

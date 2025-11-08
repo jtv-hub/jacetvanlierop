@@ -4,6 +4,11 @@ Trade Schema Validator
 Ensures that each trade dictionary has all required fields and correct types.
 """
 
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
 
 def validate_trade_schema(trade):
     """
@@ -58,3 +63,37 @@ def validate_trade_schema(trade):
         raise ValueError(f"Entry price must be positive, got {trade['entry_price']}")
 
     return True
+
+
+def validate_trades_file(path: str) -> tuple[bool, str]:
+    """Validate every trade entry in a JSONL file."""
+
+    target = Path(path)
+    if not target.exists():
+        return False, f"Trades log not found at {target}"
+
+    total = 0
+    errors: list[str] = []
+    with target.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"Line {line_no}: JSON decode error ({exc})")
+                continue
+            try:
+                validate_trade_schema(record)
+            except (ValueError, TypeError) as exc:
+                trade_id = record.get("trade_id", "<unknown>")
+                errors.append(f"Line {line_no} trade_id={trade_id}: {exc}")
+
+    if errors:
+        joined = "\n".join(errors[:20])
+        more = "" if len(errors) <= 20 else f"\n...and {len(errors) - 20} more issues"
+        return False, f"Trade schema validation failed:\n{joined}{more}"
+
+    return True, f"Validated {total} trades successfully from {target}"

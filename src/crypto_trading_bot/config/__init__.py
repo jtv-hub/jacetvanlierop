@@ -750,6 +750,26 @@ _config_template: dict[str, Any] = {
         "alts_max": 0.01,
         "use_random": False,
     },
+    "risk": {
+        "atr_period": 14,
+        "max_atr_pct": 0.06,
+        "sl_atr_mult": 1.5,
+        "tp_atr_mult": 2.0,
+        "regime_alpha": 0.5,
+        "max_drawdown_pct": _to_float(os.getenv("RISK_MAX_DRAWDOWN_PCT"), 0.10),
+        "max_consecutive_losses": _to_int(os.getenv("RISK_MAX_CONSEC_LOSSES"), 5),
+    },
+    "sizing": {
+        "confidence_mode": "linear",
+    },
+    "ppo": {
+        "enable_live_mode": False,
+        "min_live_confidence": 0.6,
+        "hybrid_mode": False,
+        "hybrid_weight": 0.7,
+        "hybrid_weight_strong_trend": 0.7,
+        "hybrid_weight_weak_trend": 0.3,
+    },
     "buffer_defaults": {
         "trending": 1.0,
         "chop": 0.5,
@@ -763,6 +783,9 @@ _config_template: dict[str, Any] = {
             os.getenv("PAPER_STARTING_BALANCE"),
             100_000.0,
         )
+    },
+    "live": {
+        "CONFIRM_LIVE_TRADING": _to_bool(os.getenv("CONFIRM_LIVE_TRADING"), True),
     },
     "live_mode": {
         "balance_env_var": os.getenv(
@@ -862,6 +885,41 @@ CONFIG.setdefault("correlation", {}).update(
         "disable_correlation_block": CONFIG.get("correlation", {}).get("disable_correlation_block", True),
     }
 )
+
+risk_cfg = CONFIG.setdefault("risk", {})
+risk_cfg.setdefault("max_atr_pct", 0.06)
+risk_cfg.setdefault("atr_period", 14)
+risk_cfg.setdefault("sl_atr_mult", 1.5)
+risk_cfg.setdefault("tp_atr_mult", 2.0)
+risk_cfg.setdefault("regime_alpha", 0.5)
+atr_cfg = risk_cfg.setdefault(
+    "atr_sizing",
+    {
+        "enabled": False,
+        "target_atr_pct": 0.02,
+        "min_scalar": 0.5,
+        "max_scalar": 1.5,
+        "mode": "inverse",
+    },
+)
+if isinstance(atr_cfg, dict):
+    atr_cfg.setdefault("enabled", False)
+    atr_cfg.setdefault("target_atr_pct", 0.02)
+    atr_cfg.setdefault("min_scalar", 0.5)
+    atr_cfg.setdefault("max_scalar", 1.5)
+    atr_cfg.setdefault("mode", "inverse")
+
+auto_pause_cfg = CONFIG.setdefault("auto_pause", {})
+auto_pause_cfg.setdefault("max_drawdown_pct", 0.10)
+auto_pause_cfg.setdefault("max_consecutive_losses", 5)
+
+ppo_cfg = CONFIG.setdefault("ppo", {})
+ppo_cfg.setdefault("mode", "disabled")
+ppo_cfg.setdefault("enable_live_mode", False)
+ppo_cfg.setdefault("min_live_confidence", 0.7)
+
+sizing_cfg = CONFIG.setdefault("sizing", {})
+sizing_cfg.setdefault("confidence_mode", "linear")
 
 CONFIG["test_mode"] = _to_bool(os.getenv("CRYPTO_TRADING_BOT_TEST_MODE"), False)
 

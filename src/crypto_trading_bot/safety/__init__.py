@@ -1,7 +1,6 @@
 """Safety utilities for prelaunch validation steps."""
 
 from .confirmation import require_live_confirmation  # noqa: F401
-from .prelaunch_guard import run_prelaunch_guard  # noqa: F401
 from .risk_guard import (  # noqa: F401
     check_pause as risk_guard_check_pause,
 )
@@ -17,6 +16,13 @@ from .risk_guard import (
 from .risk_guard import (
     update_trade_outcome as risk_guard_update_trade_outcome,
 )
+
+
+def run_prelaunch_guard(*args, **kwargs):
+    from .prelaunch_guard import run_prelaunch_guard as _impl
+
+    return _impl(*args, **kwargs)
+
 
 __all__ = [
     "run_prelaunch_guard",
