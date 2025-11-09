@@ -8,6 +8,7 @@ Provides singleton connection, optimized PRAGMAs, and batch/dual-write support.
 import logging
 import os
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,8 @@ class SQLiteAdapter:
         if db_path is None:
             base_dir = os.path.dirname(__file__)
             db_path = os.path.join(base_dir, "trades.db")
+        self.db_path = db_path
+        self.logger = logger
 
         # Thread‑safe mode enabled (required for scheduler, RL, and strategies)
         self.conn = sqlite3.connect(
@@ -113,7 +116,12 @@ class SQLiteAdapter:
         for k in ("roi", "pnl_usd", "rsi", "slippage_bps", "exit_price"):
             if k in trade_obj and trade_obj[k] is None:
                 pass
-        logger.debug("SQLite insert_trade start trade_id=%s keys=%s payload=%s", trade_id, trade_keys, trade_obj)
+        logger.debug(
+            "SQLite insert_trade start trade_id=%s keys=%s payload=%s",
+            trade_id,
+            trade_keys,
+            trade_obj,
+        )
         try:
             self.conn.execute(
                 """
@@ -193,6 +201,26 @@ class SQLiteAdapter:
             print(f"[SQLite Error] fetch_one failed: {e}")
             return None
 
+    def get_recent_trades(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """
+        Retrieve the most recent trades as lightweight dicts for shadow simulations.
+        """
+        trades: List[Dict[str, Any]] = []
+        db_path = Path(self.db_path)
+        if not db_path.exists():
+            return trades
+
+        query = "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?"
+        try:
+            with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(query, (limit,)).fetchall()
+                trades = [dict(row) for row in rows]
+        # pylint: disable=broad-exception-caught
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self.logger.exception("SQLiteAdapter get_recent_trades failed: %s", exc)
+        return trades
+
     # ---------------------------------------------------------
     # Close safely (rarely used; DB stays open for bot lifetime)
     # ---------------------------------------------------------
@@ -200,5 +228,5 @@ class SQLiteAdapter:
         """Close the underlying SQLite connection safely."""
         try:
             self.conn.close()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as exc:
+            logger.debug("SQLiteAdapter close() ignored error: %s", exc)

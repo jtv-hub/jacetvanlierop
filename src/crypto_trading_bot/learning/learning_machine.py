@@ -489,7 +489,9 @@ def append_shadow_summary(
         return
 
     try:
-        decision = deploy_gate.check_and_approve(model_path=row["model_path"] or deploy_gate.DEFAULT_MODEL_CANDIDATE)
+        decision = deploy_gate.check_and_approve(
+            model_path=row["model_path"] or deploy_gate.DEFAULT_MODEL_CANDIDATE,
+        )
         logger.info(
             "[shadow] deploy gate evaluated",
             extra={
@@ -721,7 +723,11 @@ def run_learning_machine(output_path: str = "logs/learning_feedback.jsonl") -> i
             win_rate_metric = _safe_float(summary_metrics["win_rate"])
             max_dd_metric = _safe_float(summary_metrics["max_drawdown_pct"], 1e-6)
             risk_adjusted = (
-                _safe_float(avg_roi_metric * win_rate_metric / max(max_dd_metric, 1e-6)) if max_dd_metric > 0 else 0.0
+                _safe_float(
+                    avg_roi_metric * win_rate_metric / max(max_dd_metric, 1e-6),
+                )
+                if max_dd_metric > 0
+                else 0.0
             )
             model_path_value = str(metadata.get("model_path") or PPO_MODEL_CANDIDATE)
             model_timestamp = metadata.get("timestamp")

@@ -12,21 +12,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, cast
 
-from crypto_trading_bot.config import CONFIG
+try:
+    from crypto_trading_bot.config import CONFIG
+except ImportError:  # pragma: no cover - local execution fallback
+    SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+    from crypto_trading_bot.config import CONFIG  # type: ignore  # pylint: disable=wrong-import-position
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+LOGGER = logging.getLogger(__name__)
 
 try:
     from crypto_trading_bot.bot.trading_logic import ppo_agent as _PPO_AGENT
-except Exception:  # pragma: no cover - fallback for lightweight environments
+except (ImportError, RuntimeError) as exc:  # pragma: no cover - fallback for lightweight envs
+    LOGGER.debug("Failed to import ppo_agent: %s", exc)
     _PPO_AGENT = None
 
 TRADES_PATH = os.path.join("logs", "trades.log")
@@ -105,6 +111,8 @@ def _stats(subset: List[Dict[str, Any]]) -> tuple[int, float, float]:
 
 
 def _compute_summary(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate win/loss metrics across closed trades."""
+    # pylint: disable=too-many-locals
     total = len(trades)
     wins = sum(1 for t in trades if t["roi"] > 0)
     losses = total - wins
@@ -169,6 +177,7 @@ def _recent_ppo_usage(trades: List[Dict[str, Any]], window: int = 50) -> tuple[b
 
 
 def _print_human(summary: Dict[str, Any]) -> None:
+    """Render a friendly CLI summary of trade statistics."""
     print("\n📊 Trade Summary\n")
     print(f"Total Trades: {summary['total_trades']}")
     print(f"Wins: {summary['wins']} | Losses: {summary['losses']}")
@@ -184,15 +193,18 @@ def _print_human(summary: Dict[str, Any]) -> None:
     hybrid_count = hybrid_stats.get("count", 0)
     hybrid_wr = hybrid_stats.get("win_rate", 0.0)
     hybrid_avg = hybrid_stats.get("average_roi", 0.0)
-    print(f"\n🤖 PPO Trades: {ppo_count} | Win Rate: {ppo_wr:.2%} | Avg ROI: {ppo_avg:.4f}")
-    print(f"🔀 Hybrid Trades: {hybrid_count} | Win Rate: {hybrid_wr:.2%} | Avg ROI: {hybrid_avg:.4f}")
+    print(f"\n🤖 PPO Trades: {ppo_count} | Win Rate: {ppo_wr:.2%} | " f"Avg ROI: {ppo_avg:.4f}")
+    print(f"🔀 Hybrid Trades: {hybrid_count} | Win Rate: {hybrid_wr:.2%} | " f"Avg ROI: {hybrid_avg:.4f}")
 
     if summary.get("top_strategies"):
         print("\n🏆 Top Strategies")
         for item in summary["top_strategies"]:
             s_name = item["strategy"]
             s_wins = item["wins"]
-            s_roi = _fmt_pct(item["roi"]) if isinstance(item["roi"], (int, float)) else str(item["roi"])
+            if isinstance(item["roi"], (int, float)):
+                s_roi = _fmt_pct(item["roi"])
+            else:
+                s_roi = str(item["roi"])
             print(f"\t•\t{s_name}: {s_wins} wins, {s_roi}")
 
 
@@ -230,6 +242,7 @@ def _extract_trend_strength(snapshot: Dict[str, Any]) -> float | None:
 
 def _print_live_overview(trades: List[Dict[str, Any]]) -> None:
     """Print capital, drawdown, and PPO context sourced from logs."""
+    # pylint: disable=too-many-locals
 
     ledger_state = _read_json_file(LEDGER_STATE_PATH)
     portfolio_state = _read_json_file(PORTFOLIO_STATE_PATH)
@@ -277,7 +290,8 @@ def _print_live_overview(trades: List[Dict[str, Any]]) -> None:
     ppo_status = _resolve_ppo_status()
     print(
         f"Drawdown: {drawdown_pct:.2%} | Live Capital: ${capital_numeric:,.2f} | "
-        f"Trend Strength: {trend_strength:.2f} | PPO Mode: {ppo_mode} | Approved: {ppo_status}"
+        f"Trend Strength: {trend_strength:.2f} | PPO Mode: {ppo_mode} | "
+        f"Approved: {ppo_status}"
     )
 
 
@@ -288,17 +302,23 @@ def _resolve_ppo_status() -> str:
     if agent is None:
         return "N/A"
     approver = getattr(agent, "is_approved", None)
-    try:
-        if callable(approver):
-            return str(bool(approver()))
-        if approver is not None:
-            return str(bool(approver))
-    except Exception:  # pragma: no cover - defensive formatting
-        return "error"
+    approval_value = None
+    if callable(approver):
+        callable_approver = cast(Callable[[], Any], approver)
+        try:
+            approval_value = callable_approver()  # pylint: disable=not-callable
+        except (RuntimeError, ValueError, TypeError) as exc:  # pragma: no cover
+            LOGGER.debug("PPO approval check failed: %s", exc)
+            return "error"
+    else:
+        approval_value = approver
+    if approval_value is not None:
+        return str(bool(approval_value))
     return "N/A"
 
 
 def main() -> None:
+    """CLI entrypoint for printing live stats or emitting JSON summary."""
     parser = argparse.ArgumentParser(description="Show live stats from trades.log")
     parser.add_argument("--json", action="store_true", help="Emit compact JSON summary")
     args = parser.parse_args()

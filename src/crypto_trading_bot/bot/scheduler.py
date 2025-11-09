@@ -1,3 +1,4 @@
+# pylint: disable=duplicate-code
 """
 Scheduler Module
 
@@ -5,6 +6,9 @@ Handles the scheduling of periodic trading bot tasks like trade evaluation,
 daily maintenance, and learning updates.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import time
@@ -22,12 +26,26 @@ from crypto_trading_bot.bot.utils.log_rotation import (
     get_rotating_handler,
 )
 from crypto_trading_bot.config import CONFIG, ConfigurationError, get_mode_label, is_live
+from crypto_trading_bot.context.trading_context import TradingContext
 from crypto_trading_bot.learning.confidence_audit import (
     run_and_cleanup as audit_run_and_cleanup,
 )
-from crypto_trading_bot.learning.learning_machine import run_learning_cycle, run_learning_machine
+from crypto_trading_bot.learning.learning_machine import (
+    run_learning_cycle,
+    run_learning_machine,
+)
 from crypto_trading_bot.learning.optimization import detect_outliers
-from crypto_trading_bot.learning.shadow_test_runner import run_shadow_tests
+from crypto_trading_bot.learning.shadow_test_runner import (
+    run_shadow_tests as run_learning_shadow_tests,
+)
+from crypto_trading_bot.nsga3.log_rotation import rotate_nsga3_logs
+from crypto_trading_bot.nsga3.nsga3_engine import run_nsga3_cycle
+from crypto_trading_bot.nsga3.nsga3_healthcheck import run_healthcheck as run_nsga3_healthcheck
+from crypto_trading_bot.nsga3.promotion_manager import (
+    run_promotion_cycle as run_nsga_promotion_cycle,
+)
+from crypto_trading_bot.nsga3.regime_utils import normalize_regime_label
+from crypto_trading_bot.nsga3.shadow_simulation import run_shadow_tests as run_nsga_shadow_tests
 from crypto_trading_bot.safety import risk_guard
 from crypto_trading_bot.safety.confirmation import require_live_confirmation
 
@@ -39,6 +57,7 @@ from crypto_trading_bot.scripts.suggest_top_configs import (
     generate_parameter_suggestions,
 )
 from crypto_trading_bot.scripts.sync_validator import SyncValidator
+from crypto_trading_bot.utils.kraken_client import kraken_place_order
 from crypto_trading_bot.utils.system_logger import get_system_logger
 
 try:
@@ -56,6 +75,7 @@ ALERTS_LOG_PATH = "logs/alerts.log"
 SHADOW_RESULTS_PATH = "logs/shadow_test_results.jsonl"
 SHADOW_OBS_PATH = "logs/shadow_cycle_observations.jsonl"
 LEDGER_STATE_PATH = Path("logs/ledger_state.json")
+NSGA3_HEARTBEAT_PATH = Path("logs/nsga3_scheduler.log")
 
 anomalies_logger = get_anomalies_logger()
 logger = get_system_logger().getChild("scheduler")
@@ -127,7 +147,7 @@ def send_alert(message: str, context: dict | None = None, level: str = "ERROR"):
             f.write(json.dumps(payload) + "\n")
     except (OSError, IOError):
         # Best-effort alerting; ignore failures
-        return
+        pass
 
 
 def run_anomaly_audit() -> bool:
@@ -163,9 +183,9 @@ def run_anomaly_audit() -> bool:
         msg = "🧹 Audit cleanup complete — " f"initial_errors={initial_errors}, removed={removed}, final_errors=0"
         logger.info("Audit cleanup complete", extra={"message": msg})
         return True
-    except (OSError, IOError, ValueError, KeyError, RuntimeError) as e:
-        logger.error("run_anomaly_audit failed", extra={"error": str(e)})
-        send_alert("run_anomaly_audit failed", context={"error": str(e)})
+    except (OSError, IOError, ValueError, KeyError, RuntimeError) as exc:
+        logger.exception("run_anomaly_audit failed: %s", exc)
+        send_alert("run_anomaly_audit failed", context={"error": str(exc)})
         return False
 
 
@@ -211,6 +231,75 @@ def update_shadow_test_results():
         send_alert("update_shadow_test_results failed", context={"error": str(e)})
         # Non-fatal
         return
+
+
+def _write_nsga3_heartbeat(status: str, extra: dict | None = None, regime: str = "global") -> None:
+    """Append a durable heartbeat entry for NSGA-III orchestration."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "nsga3_cycle",
+        "status": status,
+        "regime": normalize_regime_label(regime),
+    }
+    if extra:
+        entry.update(extra)
+    NSGA3_HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NSGA3_HEARTBEAT_PATH.open("a", encoding="utf-8") as handle:
+        json.dump(entry, handle)
+        handle.write("\n")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+
+def _resolve_nsga3_regime() -> str:
+    """Determine the current market regime from persisted state/context."""
+    candidates: list[str | None] = []
+    try:
+        snapshot = load_portfolio_state(refresh=False)
+        candidates.append(snapshot.get("market_regime"))
+        regime_meta = snapshot.get("regime_meta") or {}
+        if isinstance(regime_meta, dict):
+            candidates.append(regime_meta.get("label"))
+    except Exception:  # pragma: no cover - defensive  # pylint: disable=broad-exception-caught
+        candidates.append(None)
+    try:
+        context = TradingContext()
+        candidates.append(context.get_regime_label())
+    except Exception:  # pragma: no cover - defensive  # pylint: disable=broad-exception-caught
+        candidates.append(None)
+    for label in candidates:
+        normalized = normalize_regime_label(label)
+        if normalized not in ("unknown", ""):
+            return normalized
+    return "global"
+
+
+def run_nsga3_automation() -> None:
+    """Execute an NSGA-III cycle with healthchecks, logging, and rotation."""
+    regime = _resolve_nsga3_regime()
+    _write_nsga3_heartbeat("pending", regime=regime)
+    if not run_nsga3_healthcheck():
+        logger.warning("NSGA-3 cycle skipped: healthcheck failed.")
+        _write_nsga3_heartbeat("skipped", {"reason": "healthcheck_failed"}, regime=regime)
+        return
+    try:
+        population, generation = run_nsga3_cycle(regime=regime)
+        shadow_results = run_nsga_shadow_tests(population, max_trades=500, regime=regime)
+        run_nsga_promotion_cycle(
+            population=population,
+            shadow_results=shadow_results,
+            generation=generation,
+            regime=regime,
+        )
+        rotate_nsga3_logs(regime=regime)
+        logger.info("NSGA-3 cycle complete.")
+        _write_nsga3_heartbeat("success", regime=regime)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.exception("NSGA-3 cycle failed: %s", exc)
+        _write_nsga3_heartbeat("failed", {"error": str(exc)}, regime=regime)
 
 
 def run_ppo_shadow_inference() -> None:
@@ -298,7 +387,7 @@ def run_daily_pipeline() -> None:
 
         logger.info("Running shadow test evaluation")
         try:
-            run_shadow_tests(output_file="logs/shadow_test_results.jsonl")
+            run_learning_shadow_tests(output_file="logs/shadow_test_results.jsonl")
             logger.info(
                 "Shadow test results saved",
                 extra={"path": "logs/shadow_test_results.jsonl"},
@@ -312,7 +401,7 @@ def run_daily_pipeline() -> None:
                 "error": str(exc),
             }
             anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-            logger.error("run_shadow_tests failed during daily pipeline", extra={"error": str(exc)})
+            logger.exception("run_shadow_tests failed during daily pipeline: %s", exc)
     else:
         logger.warning("No top configurations found for suggestion; skipping shadow tests.")
 
@@ -329,7 +418,7 @@ def run_daily_pipeline() -> None:
             "error": str(exc),
         }
         anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-        logger.error("run_learning_machine failed during daily pipeline", extra={"error": str(exc)})
+        logger.exception("run_learning_machine failed during daily pipeline: %s", exc)
 
     metrics = run_learning_cycle()
     logger.info("Learning summary", extra={"metrics": metrics})
@@ -341,8 +430,8 @@ def run_daily_pipeline() -> None:
             "Confidence threshold analysis appended rows",
             extra={"rows_appended": n_rows},
         )
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.error("run_shadow_confidence_test failed", extra={"error": str(e)})
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.exception("run_shadow_confidence_test failed: %s", exc)
 
 
 def should_run_daily(last_run_time):
@@ -369,7 +458,7 @@ def should_run_shadow_inference(last_run_time):
     return (datetime.now(timezone.utc) - last_run_time).total_seconds() >= PPO_SHADOW_INTERVAL
 
 
-def run_scheduler():
+def run_scheduler():  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     """Runs the main scheduler loop that handles trade evaluation and daily bot maintenance."""
     logger.info("Scheduler started; running bot tasks")
     if not CONFIG.get("is_live") and not CONFIG.get("test_mode"):
@@ -425,12 +514,10 @@ def run_scheduler():
             "error": str(exc),
         }
         anomalies_logger.info(json.dumps(error_payload, separators=(",", ":")))
-        logger.error("Initial run_learning_machine failed", extra={"error": str(exc)})
+        logger.exception("Initial run_learning_machine failed: %s", exc)
 
     if CONFIG.get("is_live") and CONFIG.get("live", {}).get("CONFIRM_LIVE_TRADING", False):
         try:
-            from crypto_trading_bot.utils.kraken_client import kraken_place_order
-
             tradable_pairs = CONFIG.get("tradable_pairs") or ["BTC/USDC"]
             pair = tradable_pairs[0]
             kraken_place_order(pair, "buy", 0.0001, 1.0, validate=True)
@@ -498,8 +585,8 @@ def run_scheduler():
             if bool(CONFIG.get("auto_pause", {}).get("force_exit_on_severe_drawdown", False)):
                 try:
                     risk_guard.trigger_panic_exit_if_needed()
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    logger.error("trigger_panic_exit_if_needed failed", extra={"error": str(e)})
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    logger.exception("trigger_panic_exit_if_needed failed: %s", exc)
 
             if should_run_anomaly_audit(last_audit_run):
                 logger.info("Running anomaly audit")
@@ -521,6 +608,7 @@ def run_scheduler():
                 run_ppo_shadow_inference()
                 last_shadow_inference = datetime.now(timezone.utc)
 
+            run_nsga3_automation()
             time.sleep(TRADE_INTERVAL)
 
         except KeyboardInterrupt:
@@ -556,8 +644,6 @@ def run_scheduler():
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for running the scheduler in paper or live mode."""
-    import argparse
-
     parser = argparse.ArgumentParser(description="Crypto trading bot scheduler")
     parser.add_argument(
         "--mode",

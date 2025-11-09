@@ -1,0 +1,42 @@
+{
+  "population": 200,
+  "generations": 100,
+  "cores": 8,
+  "parallel_workers": 8,
+  "shadow_test": {
+    "max_trades": 500
+  },
+  "divisions": 4,
+
+  "cx_eta": 15,
+  "cx_prob": 0.9,
+  "mut_eta": 20,
+  "mut_prob": 0.1,
+  "mutation_rate": 0.15,
+  "seed": 42,
+
+  "objectives": ["roi", "drawdown", "win_rate"],
+
+  "constraints": {
+    "max_drawdown": 0.15,
+    "min_win_rate": 0.55,
+    "min_trades": 200
+  },
+
+  "paths": {
+    "checkpoint": "logs/nsga3_checkpoint_global.json",
+    "promotions": "logs/nsga3_promotions_global.jsonl"
+  },
+
+  "bounds": {
+    "rsi_low": [10, 40],
+    "rsi_high": [60, 90],
+    "ema_fast": [10, 50],
+    "ema_slow": [50, 200],
+    "trailing_sl_atr": [0.5, 3.0],
+    "confidence_min": [0.3, 0.8],
+    "ppo_lr": [0.00001, 0.001],
+    "ppo_clip": [0.1, 0.3],
+    "risk_per_trade_pct": [0.5, 3.0]
+  }
+}
